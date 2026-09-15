@@ -1923,3 +1923,33 @@ def test_reviewed_yahoo_mutualfund_yhd_survives_warm_cache_refresh(tmp_path):
     assert got[row.tv_id].quote_status == "FRESH_CURRENCY_UNREPORTED"
     db.close()
 
+
+
+def test_policy49_reuses_policy44_verified_cache_entries(tmp_path):
+    import time
+    from tv_market_identity.models import Binding
+
+    db = CacheDB(tmp_path / "compatible-policy-cache.sqlite")
+    now = int(time.time())
+    db.put_bindings([Binding(
+        tv_id="XETR:DTE", tv_symbol="DTE", tv_prefix="XETR",
+        tv_currency="EUR", tv_type="stock", status="VERIFIED",
+        yahoo_symbol="DTE.DE", yahoo_exchange="GER", yahoo_market="de_market",
+        yahoo_quote_type="EQUITY", yahoo_currency="EUR", resolved_mic="XETR",
+        source_mic="XETR", target_mic="XETR", mapping_method="SAME_VENUE",
+        resolver_version="0.3.44-policy44", validated_at=now,
+        expires_at=now + 86400,
+    )])
+    resolver = BatchResolver(db, None, None, None)
+    row = TvRow(
+        "XETR:DTE", "XETR", "DTE", "Deutsche Telekom AG", "EUR",
+        "stock", ("common",), None, 1e11, 29.0,
+    )
+    binding = resolver.resolve([row])[row.tv_id]
+    assert binding.status == "VERIFIED"
+    assert binding.cache_hit is True
+    assert binding.resolver_version == "0.3.44-policy44"
+    assert resolver.stats["cache_compatible_verified_hits"] == 1
+    assert resolver.stats["cache_hits"] == 1
+    assert resolver.stats["cache_misses"] == 0
+    db.close()

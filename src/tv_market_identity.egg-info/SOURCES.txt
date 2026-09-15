@@ -20,7 +20,11 @@ tests/test_cache.py
 tests/test_cli_rejection_audit.py
 tests/test_config_optional_filters.py
 tests/test_env.py
+tests/test_openfigi_concurrency.py
+tests/test_openfigi_memoization.py
 tests/test_policy.py
+tests/test_refresh_rejected.py
 tests/test_resolver.py
 tests/test_tradingview_query.py
 tests/test_venue_expansion.py
+tests/test_yahoo_memoization.py

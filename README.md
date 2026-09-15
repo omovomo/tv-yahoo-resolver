@@ -1,4 +1,115 @@
-# TV Market Identity Prototype v0.3.44
+# TV Market Identity Prototype v0.3.49
+
+## v0.3.49 — exact-ISIN German regional source-gap bridge + bounded Yahoo retry
+
+This release changes resolver admission only for German bridge rows that already carry an exact
+TradingView ISIN.  It does **not** broaden OpenFIGI type compatibility: `Unit`, `Stapled Security`,
+`Closed-End Fund`, `Dutch Cert`, and other taxonomy disagreements remain fail-closed for now.
+
+Two evidence-gated improvements are added:
+
+- GETTEX/TRADEGATE/LS/LSX rows with no compatible source listing may use a one-sided German
+  regional target only when the target is independently proven by `ID_ISIN + exact MIC`, has a
+  non-null and unambiguous `shareClassFIGI`, and Yahoo passes the ordinary German
+  currency/type/venue contract.  Multi-MIC source namespaces preserve the source venue code
+  rather than inventing a source MIC or source FIGI.
+- German regional Yahoo probing performs one bounded second bulk request only for rows that got
+  no valid candidate on the first response.  The retry uses the exact same admission contract.
+
+Resolver policy is now `0.3.49-policy49`.  Because this change is monotonic (it only admits
+previously-rejected exact-ISIN cases), VERIFIED bindings created under `0.3.44-policy44` are
+explicitly cache-compatible and remain reusable.  Old policy44 REJECTED bindings are ignored and
+re-resolved under policy49.
+
+Recommended full-Germany upgrade run:
+
+```powershell
+tv-market-id --cache .\cache\identity.sqlite3 run `
+  --config .\config\identity_coverage_germany_full.ini `
+  --output .\out\identity_coverage_germany_full_v049.csv
+```
+
+Use `--rejection-audit` if you want the new residual evidence set.
+
+## v0.3.47 — single-shot full-universe TradingView acquisition
+
+This release changes only the TradingView acquisition layer. Resolver/admission policy remains
+`0.3.44-policy44`, so all v0.3.44+ validated bindings remain cache-compatible.
+
+The previous offset-pagination experiments (`v0.3.45`/`v0.3.46`) correctly failed closed when
+TradingView's live Germany universe changed during the multi-request scan. The installed
+`tradingview-screener` API does not require pagination for this scale: `Query.limit()` sets the
+upper range boundary and supports large values. The Germany full preset now requests up to
+100,000 rows in one POST (`range=[0,100000)`).
+
+`RequireCompleteUniverse=true` makes this fail closed unless the same response satisfies:
+
+- returned row count == TradingView `totalCount`;
+- every returned `EXCHANGE:SYMBOL` is unique;
+- the response includes the `ticker` column.
+
+This removes both equal-sort-key boundary instability and cross-request `totalCount` drift.
+
+Recommended preflight:
+
+```powershell
+tv-market-id screen `
+  --config .\config\identity_coverage_germany_full.ini `
+  --output .\out\identity_coverage_germany_full_screen.csv
+```
+
+Expected shape is one request with `returned == unique_rows == totalCount`.
+
+## v0.3.46 — overlap + confirmed full-universe TradingView pagination
+
+This release changes only TradingView acquisition. Resolver admission remains
+`0.3.44-policy44`, so the validated v0.3.44 Germany bindings stay cache-compatible.
+
+v0.3.45 correctly failed closed on the first live full-Germany preflight:
+`totalCount=33389`, but ordinary non-overlapping `name ASC` pages contained five
+repeated TradingView tickers and therefore only 33384 unique rows. The cause is
+that TradingView exposes only one server-side sort key while `name` is the short
+symbol, not the unique `EXCHANGE:SYMBOL`; equal-name venue listings can therefore
+change tie order at offset boundaries.
+
+- Pagination now uses intentional overlapping windows. With the default
+  `Limit=4000` and `PaginationOverlap=256`, offsets advance by 3744 rows.
+- Duplicate observations inside overlap are expected and are no longer treated
+  as an error by themselves. The pass succeeds only when the union contains
+  exactly `totalCount` unique canonical `EXCHANGE:SYMBOL` tickers.
+- Returned rows are client-side sorted by canonical ticker after union/dedup;
+  server tie order is never used as an identity key.
+- `PaginationConfirmPasses=2` performs two independent complete scans and
+  requires the exact ticker membership set to be identical. This detects
+  count-stable constituent drift that a simple `totalCount` check cannot see.
+- `PaginationRetries=1` retries the whole confirmation cycle. On retry the
+  overlap doubles (256 -> 512) to protect against a larger equal-name tie group.
+- Every individual page must still report the same totalCount and expected row
+  count. Incomplete union, membership drift, page-size mismatch, or totalCount
+  drift remains fail-closed with exit code 4.
+- CLI telemetry now includes page size, effective overlap, confirmation passes,
+  attempts, raw observations, unique rows, duplicate observations, and totalCount.
+- Existing non-paginated top-N configs and resolver policy are unchanged.
+- Package version: `0.3.46`; resolver policy remains `0.3.44-policy44`.
+  Regression suite: 129 tests.
+
+Recommended full-Germany preflight (TradingView only):
+
+```powershell
+tv-market-id screen `
+  --config .\config\identity_coverage_germany_full.ini `
+  --output .\out\identity_coverage_germany_full_screen.csv
+```
+
+A successful pass should report `unique_rows == totalCount`; duplicate
+observations will be non-zero by design because windows overlap. Only after the
+preflight succeeds should the full identity run be started without `--refresh`:
+
+```powershell
+tv-market-id --cache .\cache\identity.sqlite3 run `
+  --config .\config\identity_coverage_germany_full.ini `
+  --output .\out\identity_coverage_germany_full.csv
+```
 
 ## v0.3.44 — Germany final evidence-gated regional rerouting
 
@@ -765,3 +876,48 @@ At v0.3.21, `LSE:ROSE` remained fail-closed because OpenFIGI returned two incomp
 Coverage profiles use one TradingView request with `Limit = 2000`. If `totalCount` exceeds the returned row count, the CLI warns that the result is truncated. `PrimaryOnly` semantics are explicit: `false` clears the library's implicit `is_primary=true` default; `true` adds it intentionally.
 
 For apples-to-apples comparison with v0.3.20 market-only runs (which inherited the library's implicit `is_primary=true`), use `identity_coverage_uk_primary.ini` and `identity_coverage_germany_primary.ini`. The non-primary coverage files now intentionally clear that implicit restriction and therefore may return a larger universe.
+
+
+## v0.3.50 performance-only OpenFIGI memoization
+
+`v0.3.50` keeps resolver policy `0.3.49-policy49` unchanged. During one
+`BatchResolver.resolve()` run, identical OpenFIGI mapping jobs are canonicalized,
+deduplicated and memoized in memory. Empty mappings are memoized too. The memo
+is reset at the beginning of each resolver run and is never persisted, so this
+changes network work only, not identity/admission semantics or cache TTLs.
+
+Additional resolver stats report actual provider work:
+`openfigi_provider_requested_jobs`, `openfigi_provider_network_jobs`,
+`openfigi_provider_network_batches`, `openfigi_provider_memo_hits`, and
+`openfigi_provider_intra_call_dedup_hits`.
+
+## v0.3.52 performance-only security evidence reuse
+
+`v0.3.52` keeps resolver policy `0.3.49-policy49` unchanged and is based on
+`v0.3.50` (the experimental OpenFIGI transport concurrency from `v0.3.51` is
+not included).
+
+Two run-local performance changes preserve the existing admission contract:
+
+1. German regional exact-ISIN evidence is grouped by exact ISIN before the
+   bounded `XFRA/XSTU/XMUN/XHAN/XDUS/XHAM` probe. Raw OpenFIGI evidence for one
+   `ID_ISIN + MIC` lookup is shared by all TradingView rows for that ISIN, while
+   target selection and type/taxonomy checks remain row-specific.
+2. Yahoo v7 positive quote rows are memoized within one resolver run. Missing
+   symbols are deliberately not negative-cached, so the existing targeted retry
+   for thin German listings remains a real network request.
+
+Useful counters:
+
+- `openfigi_regional_target_probe_security_groups`
+- `openfigi_regional_target_probe_grouped_row_reuses`
+- `openfigi_regional_target_probe_row_equivalent_jobs`
+- `openfigi_regional_target_probe_jobs_saved_by_grouping`
+- `yahoo_provider_requested_symbols`
+- `yahoo_provider_network_symbols`
+- `yahoo_provider_network_batches`
+- `yahoo_provider_memo_hits`
+- `yahoo_provider_missing_symbols`
+
+The resolver policy/cache identity remains `0.3.49-policy49`; existing verified
+bindings therefore remain compatible.

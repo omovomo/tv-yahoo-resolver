@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pandas as pd
+
 from tradingview_screener import Column, Query
 
 from .config import ScreenConfig
@@ -25,7 +27,11 @@ TV_COLUMNS = (
 )
 
 
-def build_query(cfg: ScreenConfig) -> Query:
+class PaginationStabilityError(RuntimeError):
+    """Raised when a requested complete TradingView universe cannot be proven complete."""
+
+
+def build_query(cfg: ScreenConfig, *, offset: int = 0, page_size: int | None = None) -> Query:
     query = Query().select(*TV_COLUMNS).set_markets(cfg.market)
 
     # tradingview-screener Query() currently carries an implicit
@@ -52,14 +58,200 @@ def build_query(cfg: ScreenConfig) -> Query:
     if conditions:
         query = query.where(*conditions)
 
-    return query.order_by(cfg.order_by, ascending=cfg.ascending).limit(cfg.limit)
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+    size = cfg.limit if page_size is None else page_size
+    if size <= 0:
+        raise ValueError("page_size must be > 0")
+
+    # tradingview-screener stores pagination as range=[start, end), despite the
+    # public method being named limit().  Therefore page N must use
+    # offset=start and limit=start+page_size.
+    query = query.order_by(cfg.order_by, ascending=cfg.ascending)
+    if offset:
+        query = query.offset(offset)
+    return query.limit(offset + size)
+
+
+def _fetch_paginated_pass(cfg: ScreenConfig, *, overlap: int):
+    page_size = cfg.limit
+    if page_size <= 0:
+        raise ValueError("Limit/page_size must be > 0")
+    if overlap < 0 or overlap >= page_size:
+        raise ValueError("PaginationOverlap must satisfy 0 <= overlap < Limit")
+    step = page_size - overlap
+
+    pages = []
+    totals_seen: list[int] = []
+    page_ranges: list[tuple[int, int]] = []
+    issues: list[str] = []
+    raw_rows = 0
+    expected_total: int | None = None
+
+    offset = 0
+    while expected_total is None or offset < expected_total:
+        total, page = build_query(cfg, offset=offset, page_size=page_size).get_scanner_data()
+        total = int(total)
+        totals_seen.append(total)
+        if expected_total is None:
+            expected_total = total
+        elif total != expected_total:
+            issues.append(f"totalCount drifted {expected_total}->{total} at offset {offset}")
+
+        expected_rows = min(page_size, max(0, expected_total - offset))
+        actual_rows = len(page)
+        if actual_rows != expected_rows:
+            issues.append(
+                f"page {offset}:{offset + page_size} returned {actual_rows} rows, expected {expected_rows}"
+            )
+
+        pages.append(page)
+        page_ranges.append((offset, offset + page_size))
+        raw_rows += actual_rows
+        if expected_total == 0:
+            break
+        offset += step
+
+    if pages:
+        merged = pd.concat(pages, ignore_index=True)
+    else:
+        merged = pd.DataFrame(columns=["ticker", *TV_COLUMNS])
+
+    duplicate_rows = 0
+    if "ticker" not in merged.columns:
+        issues.append("TradingView response omitted ticker column")
+        unique = merged
+        ticker_set: frozenset[str] = frozenset()
+    else:
+        keys = merged["ticker"].astype(str).str.upper()
+        duplicate_rows = int(keys.duplicated(keep="first").sum())
+        unique = merged.loc[~keys.duplicated(keep="first")].copy()
+        unique["ticker"] = unique["ticker"].astype(str).str.upper()
+        # Client-side canonicalization makes the downstream order deterministic;
+        # completeness is established by the exact ticker set, not server tie order.
+        unique = unique.sort_values("ticker", kind="stable").reset_index(drop=True)
+        ticker_set = frozenset(unique["ticker"].astype(str))
+
+    expected_total = expected_total or 0
+    if len(unique) != expected_total:
+        issues.append(f"unique rows {len(unique)} != initial totalCount {expected_total}")
+
+    meta = {
+        "pagination": True,
+        "page_size": page_size,
+        "overlap": overlap,
+        "step": step,
+        "pages": len(pages),
+        "raw_rows": raw_rows,
+        "unique_rows": len(unique),
+        "duplicate_rows": duplicate_rows,
+        "total_count": expected_total,
+        "totals_seen": tuple(totals_seen),
+        "page_ranges": tuple(page_ranges),
+        "stable": not issues,
+        "issues": tuple(issues),
+    }
+    unique.attrs["tradingview_pagination"] = meta
+    return expected_total, unique, ticker_set, meta
 
 
 def fetch_screen(cfg: ScreenConfig):
-    # Intentionally one deterministic TradingView request. Coverage profiles
-    # should use a sufficiently high Limit (currently 2000). The CLI warns if
-    # totalCount still exceeds the returned row count.
-    return build_query(cfg).get_scanner_data()
+    if not cfg.paginate:
+        total, df = build_query(cfg).get_scanner_data()
+        total = int(total)
+        issues: list[str] = []
+        duplicate_rows = 0
+
+        if "ticker" not in df.columns:
+            if cfg.require_complete_universe:
+                issues.append("TradingView response omitted ticker column")
+        else:
+            keys = df["ticker"].astype(str).str.upper()
+            duplicate_rows = int(keys.duplicated(keep=False).sum())
+            if cfg.require_complete_universe and duplicate_rows:
+                issues.append(f"duplicate ticker rows in single response: {duplicate_rows}")
+
+        if cfg.require_complete_universe and len(df) != total:
+            hint = f"; configured Limit={cfg.limit}" if total > cfg.limit else ""
+            issues.append(f"returned rows {len(df)} != totalCount {total}{hint}")
+
+        if issues:
+            raise PaginationStabilityError(
+                "TradingView single-shot full-universe fetch was incomplete: " + "; ".join(issues)
+            )
+
+        mode = "single_shot_complete" if cfg.require_complete_universe else "single_request"
+        df.attrs["tradingview_pagination"] = {
+            "pagination": False,
+            "mode": mode,
+            "range_limit": cfg.limit,
+            "pages": 1,
+            "raw_rows": len(df),
+            "unique_rows": len(df),
+            "duplicate_rows": duplicate_rows,
+            "total_count": total,
+            "totals_seen": (total,),
+            "stable": True,
+            "issues": (),
+            "attempts": 1,
+            "require_complete_universe": cfg.require_complete_universe,
+        }
+        return total, df
+
+    attempts = 1 + cfg.pagination_retries
+    last_issues: list[str] = []
+    for attempt in range(1, attempts + 1):
+        # Increase overlap on retries.  This specifically protects against
+        # non-deterministic ordering inside equal-name tie groups.
+        overlap = min(cfg.limit - 1, cfg.pagination_overlap * (2 ** (attempt - 1)))
+        passes = []
+        pass_sets = []
+        attempt_issues: list[str] = []
+        total_ref: int | None = None
+
+        for pass_no in range(1, cfg.pagination_confirm_passes + 1):
+            total, df, ticker_set, meta = _fetch_paginated_pass(cfg, overlap=overlap)
+            passes.append((total, df, meta))
+            pass_sets.append(ticker_set)
+            if not meta["stable"]:
+                attempt_issues.extend(f"pass {pass_no}: {x}" for x in meta["issues"])
+                break
+            if total_ref is None:
+                total_ref = total
+            elif total != total_ref:
+                attempt_issues.append(
+                    f"confirmation totalCount drifted {total_ref}->{total} on pass {pass_no}"
+                )
+                break
+
+        if not attempt_issues and len(pass_sets) == cfg.pagination_confirm_passes:
+            ref = pass_sets[0]
+            for pass_no, current in enumerate(pass_sets[1:], start=2):
+                if current != ref:
+                    added = len(current - ref)
+                    removed = len(ref - current)
+                    attempt_issues.append(
+                        f"membership drift between confirmation passes: +{added}/-{removed} on pass {pass_no}"
+                    )
+                    break
+
+        if not attempt_issues and passes:
+            total, df, meta = passes[-1]
+            meta = dict(meta)
+            meta.update({
+                "attempts": attempt,
+                "confirmation_passes": cfg.pagination_confirm_passes,
+                "overlap": overlap,
+            })
+            df.attrs["tradingview_pagination"] = meta
+            return total, df
+
+        last_issues = attempt_issues or ["unknown pagination instability"]
+
+    detail = "; ".join(last_issues)
+    raise PaginationStabilityError(
+        f"TradingView full-universe pagination remained unstable after {attempts} attempt(s): {detail}"
+    )
 
 
 def dataframe_to_tv_rows(df) -> list[TvRow]:

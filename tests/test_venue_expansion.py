@@ -1348,3 +1348,261 @@ def test_yahoo_fund_type_failure_reroutes_to_ordinary_regional_equity(tmp_path):
     assert r.stats["yahoo_failure_regional_fallback_matches"] == 1
     assert r.stats["yahoo_failure_regional_fallback_matches_reason_YAHOO_TYPE_MISMATCH_MUTUALFUND"] == 1
     db.close()
+
+
+class OFGettexOneSidedRegionalTarget:
+    batch_size = 100
+
+    def map_jobs(self, jobs):
+        out = []
+        for job in jobs:
+            if (
+                job.get("idType") == "ID_ISIN"
+                and job.get("idValue") == "US1234567890"
+                and job.get("micCode") == "XFRA"
+            ):
+                out.append([OpenFigiIdentity(
+                    figi="BBG_GETTEX_XFRA", composite_figi="BBG_GETTEX_XFRA_C",
+                    share_class_figi="BBG_GETTEX_SHARE", ticker="ABC",
+                    name="ABC CORP", security_type="Common Stock",
+                    security_type2="Common Stock", exch_code="GF",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHRegionalRetryThenMatch:
+    batch_size = 75
+
+    def __init__(self):
+        self.calls = 0
+
+    def quotes(self, symbols):
+        self.calls += 1
+        if self.calls >= 2 and "ABC.F" in symbols:
+            return {"ABC.F": YahooQuote(
+                "ABC.F", "FRA", "Frankfurt", "EUR", "EQUITY", "de_market",
+                "ABC Corp", None, 42.0, 15,
+            )}
+        return {}
+
+
+def test_gettex_exact_isin_can_use_one_sided_regional_target_with_retry(tmp_path):
+    db = CacheDB(tmp_path / "gettex-one-sided-regional-retry.sqlite")
+    yh = YHRegionalRetryThenMatch()
+    r = BatchResolver(db, None, OFGettexOneSidedRegionalTarget(), yh)
+    row = TvRow(
+        "GETTEX:ABC", "GETTEX", "ABC", "ABC Corp", "EUR", "stock",
+        ("common",), None, 1e9, 42.0, isin="US1234567890",
+    )
+    b = r.resolve([row])[row.tv_id]
+    assert b.status == "VERIFIED"
+    assert b.mapping_method == "TV_ISIN_GERMANY_REGIONAL_TARGET_BRIDGE"
+    assert b.source_mic is None
+    assert b.source_venue_code == "GETTEX"
+    assert b.target_mic == "XFRA"
+    assert b.target_venue_figi == "BBG_GETTEX_XFRA"
+    assert b.share_class_figi == "BBG_GETTEX_SHARE"
+    assert r.stats["yahoo_regional_target_retry_rows"] == 1
+    assert r.stats["yahoo_regional_target_retry_matches"] == 1
+    assert r.stats["tv_isin_germany_regional_target_bridge_matches_GETTEX"] == 1
+    db.close()
+
+
+class OFTradegateOneSidedRegionalTarget:
+    batch_size = 100
+
+    def map_jobs(self, jobs):
+        out = []
+        for job in jobs:
+            if (
+                job.get("idType") == "ID_ISIN"
+                and job.get("idValue") == "US0987654321"
+                and job.get("micCode") == "XFRA"
+            ):
+                out.append([OpenFigiIdentity(
+                    figi="BBG_TG_XFRA", composite_figi="BBG_TG_XFRA_C",
+                    share_class_figi="BBG_TG_SHARE", ticker="TGX",
+                    name="TGX CORP", security_type="Common Stock",
+                    security_type2="Common Stock", exch_code="GF",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHTradegateOneSidedRegionalTarget:
+    batch_size = 75
+
+    def quotes(self, symbols):
+        if "TGX.F" in symbols:
+            return {"TGX.F": YahooQuote(
+                "TGX.F", "FRA", "Frankfurt", "EUR", "EQUITY", "de_market",
+                "TGX Corp", None, 50.0, 15,
+            )}
+        return {}
+
+
+def test_tradegate_exact_isin_can_use_one_sided_regional_target(tmp_path):
+    db = CacheDB(tmp_path / "tradegate-one-sided-regional.sqlite")
+    r = BatchResolver(
+        db, None, OFTradegateOneSidedRegionalTarget(),
+        YHTradegateOneSidedRegionalTarget(),
+    )
+    row = TvRow(
+        "TRADEGATE:TGX", "TRADEGATE", "TGX", "TGX Corp", "EUR", "stock",
+        ("common",), None, 1e9, 50.0, isin="US0987654321",
+    )
+    b = r.resolve([row])[row.tv_id]
+    assert b.status == "VERIFIED"
+    assert b.mapping_method == "TV_ISIN_GERMANY_REGIONAL_TARGET_BRIDGE"
+    assert b.source_mic is None
+    assert b.source_venue_code == "TRADEGATE"
+    assert b.target_mic == "XFRA"
+    assert r.stats["tv_isin_germany_regional_target_bridge_matches_TRADEGATE"] == 1
+    db.close()
+
+
+class OFGettexConflictingRegionalTargets:
+    batch_size = 100
+
+    def map_jobs(self, jobs):
+        out = []
+        for job in jobs:
+            if job.get("idType") != "ID_ISIN" or job.get("idValue") != "US1122334455":
+                out.append([])
+                continue
+            mic = job.get("micCode")
+            if mic == "XFRA":
+                share = "BBG_SHARE_A"
+                figi = "BBG_XFRA_A"
+            elif mic == "XMUN":
+                share = "BBG_SHARE_B"
+                figi = "BBG_XMUN_B"
+            else:
+                out.append([])
+                continue
+            out.append([OpenFigiIdentity(
+                figi=figi, composite_figi=f"{figi}_C", share_class_figi=share,
+                ticker="AMB", name="AMB CORP", security_type="Common Stock",
+                security_type2="Common Stock", exch_code="XX",
+            )])
+        return out
+
+
+class YHGettexConflictingRegionalTargets:
+    batch_size = 75
+
+    def quotes(self, symbols):
+        out = {}
+        if "AMB.F" in symbols:
+            out["AMB.F"] = YahooQuote(
+                "AMB.F", "FRA", "Frankfurt", "EUR", "EQUITY", "de_market",
+                "AMB Corp", None, 10.0, 15,
+            )
+        if "AMB.MU" in symbols:
+            out["AMB.MU"] = YahooQuote(
+                "AMB.MU", "MUN", "Munich", "EUR", "EQUITY", "de_market",
+                "AMB Corp", None, 10.0, 15,
+            )
+        return out
+
+
+def test_gettex_one_sided_regional_target_stays_fail_closed_on_share_conflict(tmp_path):
+    db = CacheDB(tmp_path / "gettex-one-sided-conflict.sqlite")
+    r = BatchResolver(
+        db, None, OFGettexConflictingRegionalTargets(),
+        YHGettexConflictingRegionalTargets(),
+    )
+    row = TvRow(
+        "GETTEX:AMB", "GETTEX", "AMB", "AMB Corp", "EUR", "stock",
+        ("common",), None, 1e9, 10.0, isin="US1122334455",
+    )
+    b = r.resolve([row])[row.tv_id]
+    assert b.status == "REJECTED"
+    assert b.rejection_reason == "OPENFIGI_SOURCE_NO_MATCH"
+    assert r.stats["regional_target_bridge_security_ambiguous_GETTEX"] == 1
+    db.close()
+
+
+class OFRegionalSecurityGrouping:
+    batch_size = 100
+
+    def __init__(self):
+        self.calls = []
+
+    def map_jobs(self, jobs):
+        self.calls.append([dict(job) for job in jobs])
+        out = []
+        for job in jobs:
+            id_type = job.get("idType")
+            isin = job.get("idValue")
+            mic = job.get("micCode")
+            if id_type == "ID_ISIN" and isin == "US0000000001" and mic in {"MUND", "LSSI"}:
+                out.append([OpenFigiIdentity(
+                    figi=f"SRC-{mic}", composite_figi="COMP-SRC",
+                    share_class_figi="SHARE-1", ticker="SRC",
+                    name="SAME SECURITY", security_type="Common Stock",
+                    security_type2="Common Stock", exch_code="GZ",
+                )])
+            elif id_type == "ID_ISIN" and isin == "US0000000001" and mic == "XFRA":
+                out.append([OpenFigiIdentity(
+                    figi="TGT-XFRA", composite_figi="COMP-TGT",
+                    share_class_figi="SHARE-1", ticker="ABC",
+                    name="SAME SECURITY", security_type="Common Stock",
+                    security_type2="Common Stock", exch_code="GF",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHRegionalSecurityGrouping:
+    batch_size = 75
+
+    def quotes(self, symbols):
+        if "ABC.F" not in symbols:
+            return {}
+        return {"ABC.F": YahooQuote(
+            "ABC.F", "FRA", "Frankfurt", "EUR", "EQUITY", "dr_market",
+            "Same Security", None, 10.0, 15,
+        )}
+
+
+def test_regional_exact_isin_evidence_is_grouped_across_provider_rows(tmp_path):
+    db = CacheDB(tmp_path / "regional-security-grouping.sqlite")
+    of = OFRegionalSecurityGrouping()
+    r = BatchResolver(db, None, of, YHRegionalSecurityGrouping())
+    rows = [
+        TvRow(
+            "GETTEX:ABC", "GETTEX", "ABC", "Same Security", "EUR", "stock",
+            ("common",), None, 1e9, 10.0, isin="US0000000001",
+        ),
+        TvRow(
+            "LS:123456", "LS", "123456", "Same Security", "EUR", "stock",
+            ("common",), None, 1e9, 10.0, isin="US0000000001",
+        ),
+    ]
+
+    got = r.resolve(rows)
+    assert got["GETTEX:ABC"].status == "VERIFIED"
+    assert got["LS:123456"].status == "VERIFIED"
+    assert got["GETTEX:ABC"].yahoo_symbol == "ABC.F"
+    assert got["LS:123456"].yahoo_symbol == "ABC.F"
+
+    germany_mics = {"XFRA", "XSTU", "XMUN", "XHAN", "XDUS", "XHAM"}
+    regional_calls = [
+        call for call in of.calls
+        if call and {job.get("micCode") for job in call} == germany_mics
+        and all(job.get("idValue") == "US0000000001" for job in call)
+    ]
+    assert len(regional_calls) == 1
+    assert len(regional_calls[0]) == 6
+    assert r.stats["openfigi_regional_target_probe_rows"] == 2
+    assert r.stats["openfigi_regional_target_probe_security_groups"] == 1
+    assert r.stats["openfigi_regional_target_probe_grouped_row_reuses"] == 1
+    assert r.stats["openfigi_regional_target_probe_row_equivalent_jobs"] == 12
+    assert r.stats["openfigi_regional_target_probe_jobs"] == 6
+    assert r.stats["openfigi_regional_target_probe_jobs_saved_by_grouping"] == 6
+    db.close()

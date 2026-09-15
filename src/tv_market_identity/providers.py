@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+from collections import defaultdict
 from typing import Iterable
 from urllib.parse import quote
 
@@ -54,6 +56,23 @@ class OpenFigiProvider:
         self.api_key = api_key or os.getenv("OPENFIGI_API_KEY")
         self.timeout = timeout
         self.session = requests.Session()
+        self._run_memo: dict[str, tuple[OpenFigiIdentity, ...]] = {}
+        self.metrics = defaultdict(int)
+
+    def reset_run_cache(self) -> None:
+        """Reset request-local OpenFIGI memoization and performance counters.
+
+        The resolver calls this once at the beginning of each resolve() run.
+        Mapping responses are immutable identity evidence, so identical jobs may
+        safely share one provider response within that run.  Nothing is persisted
+        across resolver runs.
+        """
+        self._run_memo.clear()
+        self.metrics.clear()
+
+    @staticmethod
+    def _job_key(job: dict) -> str:
+        return json.dumps(job, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
     @property
     def batch_size(self) -> int:
@@ -64,46 +83,80 @@ class OpenFigiProvider:
     def map_jobs(self, jobs: list[dict]) -> list[list[OpenFigiIdentity]]:
         if not jobs:
             return []
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-OPENFIGI-APIKEY"] = self.api_key
-        all_results: list[list[OpenFigiIdentity]] = []
-        for start in range(0, len(jobs), self.batch_size):
-            chunk = jobs[start:start + self.batch_size]
-            for attempt in range(4):
-                try:
-                    r = self.session.post(self.URL, headers=headers, json=chunk, timeout=self.timeout)
-                    if r.status_code == 429:
-                        wait = float(r.headers.get("ratelimit-reset") or 2 ** attempt)
-                        time.sleep(max(0.5, min(wait, 10)))
-                        continue
-                    r.raise_for_status()
-                    payload = r.json()
-                    break
-                except Exception as exc:
-                    if attempt == 3:
-                        raise ProviderError(f"OpenFIGI mapping failed: {exc}") from exc
-                    time.sleep(2 ** attempt)
-            else:
-                raise ProviderError("OpenFIGI mapping failed after retries")
 
-            if len(payload) != len(chunk):
-                raise ProviderError(f"OpenFIGI response length mismatch: {len(payload)} != {len(chunk)}")
-            for result in payload:
-                identities: list[OpenFigiIdentity] = []
-                for row in result.get("data") or []:
-                    identities.append(OpenFigiIdentity(
-                        figi=row.get("figi"),
-                        composite_figi=row.get("compositeFIGI"),
-                        share_class_figi=row.get("shareClassFIGI"),
-                        ticker=row.get("ticker"),
-                        name=row.get("name"),
-                        security_type=row.get("securityType"),
-                        security_type2=row.get("securityType2"),
-                        exch_code=row.get("exchCode"),
-                    ))
-                all_results.append(identities)
-        return all_results
+        self.metrics["requested_jobs"] += len(jobs)
+        keys = [self._job_key(job) for job in jobs]
+
+        # Preserve one output slot per requested job, but only send unique
+        # uncached jobs to OpenFIGI.  Duplicate jobs can occur both within one
+        # resolver stage and across bridge/probe/fallback stages.
+        pending_jobs: list[dict] = []
+        pending_keys: list[str] = []
+        pending_seen: set[str] = set()
+        for job, key in zip(jobs, keys):
+            if key in self._run_memo:
+                self.metrics["memo_hits"] += 1
+                continue
+            if key in pending_seen:
+                self.metrics["intra_call_dedup_hits"] += 1
+                continue
+            pending_seen.add(key)
+            pending_jobs.append(job)
+            pending_keys.append(key)
+
+        if pending_jobs:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["X-OPENFIGI-APIKEY"] = self.api_key
+
+            fetched: list[list[OpenFigiIdentity]] = []
+            for start in range(0, len(pending_jobs), self.batch_size):
+                chunk = pending_jobs[start:start + self.batch_size]
+                self.metrics["network_batches"] += 1
+                self.metrics["network_jobs"] += len(chunk)
+                for attempt in range(4):
+                    try:
+                        r = self.session.post(self.URL, headers=headers, json=chunk, timeout=self.timeout)
+                        if r.status_code == 429:
+                            wait = float(r.headers.get("ratelimit-reset") or 2 ** attempt)
+                            time.sleep(max(0.5, min(wait, 10)))
+                            continue
+                        r.raise_for_status()
+                        payload = r.json()
+                        break
+                    except Exception as exc:
+                        if attempt == 3:
+                            raise ProviderError(f"OpenFIGI mapping failed: {exc}") from exc
+                        time.sleep(2 ** attempt)
+                else:
+                    raise ProviderError("OpenFIGI mapping failed after retries")
+
+                if len(payload) != len(chunk):
+                    raise ProviderError(f"OpenFIGI response length mismatch: {len(payload)} != {len(chunk)}")
+                for result in payload:
+                    identities: list[OpenFigiIdentity] = []
+                    for row in result.get("data") or []:
+                        identities.append(OpenFigiIdentity(
+                            figi=row.get("figi"),
+                            composite_figi=row.get("compositeFIGI"),
+                            share_class_figi=row.get("shareClassFIGI"),
+                            ticker=row.get("ticker"),
+                            name=row.get("name"),
+                            security_type=row.get("securityType"),
+                            security_type2=row.get("securityType2"),
+                            exch_code=row.get("exchCode"),
+                        ))
+                    fetched.append(identities)
+
+            if len(fetched) != len(pending_keys):
+                raise ProviderError(f"OpenFIGI memoization alignment mismatch: {len(fetched)} != {len(pending_keys)}")
+            for key, identities in zip(pending_keys, fetched):
+                # OpenFigiIdentity is frozen; tuples make the memo itself
+                # immutable and fresh lists are returned to callers.
+                self._run_memo[key] = tuple(identities)
+
+        return [list(self._run_memo[key]) for key in keys]
+
 
 
 class YahooProvider:
@@ -116,12 +169,48 @@ class YahooProvider:
         except ImportError as exc:
             raise ProviderError("yfinance is not installed; run pip install -e .") from exc
         self.data = YfData()
+        self._run_quote_memo: dict[str, YahooQuote] = {}
+        self.metrics = defaultdict(int)
+
+    def reset_run_cache(self) -> None:
+        """Reset positive Yahoo quote evidence cached for one resolver run.
+
+        Only successfully returned quote rows are memoized.  Missing rows are
+        intentionally *not* cached because Yahoo v7 can omit thin listings from
+        one bulk response and return them on the targeted retry used by the
+        resolver.
+        """
+        self._run_quote_memo.clear()
+        self.metrics.clear()
 
     def quotes(self, symbols: Iterable[str]) -> dict[str, YahooQuote]:
-        unique = list(dict.fromkeys(s for s in symbols if s))
+        requested = [s for s in symbols if s]
+        unique = list(dict.fromkeys(requested))
+
+        # Some tests construct YahooProvider with __new__ to exercise parsing in
+        # isolation; initialize performance state lazily for compatibility.
+        if not hasattr(self, "_run_quote_memo"):
+            self._run_quote_memo = {}
+        if not hasattr(self, "metrics"):
+            self.metrics = defaultdict(int)
+
+        self.metrics["requested_symbols"] += len(unique)
+        self.metrics["intra_call_dedup_hits"] += max(0, len(requested) - len(unique))
+
         out: dict[str, YahooQuote] = {}
-        for start in range(0, len(unique), self.batch_size):
-            chunk = unique[start:start + self.batch_size]
+        pending: list[str] = []
+        for symbol in unique:
+            cached = self._run_quote_memo.get(symbol)
+            if cached is not None:
+                out[symbol] = cached
+                self.metrics["memo_hits"] += 1
+            else:
+                pending.append(symbol)
+
+        for start in range(0, len(pending), self.batch_size):
+            chunk = pending[start:start + self.batch_size]
+            self.metrics["network_batches"] += 1
+            self.metrics["network_symbols"] += len(chunk)
             try:
                 raw = self.data.get_raw_json(
                     self.URL,
@@ -130,11 +219,12 @@ class YahooProvider:
                 )
             except Exception as exc:
                 raise ProviderError(f"Yahoo bulk quote failed for {len(chunk)} symbols: {exc}") from exc
+            returned_in_chunk: set[str] = set()
             for row in (raw.get("quoteResponse", {}) or {}).get("result", []) or []:
                 symbol = str(row.get("symbol") or "")
-                if not symbol:
+                if not symbol or symbol not in chunk:
                     continue
-                out[symbol] = YahooQuote(
+                quote = YahooQuote(
                     symbol=symbol,
                     exchange=_nullable_text(row.get("exchange")),
                     full_exchange_name=_nullable_text(row.get("fullExchangeName")),
@@ -146,6 +236,13 @@ class YahooProvider:
                     price=row.get("regularMarketPrice"),
                     delayed_by=row.get("exchangeDataDelayedBy"),
                 )
+                out[symbol] = quote
+                self._run_quote_memo[symbol] = quote
+                returned_in_chunk.add(symbol)
+            self.metrics["returned_symbols"] += len(returned_in_chunk)
+            # Missing symbols remain uncached by design so a subsequent targeted
+            # retry is a real network request rather than a memoized miss.
+            self.metrics["missing_symbols"] += len(chunk) - len(returned_in_chunk)
         return out
 
     def chart_quotes(self, symbols: Iterable[str]) -> dict[str, YahooQuote]:

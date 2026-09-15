@@ -41,6 +41,9 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.44-policy44",)
+
+
 def _telemetry_token(value: str | None) -> str:
     """Bound provider metadata into a stable, low-cardinality stats token."""
     if value is None:
@@ -480,9 +483,49 @@ class BatchResolver:
         self.finnhub_ttl = finnhub_ttl_hours * 3600
         self.stats = defaultdict(int)
 
-    def resolve(self, rows: list[TvRow], refresh: bool = False) -> dict[str, Binding]:
+    def resolve(
+        self,
+        rows: list[TvRow],
+        refresh: bool = False,
+        refresh_rejected: bool = False,
+    ) -> dict[str, Binding]:
+        reset_openfigi_run_cache = getattr(self.openfigi, "reset_run_cache", None)
+        if callable(reset_openfigi_run_cache):
+            reset_openfigi_run_cache()
+        reset_yahoo_run_cache = getattr(self.yahoo, "reset_run_cache", None)
+        if callable(reset_yahoo_run_cache):
+            reset_yahoo_run_cache()
+
         current = {r.tv_id: (r.currency, r.tv_type) for r in rows}
-        cached = {} if refresh else self.cache.get_bindings([r.tv_id for r in rows], RESOLVER_VERSION, current)
+        ids = [r.tv_id for r in rows]
+        cached = {} if refresh else self.cache.get_bindings(ids, RESOLVER_VERSION, current)
+        if not refresh:
+            for compatible_version in CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS:
+                if compatible_version == RESOLVER_VERSION:
+                    continue
+                legacy = self.cache.get_bindings(ids, compatible_version, current)
+                legacy_verified = {
+                    tv_id: binding for tv_id, binding in legacy.items()
+                    if binding.status == "VERIFIED" and tv_id not in cached
+                }
+                legacy_rejected = sum(
+                    1 for tv_id, binding in legacy.items()
+                    if binding.status == "REJECTED" and tv_id not in cached
+                )
+                cached.update(legacy_verified)
+                self.stats["cache_compatible_verified_hits"] += len(legacy_verified)
+                self.stats["cache_compatible_rejected_ignored"] += legacy_rejected
+        if refresh_rejected and not refresh:
+            rejected_cached_ids = {
+                tv_id for tv_id, binding in cached.items()
+                if binding.status == "REJECTED"
+            }
+            if rejected_cached_ids:
+                cached = {
+                    tv_id: binding for tv_id, binding in cached.items()
+                    if tv_id not in rejected_cached_ids
+                }
+            self.stats["cache_rejected_refreshes"] += len(rejected_cached_ids)
         self.stats["cache_hits"] += len(cached)
         missing = [r for r in rows if r.tv_id not in cached]
         self.stats["cache_misses"] += len(missing)
@@ -500,6 +543,15 @@ class BatchResolver:
         self.stats["transient_rejections_not_cached"] += len(new_bindings) - len(persistent)
         out = dict(cached)
         out.update({b.tv_id: b for b in new_bindings})
+
+        provider_metrics = getattr(self.openfigi, "metrics", None)
+        if provider_metrics:
+            for name, value in provider_metrics.items():
+                self.stats[f"openfigi_provider_{name}"] = value
+        yahoo_metrics = getattr(self.yahoo, "metrics", None)
+        if yahoo_metrics:
+            for name, value in yahoo_metrics.items():
+                self.stats[f"yahoo_provider_{name}"] = value
         return out
 
     @staticmethod
@@ -1269,6 +1321,26 @@ class BatchResolver:
                         "isin_bridge": isin_bridge,
                         "source_isin_fallback": source_isin_fallback_used,
                     }
+            elif (
+                not source_matches
+                and r.isin
+                and not (isin_bridge and target_matches and len(source_mics) == 1)
+                and r.tv_id not in regional_target_probe_seen
+            ):
+                # The default target may exist even when the source venue is
+                # absent from OpenFIGI.  For German bridge namespaces, keep the
+                # row eligible for an exact-ISIN regional target proof rather
+                # than stopping at OPENFIGI_SOURCE_NO_MATCH.  Admission below
+                # still requires a non-null, unambiguous target shareClassFIGI
+                # and Yahoo's ordinary German quote contract.
+                regional_target_probe_seen.add(r.tv_id)
+                regional_target_probe_rows.append(r)
+                regional_bridge_context_by_id[r.tv_id] = {
+                    "source_matches": tuple(source_matches),
+                    "source_mics": source_mics,
+                    "isin_bridge": isin_bridge,
+                    "source_isin_fallback": source_isin_fallback_used,
+                }
             # LS Exchange (HAML) and occasional LSSI rows are not always
             # represented by OpenFIGI at the source venue.  For an ISIN bridge
             # with exactly one reviewed source MIC, an exact TradingView ISIN
@@ -1391,16 +1463,40 @@ class BatchResolver:
         # source venue is absent from OpenFIGI.  A deterministic MIC priority then
         # chooses one Yahoo quote venue without changing security identity.
         if regional_target_probe_rows:
-            regional_jobs: list[dict] = []
-            regional_layout: list[tuple[TvRow, str]] = []
+            # v0.3.52: build regional OpenFIGI work once per exact ISIN rather
+            # than once per TradingView row.  The raw provider evidence is safe
+            # to share because the lookup key is exact ID_ISIN + MIC. Selection
+            # remains row-specific below, so TradingView type/taxonomy guards are
+            # unchanged even when the same security is exposed by several German
+            # provider namespaces (GETTEX/LS/LSX/TRADEGATE).
+            regional_rows_by_isin: dict[str, list[TvRow]] = defaultdict(list)
+            regional_isin_order: list[str] = []
             for r in regional_target_probe_rows:
+                isin_key = (r.isin or "").upper().strip()
+                if isin_key not in regional_rows_by_isin:
+                    regional_isin_order.append(isin_key)
+                regional_rows_by_isin[isin_key].append(r)
+
+            regional_jobs: list[dict] = []
+            regional_layout: list[tuple[str, str]] = []
+            for isin_key in regional_isin_order:
                 for mic in GERMANY_REGIONAL_TARGET_MICS:
-                    regional_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
-                    regional_layout.append((r, mic))
+                    regional_jobs.append({"idType": "ID_ISIN", "idValue": isin_key, "micCode": mic})
+                    regional_layout.append((isin_key, mic))
+
+            row_equivalent_jobs = len(regional_target_probe_rows) * len(GERMANY_REGIONAL_TARGET_MICS)
+            self.stats["openfigi_regional_target_probe_rows"] += len(regional_target_probe_rows)
+            self.stats["openfigi_regional_target_probe_security_groups"] += len(regional_isin_order)
+            self.stats["openfigi_regional_target_probe_grouped_row_reuses"] += (
+                len(regional_target_probe_rows) - len(regional_isin_order)
+            )
+            self.stats["openfigi_regional_target_probe_row_equivalent_jobs"] += row_equivalent_jobs
+            self.stats["openfigi_regional_target_probe_jobs_saved_by_grouping"] += (
+                row_equivalent_jobs - len(regional_jobs)
+            )
 
             try:
                 regional_mapped = self.openfigi.map_jobs(regional_jobs)
-                self.stats["openfigi_regional_target_probe_rows"] += len(regional_target_probe_rows)
                 self.stats["openfigi_regional_target_probe_jobs"] += len(regional_jobs)
                 self.stats["openfigi_jobs"] += len(regional_jobs)
                 self.stats["openfigi_http_batches"] += (len(regional_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
@@ -1408,24 +1504,33 @@ class BatchResolver:
                 regional_mapped = [[] for _ in regional_jobs]
                 self.stats["openfigi_regional_target_probe_unavailable"] += len(regional_jobs)
 
+            regional_raw_by_isin_mic: dict[tuple[str, str], list[OpenFigiIdentity]] = {
+                key: identities
+                for key, identities in zip(regional_layout, regional_mapped)
+            }
+
             regional_candidates: list[tuple[TvRow, str, str, OpenFigiIdentity]] = []
             openfigi_mics_by_row: dict[str, set[str]] = defaultdict(set)
-            for (r, mic), identities in zip(regional_layout, regional_mapped):
-                prefix_token = _telemetry_token(r.prefix)
-                selected, collapsed = _select_isin_bridge_target(r, identities)
-                if selected is None or not selected.ticker:
-                    continue
-                openfigi_mics_by_row[r.tv_id].add(mic)
-                self.stats["openfigi_regional_target_probe_matches"] += 1
-                self.stats[f"openfigi_regional_target_probe_matches_{mic}"] += 1
-                self.stats[f"openfigi_regional_target_probe_matches_{prefix_token}_{mic}"] += 1
-                if collapsed:
-                    self.stats["openfigi_regional_target_probe_collapses"] += 1
-                regional_candidates.append((
-                    r, mic,
-                    yahoo_listing_symbol(selected.ticker, mic, r.prefix, tv_type_kind(r)),
-                    selected,
-                ))
+            for isin_key in regional_isin_order:
+                rows_for_isin = regional_rows_by_isin[isin_key]
+                for r in rows_for_isin:
+                    prefix_token = _telemetry_token(r.prefix)
+                    for mic in GERMANY_REGIONAL_TARGET_MICS:
+                        identities = regional_raw_by_isin_mic.get((isin_key, mic), [])
+                        selected, collapsed = _select_isin_bridge_target(r, identities)
+                        if selected is None or not selected.ticker:
+                            continue
+                        openfigi_mics_by_row[r.tv_id].add(mic)
+                        self.stats["openfigi_regional_target_probe_matches"] += 1
+                        self.stats[f"openfigi_regional_target_probe_matches_{mic}"] += 1
+                        self.stats[f"openfigi_regional_target_probe_matches_{prefix_token}_{mic}"] += 1
+                        if collapsed:
+                            self.stats["openfigi_regional_target_probe_collapses"] += 1
+                        regional_candidates.append((
+                            r, mic,
+                            yahoo_listing_symbol(selected.ticker, mic, r.prefix, tv_type_kind(r)),
+                            selected,
+                        ))
 
             for r in regional_target_probe_rows:
                 mics = openfigi_mics_by_row.get(r.tv_id, set())
@@ -1476,6 +1581,55 @@ class BatchResolver:
                         reason_token = _telemetry_token(reason.split(":", 1)[0])
                         self.stats[f"yahoo_regional_target_probe_block_{reason_token}"] += 1
 
+                # Yahoo v7 occasionally omits thin German regional rows from a
+                # bulk response even though the same symbol is returned on a
+                # subsequent request. Retry only rows that received *no* valid
+                # candidate at all; this keeps the extra work bounded while
+                # preserving the exact same currency/type/venue contract.
+                retry_row_ids = {
+                    r.tv_id for r in regional_target_probe_rows
+                    if not yahoo_valid_by_row.get(r.tv_id)
+                }
+                if retry_row_ids:
+                    retry_records = [
+                        record for record in regional_candidates
+                        if record[0].tv_id in retry_row_ids
+                    ]
+                    retry_symbols = list(dict.fromkeys(record[2] for record in retry_records))
+                    try:
+                        retry_quotes = self.yahoo.quotes(retry_symbols) if retry_symbols else {}
+                        if retry_symbols:
+                            self.stats["yahoo_regional_target_retry_rows"] += len(retry_row_ids)
+                            self.stats["yahoo_regional_target_retry_candidates"] += len(retry_records)
+                            self.stats["yahoo_regional_target_retry_batches"] += (
+                                len(retry_symbols) + batch_size - 1
+                            ) // batch_size
+                    except ProviderError:
+                        retry_quotes = {}
+                        self.stats["yahoo_regional_target_retry_unavailable"] += len(retry_row_ids)
+
+                    seen_retry: set[tuple[str, str, str]] = set()
+                    for r, mic, symbol, selected in retry_records:
+                        key = (r.tv_id, mic, symbol)
+                        if key in seen_retry:
+                            continue
+                        seen_retry.add(key)
+                        q = retry_quotes.get(symbol)
+                        regular_ok = _non_us_quote_compatible(r, mic, symbol, q, False)
+                        taxonomy_ok = _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+                            r, mic, symbol, q, selected, "REGIONAL_PROBE_RETRY"
+                        )
+                        if regular_ok or taxonomy_ok:
+                            yahoo_mics_by_row[r.tv_id].add(mic)
+                            yahoo_valid_by_row[r.tv_id].append((r, mic, symbol, selected))
+                            self.stats["yahoo_regional_target_retry_matches"] += 1
+                            self.stats[
+                                f"yahoo_regional_target_retry_matches_{_telemetry_token(r.prefix)}"
+                            ] += 1
+                            self.stats[f"yahoo_regional_target_retry_matches_{mic}"] += 1
+                            if taxonomy_ok and not regular_ok:
+                                self.stats["yahoo_regional_target_retry_taxonomy_anomaly_matches"] += 1
+
                 for r in regional_target_probe_rows:
                     mics = yahoo_mics_by_row.get(r.tv_id, set())
                     prefix_token = _telemetry_token(r.prefix)
@@ -1502,6 +1656,7 @@ class BatchResolver:
                 isin_bridge = bool(ctx.get("isin_bridge"))
 
                 eligible: list[tuple[TvRow, str, str, OpenFigiIdentity, str | None, OpenFigiIdentity | None]] = []
+                one_sided_tv_isin = False
                 if source_matches:
                     for vr, mic, symbol, target_of in valid:
                         share = target_of.share_class_figi
@@ -1520,11 +1675,24 @@ class BatchResolver:
                         self.stats["regional_target_bridge_source_share_class_no_match"] += 1
                         self.stats[f"regional_target_bridge_source_share_class_no_match_{prefix_token}"] += 1
                         continue
-                elif isin_bridge and len(source_mics) == 1:
-                    # Same contract as TV_ISIN_TARGET_BRIDGE: TradingView supplied
-                    # an exact ISIN and the provider namespace maps to one reviewed
-                    # source MIC, but OpenFIGI lacks that source listing.
-                    eligible = [(*record, source_mics[0], None) for record in valid]
+                elif r.isin and r.prefix in {"GETTEX", "LS", "LSX", "TRADEGATE"}:
+                    # Security-level one-sided proof for German bridge namespaces.
+                    # TradingView supplied the exact ISIN, every regional target
+                    # candidate was independently resolved by ID_ISIN + exact MIC,
+                    # and Yahoo already passed the ordinary German quote contract.
+                    # We deliberately do not invent a source FIGI or an exact source
+                    # MIC when a provider namespace spans more than one reviewed MIC.
+                    source_mic_hint = source_mics[0] if len(source_mics) == 1 else None
+                    eligible = [
+                        (*record, source_mic_hint, None)
+                        for record in valid
+                        if record[3].share_class_figi
+                    ]
+                    if not eligible:
+                        self.stats["regional_target_bridge_source_proof_missing"] += 1
+                        self.stats[f"regional_target_bridge_source_proof_missing_{prefix_token}"] += 1
+                        continue
+                    one_sided_tv_isin = True
                 else:
                     self.stats["regional_target_bridge_source_proof_missing"] += 1
                     self.stats[f"regional_target_bridge_source_proof_missing_{prefix_token}"] += 1
@@ -1544,6 +1712,7 @@ class BatchResolver:
 
                 chosen = min(eligible, key=lambda x: priority.get(x[1], len(priority)))
                 _, target_mic, yahoo_symbol, target_of, source_mic, source_of = chosen
+                source_venue_code = None
                 if source_of is None:
                     source_of = OpenFigiIdentity(
                         figi=None,
@@ -1555,10 +1724,18 @@ class BatchResolver:
                         security_type2=target_of.security_type2,
                         exch_code=None,
                     )
-                    mapping_method = "TV_ISIN_REGIONAL_TARGET_BRIDGE"
+                    if one_sided_tv_isin and len(source_mics) != 1:
+                        mapping_method = "TV_ISIN_GERMANY_REGIONAL_TARGET_BRIDGE"
+                        source_venue_code = r.prefix
+                        self.stats["tv_isin_germany_regional_target_bridge_matches"] += 1
+                        self.stats[
+                            f"tv_isin_germany_regional_target_bridge_matches_{prefix_token}"
+                        ] += 1
+                    else:
+                        mapping_method = "TV_ISIN_REGIONAL_TARGET_BRIDGE"
+                        self.stats["tv_isin_regional_target_bridge_matches"] += 1
+                        self.stats[f"tv_isin_regional_target_bridge_matches_{prefix_token}"] += 1
                     identity = target_of
-                    self.stats["tv_isin_regional_target_bridge_matches"] += 1
-                    self.stats[f"tv_isin_regional_target_bridge_matches_{prefix_token}"] += 1
                 else:
                     mapping_method = (
                         "ISIN_REGIONAL_SHARE_CLASS_BRIDGE"
@@ -1577,7 +1754,7 @@ class BatchResolver:
                     "source_identity": source_of,
                     "target_identity": target_of,
                     "source_mic": source_mic,
-                    "source_venue_code": None,
+                    "source_venue_code": source_venue_code,
                     "target_mic": target_mic,
                     "yahoo_symbol": yahoo_symbol,
                     "mapping_method": mapping_method,

@@ -72,3 +72,37 @@ market=market=switzerland
     cfg = load_screen_config(p)
     assert cfg.primary_only is True
     assert cfg.min_market_cap is None
+
+
+def test_pagination_flags(tmp_path):
+    p = tmp_path / "full.ini"
+    p.write_text("""[TradingView]
+StockFilterSchema=2
+Limit=4000
+Paginate=true
+PaginationRetries=2
+PaginationOverlap=384
+PaginationConfirmPasses=2
+OrderBy=name
+Ascending=true
+
+[Filters]
+market=market=germany
+""", encoding="utf-8")
+    cfg = load_screen_config(p)
+    assert cfg.paginate is True
+    assert cfg.limit == 4000
+    assert cfg.pagination_retries == 2
+    assert cfg.pagination_overlap == 384
+    assert cfg.pagination_confirm_passes == 2
+    assert cfg.order_by == "name"
+    assert cfg.ascending is True
+
+
+def test_complete_universe_flag(tmp_path):
+    p = tmp_path / "full.ini"
+    p.write_text("""\n[General]\nPresetName=x\nAssetType=STOCKS\nMinScore=0\n[TradingView]\nStockFilterSchema=2\nLimit=100000\nPaginate=false\nRequireCompleteUniverse=true\nOrderBy=name\nAscending=true\n[Filters]\nmarket=market=germany\n""", encoding="utf-8")
+    cfg = load_screen_config(p)
+    assert cfg.paginate is False
+    assert cfg.require_complete_universe is True
+    assert cfg.limit == 100000

@@ -26,7 +26,7 @@ from .policy import (
     yahoo_venue_compatible,
 )
 from .resolver import BatchResolver
-from .tradingview import dataframe_to_tv_rows, fetch_screen
+from .tradingview import PaginationStabilityError, dataframe_to_tv_rows, fetch_screen
 
 
 def _load_environment() -> str | None:
@@ -220,9 +220,38 @@ def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchReso
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
+
+
+def _print_tradingview_pagination(df) -> None:
+    meta = getattr(df, "attrs", {}).get("tradingview_pagination", {})
+    if meta.get("mode") == "single_shot_complete":
+        print(
+            "TradingView full-universe single-shot: "
+            f"range_limit={meta.get('range_limit')}, returned={meta.get('raw_rows')}, "
+            f"unique_rows={meta.get('unique_rows')}, duplicate_rows={meta.get('duplicate_rows')}, "
+            f"totalCount={meta.get('total_count')}"
+        )
+        return
+    if not meta.get("pagination"):
+        return
+    print(
+        "TradingView pagination: "
+        f"pages={meta.get('pages')}, page_size={meta.get('page_size')}, "
+        f"overlap={meta.get('overlap')}, confirm_passes={meta.get('confirmation_passes')}, "
+        f"attempts={meta.get('attempts')}, raw_rows={meta.get('raw_rows')}, "
+        f"unique_rows={meta.get('unique_rows')}, duplicate_observations={meta.get('duplicate_rows')}, "
+        f"totalCount={meta.get('total_count')}"
+    )
+
 def cmd_run(args) -> int:
     cfg = load_screen_config(args.config)
-    print(f"TradingView: market={cfg.market}, limit={cfg.limit}, order={cfg.order_by} {'ASC' if cfg.ascending else 'DESC'}")
+    if cfg.paginate:
+        mode = f"page_size={cfg.limit}, paginate=true"
+    elif cfg.require_complete_universe:
+        mode = f"limit={cfg.limit}, full=single-shot"
+    else:
+        mode = f"limit={cfg.limit}"
+    print(f"TradingView: market={cfg.market}, {mode}, order={cfg.order_by} {'ASC' if cfg.ascending else 'DESC'}")
     filter_parts = []
     if cfg.min_market_cap is not None:
         filter_parts.append(f"cap>{cfg.min_market_cap:g}")
@@ -235,7 +264,12 @@ def cmd_run(args) -> int:
     if cfg.primary_only:
         filter_parts.append("primaryOnly=true")
     print("Filters: " + (", ".join(filter_parts) if filter_parts else "market only"))
-    total, df = fetch_screen(cfg)
+    try:
+        total, df = fetch_screen(cfg)
+    except PaginationStabilityError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 4
+    _print_tradingview_pagination(df)
     rows = dataframe_to_tv_rows(df)
     print(f"TradingView returned {len(df)} rows (totalCount={total}); resolvable rows={len(rows)}")
     if total > len(df):
@@ -244,7 +278,7 @@ def cmd_run(args) -> int:
     cache = CacheDB(args.cache)
     try:
         resolver = _make_resolver(cache, args)
-        bindings = resolver.resolve(rows, refresh=args.refresh)
+        bindings = resolver.resolve(rows, refresh=args.refresh, refresh_rejected=args.refresh_rejected)
         resolver.refresh_cached_quotes(bindings)
         verified = sum(1 for b in bindings.values() if b.status == "VERIFIED")
         rejected = sum(1 for b in bindings.values() if b.status == "REJECTED")
@@ -290,7 +324,12 @@ def cmd_run(args) -> int:
 
 def cmd_screen(args) -> int:
     cfg = load_screen_config(args.config)
-    total, df = fetch_screen(cfg)
+    try:
+        total, df = fetch_screen(cfg)
+    except PaginationStabilityError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 4
+    _print_tradingview_pagination(df)
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False, encoding="utf-8-sig")
@@ -514,6 +553,11 @@ def parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="Run TradingView + persistent identity resolution")
     common(r)
     r.add_argument("--refresh", action="store_true", help="Ignore binding cache and resolve again")
+    r.add_argument(
+        "--refresh-rejected",
+        action="store_true",
+        help="Reuse cached VERIFIED bindings but re-resolve cached REJECTED bindings",
+    )
     r.add_argument(
         "--rejection-audit",
         default=None,

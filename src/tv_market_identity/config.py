@@ -17,6 +17,11 @@ class ScreenConfig:
     min_pe: float | None
     sectors: tuple[str, ...]
     primary_only: bool
+    paginate: bool = False
+    pagination_retries: int = 1
+    pagination_overlap: int = 256
+    pagination_confirm_passes: int = 2
+    require_complete_universe: bool = False
 
 
 def _bool(v: str) -> bool:
@@ -79,4 +84,9 @@ def load_screen_config(path: str | Path) -> ScreenConfig:
         min_pe=above_optional("price_earnings_ttm"),
         sectors=sectors,
         primary_only=_bool(tv.get("PrimaryOnly", "false")),
+        paginate=_bool(tv.get("Paginate", "false")),
+        pagination_retries=max(0, int(tv.get("PaginationRetries", "1"))),
+        pagination_overlap=max(0, int(tv.get("PaginationOverlap", "256"))),
+        pagination_confirm_passes=max(1, int(tv.get("PaginationConfirmPasses", "2"))),
+        require_complete_universe=_bool(tv.get("RequireCompleteUniverse", "false")),
     )
