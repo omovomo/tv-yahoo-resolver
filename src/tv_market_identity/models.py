@@ -16,6 +16,7 @@ class TvRow:
     sector: str | None
     market_cap: float | None
     close: float | None
+    isin: str | None = None
 
 
 @dataclass(frozen=True)

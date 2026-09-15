@@ -11,6 +11,8 @@ from .models import Binding, FinnhubIdentity, OpenFigiIdentity, TvRow, YahooQuot
 from .policy import (
     CROSS_VENUE_BRIDGES,
     EXCHCODE_SHARE_CLASS_BRIDGES,
+    ISIN_SHARE_CLASS_BRIDGES,
+    GERMANY_REGIONAL_TARGET_MICS,
     MIC_TO_YAHOO_SUFFIX,
     RESOLVER_VERSION,
     REVIEWED_ISIN_FALLBACKS,
@@ -45,6 +47,7 @@ def _telemetry_token(value: str | None) -> str:
         return "UNREPORTED"
     token = re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
     return (token or "EMPTY")[:48]
+
 
 
 def _select_openfigi_identity(row: TvRow, identities: list[OpenFigiIdentity]):
@@ -89,6 +92,51 @@ def _select_openfigi_identity(row: TvRow, identities: list[OpenFigiIdentity]):
             exch_code=None,
         ), True, None
     return None, False, f"OPENFIGI_AMBIGUOUS:{len(exact)}"
+
+
+def _select_isin_bridge_target(
+    row: TvRow,
+    identities: list[OpenFigiIdentity],
+    *,
+    required_share_class: str | None = None,
+) -> tuple[OpenFigiIdentity | None, bool]:
+    """Select one security-level target from an exact ``ID_ISIN + MIC`` job.
+
+    ``ID_ISIN`` already fixes the security identifier, so duplicate venue rows
+    can be collapsed only when they also agree on one non-null shareClassFIGI
+    and one normalized ticker.  No arbitrary venue FIGI is retained.
+    """
+    exact = [
+        x for x in identities
+        if openfigi_type_compatible(row, x)
+        and (required_share_class is None or x.share_class_figi == required_share_class)
+    ]
+    if not exact:
+        return None, False
+    if len(exact) == 1:
+        return exact[0], False
+
+    shares = {x.share_class_figi for x in exact if x.share_class_figi}
+    tickers = {punctuation_key(x.ticker or "") for x in exact if x.ticker}
+    if (
+        all(bool(x.share_class_figi) for x in exact)
+        and all(bool(x.ticker) for x in exact)
+        and len(shares) == 1
+        and len(tickers) == 1
+    ):
+        composites = {x.composite_figi for x in exact if x.composite_figi}
+        first = exact[0]
+        return OpenFigiIdentity(
+            figi=None,
+            composite_figi=(next(iter(composites)) if len(composites) == 1 else None),
+            share_class_figi=next(iter(shares)),
+            ticker=first.ticker,
+            name=first.name,
+            security_type=first.security_type,
+            security_type2=first.security_type2,
+            exch_code=None,
+        ), True
+    return None, False
 
 
 def _strict_yahoo_mapping(mapping_method: str | None) -> bool:
@@ -268,6 +316,44 @@ def _reviewed_yahoo_mutualfund_taxonomy_anomaly_compatible(
     return _reviewed_yahoo_mutualfund_taxonomy_block_reason(
         row, target_mic, expected_symbol, q, identity, mapping_method
     ) is None
+
+
+def _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    identity: OpenFigiIdentity | None,
+    mapping_method: str | None,
+) -> bool:
+    """Bounded German regional Yahoo fund-taxonomy anomaly.
+
+    Some thin German regional equity quotes are exposed by Yahoo as
+    ``MUTUALFUND`` or ``ETF`` even though TradingView and an independent exact
+    OpenFIGI mapping prove a common equity / REIT.  This exception never creates
+    identity and is intentionally narrower than the ordinary non-US contract:
+    it requires an exact ISIN-bearing common-stock TV row, explicit matching EUR
+    currency, an explicit compatible German regional venue, and non-strict
+    OpenFIGI-backed mapping evidence.
+    """
+    if q is None or identity is None or _strict_yahoo_mapping(mapping_method):
+        return False
+    if target_mic not in GERMANY_REGIONAL_TARGET_MICS:
+        return False
+    if row.prefix not in {"GETTEX", "LS", "LSX", "TRADEGATE", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}:
+        return False
+    if not row.isin or tv_type_kind(row) != "STOCK":
+        return False
+    specs = {str(x).lower() for x in row.type_specs if x}
+    if "common" not in specs:
+        return False
+    if q.symbol != expected_symbol or (q.quote_type or "").upper() not in {"MUTUALFUND", "ETF"}:
+        return False
+    if q.currency is None or not currency_compatible(row.currency, q.currency):
+        return False
+    if not yahoo_venue_compatible(target_mic, q):
+        return False
+    return openfigi_type_compatible(row, identity)
 
 
 def _non_us_quote_compatible(row: TvRow, target_mic: str, expected_symbol: str, q: YahooQuote | None, target_only: bool) -> bool:
@@ -572,6 +658,12 @@ class BatchResolver:
             if r.prefix in CROSS_VENUE_BRIDGES:
                 bridge_rows.append(r)
                 continue
+            if r.prefix in ISIN_SHARE_CLASS_BRIDGES:
+                if not r.isin:
+                    rejected.append(self._reject(r, "TV_ISIN_UNKNOWN"))
+                    continue
+                bridge_rows.append(r)
+                continue
             if r.prefix in EXCHCODE_SHARE_CLASS_BRIDGES:
                 exchcode_bridge_rows.append(r)
                 continue
@@ -604,6 +696,8 @@ class BatchResolver:
 
             retry_rows: list[TvRow] = []
             retry_jobs: list[dict] = []
+            german_direct_isin_rows: list[TvRow] = []
+            german_direct_isin_jobs: list[dict] = []
             isin_fallback_rows: list[tuple[TvRow, str]] = []
             isin_fallback_jobs: list[dict] = []
             isin_unscoped_rows: list[tuple[TvRow, str]] = []
@@ -819,9 +913,45 @@ class BatchResolver:
                             "currency": "GBP",
                         })
                         continue
+                    if ((reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
+                            and r.prefix in {"FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
+                            and r.isin):
+                        german_direct_isin_rows.append(r)
+                        german_direct_isin_jobs.append({
+                            "idType": "ID_ISIN",
+                            "idValue": r.isin,
+                            "micCode": TV_PREFIX_TO_MIC[r.prefix],
+                        })
+                        continue
                     if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH" and add_target_provider_strict_fallback(r):
                         continue
                     rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
+
+                if german_direct_isin_jobs:
+                    try:
+                        german_direct_isin_mapped = self.openfigi.map_jobs(german_direct_isin_jobs)
+                        self.stats["openfigi_jobs"] += len(german_direct_isin_jobs)
+                        self.stats["openfigi_german_direct_isin_fallback_jobs"] += len(german_direct_isin_jobs)
+                        self.stats["openfigi_http_batches"] += (len(german_direct_isin_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in german_direct_isin_rows)
+                        german_direct_isin_mapped = [[] for _ in german_direct_isin_rows]
+
+                    for r, identities in zip(german_direct_isin_rows, german_direct_isin_mapped):
+                        of, collapsed = _select_isin_bridge_target(r, identities)
+                        prefix_token = _telemetry_token(r.prefix)
+                        if of is not None:
+                            add_direct_pending(
+                                r, of, collapsed,
+                                method_override="TV_ISIN_SAME_VENUE_FALLBACK",
+                            )
+                            self.stats["openfigi_german_direct_isin_fallback_matches"] += 1
+                            self.stats[f"openfigi_german_direct_isin_fallback_matches_{prefix_token}"] += 1
+                            continue
+                        self.stats["openfigi_german_direct_isin_fallback_no_match"] += 1
+                        self.stats[f"openfigi_german_direct_isin_fallback_no_match_{prefix_token}"] += 1
+                        if not add_target_provider_strict_fallback(r):
+                            rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
 
                 if secondary_mic_jobs:
                     secondary_provider_failed = False
@@ -971,50 +1101,217 @@ class BatchResolver:
         # Cross-venue share-class bridges.  Jobs are still batched across all
         # bridge rows so one screen does not become N HTTP requests.
         bridge_jobs: list[dict] = []
-        bridge_layout: list[tuple[TvRow, tuple[str, ...], str, int, int]] = []
+        bridge_layout: list[tuple[TvRow, tuple[str, ...], str, int, int, bool]] = []
         for r in bridge_rows:
-            cfg = CROSS_VENUE_BRIDGES[r.prefix]
+            isin_bridge = r.prefix in ISIN_SHARE_CLASS_BRIDGES
+            cfg = ISIN_SHARE_CLASS_BRIDGES[r.prefix] if isin_bridge else CROSS_VENUE_BRIDGES[r.prefix]
             source_mics = tuple(cfg["source_mics"])
             target_mic = str(cfg["target_mic"])
             offset = len(bridge_jobs)
             for mic in (*source_mics, target_mic):
-                bridge_jobs.append({
-                    "idType": "ID_EXCH_SYMBOL",
-                    "idValue": r.symbol,
-                    "micCode": mic,
-                    "currency": openfigi_currency(r.currency),
-                    "securityType2": openfigi_security_type(r),
-                })
-            bridge_layout.append((r, source_mics, target_mic, offset, len(source_mics) + 1))
+                if isin_bridge:
+                    # TradingView LS/LSX often expose WKN-style symbols that do
+                    # not equal the Xetra local ticker. Exact ISIN + exact MIC is
+                    # therefore the bridge key; type remains a post-response guard.
+                    bridge_jobs.append({
+                        "idType": "ID_ISIN",
+                        "idValue": r.isin,
+                        "micCode": mic,
+                    })
+                else:
+                    bridge_jobs.append({
+                        "idType": "ID_EXCH_SYMBOL",
+                        "idValue": r.symbol,
+                        "micCode": mic,
+                        "currency": openfigi_currency(r.currency),
+                        "securityType2": openfigi_security_type(r),
+                    })
+            bridge_layout.append((r, source_mics, target_mic, offset, len(source_mics) + 1, isin_bridge))
 
         bridge_mapped: list[list[OpenFigiIdentity]] = []
+        isin_bridge_probe_rows: list[TvRow] = []
+        isin_bridge_probe_seen: set[str] = set()
+        regional_target_probe_rows: list[TvRow] = []
+        regional_target_probe_seen: set[str] = set()
+        # Preserve the source-side bridge evidence for rows whose default Xetra
+        # target is absent. Regional target routing later may reuse this exact
+        # evidence, but never weakens the source-side contract.
+        regional_bridge_context_by_id: dict[str, dict] = {}
         if bridge_jobs:
             try:
                 bridge_mapped = self.openfigi.map_jobs(bridge_jobs)
                 self.stats["openfigi_jobs"] += len(bridge_jobs)
                 self.stats["openfigi_cross_venue_jobs"] += len(bridge_jobs)
+                self.stats["openfigi_isin_bridge_jobs"] += sum(
+                    len(tuple(ISIN_SHARE_CLASS_BRIDGES[r.prefix]["source_mics"])) + 1
+                    for r in bridge_rows if r.prefix in ISIN_SHARE_CLASS_BRIDGES
+                )
                 self.stats["openfigi_http_batches"] += (len(bridge_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
             except ProviderError as exc:
                 rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in bridge_rows)
                 bridge_mapped = [[] for _ in bridge_jobs]
 
-        for r, source_mics, target_mic, offset, count in bridge_layout:
+        # Germany cross-venue source rescue.  The primary TRADEGATE bridge
+        # intentionally starts with ID_EXCH_SYMBOL + source MIC because that is
+        # the strongest same-symbol proof.  Live audit evidence showed a small
+        # class where that lookup is empty even though exact TradingView ISIN +
+        # the same source MIC resolves cleanly in OpenFIGI.  Batch only those
+        # primary source misses and preserve the exact source MIC; no source
+        # venue is guessed and the later shareClassFIGI bridge remains mandatory.
+        bridge_source_isin_fallback_by_id: dict[str, list[tuple[str, OpenFigiIdentity]]] = defaultdict(list)
+        bridge_source_isin_jobs: list[dict] = []
+        bridge_source_isin_layout: list[tuple[TvRow, str]] = []
+        bridge_source_isin_rows: set[str] = set()
+        for r, source_mics, _target_mic, offset, count, isin_bridge in bridge_layout:
+            if isin_bridge or not r.isin:
+                continue
             chunks = bridge_mapped[offset:offset + count]
             if len(chunks) != count:
+                continue
+            primary_source_matches = [
+                (mic, x)
+                for mic, identities in zip(source_mics, chunks[:-1])
+                for x in identities
+                if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                and openfigi_type_compatible(r, x)
+            ]
+            if primary_source_matches:
+                continue
+            bridge_source_isin_rows.add(r.tv_id)
+            for mic in source_mics:
+                bridge_source_isin_jobs.append({
+                    "idType": "ID_ISIN",
+                    "idValue": r.isin,
+                    "micCode": mic,
+                })
+                bridge_source_isin_layout.append((r, mic))
+
+        if bridge_source_isin_jobs:
+            self.stats["openfigi_bridge_source_isin_fallback_rows"] += len(bridge_source_isin_rows)
+            self.stats["openfigi_bridge_source_isin_fallback_jobs"] += len(bridge_source_isin_jobs)
+            try:
+                source_isin_mapped = self.openfigi.map_jobs(bridge_source_isin_jobs)
+                self.stats["openfigi_jobs"] += len(bridge_source_isin_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(bridge_source_isin_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError:
+                source_isin_mapped = [[] for _ in bridge_source_isin_jobs]
+                self.stats["openfigi_bridge_source_isin_fallback_unavailable"] += len(bridge_source_isin_jobs)
+
+            for (r, mic), identities in zip(bridge_source_isin_layout, source_isin_mapped):
+                selected, collapsed = _select_isin_bridge_target(r, identities)
+                if selected is None:
+                    continue
+                bridge_source_isin_fallback_by_id[r.tv_id].append((mic, selected))
+                self.stats["openfigi_bridge_source_isin_fallback_matches"] += 1
+                self.stats[
+                    f"openfigi_bridge_source_isin_fallback_matches_{_telemetry_token(r.prefix)}"
+                ] += 1
+                self.stats[
+                    f"openfigi_bridge_source_isin_fallback_matches_{_telemetry_token(mic)}"
+                ] += 1
+                if collapsed:
+                    self.stats["openfigi_bridge_source_isin_fallback_collapses"] += 1
+
+        for r, source_mics, target_mic, offset, count, isin_bridge in bridge_layout:
+            prefix_token = _telemetry_token(r.prefix)
+            self.stats[f"bridge_rows_{prefix_token}"] += 1
+            chunks = bridge_mapped[offset:offset + count]
+            if len(chunks) != count:
+                self.stats[f"bridge_response_mismatch_{prefix_token}"] += 1
                 rejected.append(self._reject(r, "OPENFIGI_BRIDGE_RESPONSE_MISMATCH"))
                 continue
 
+            source_raw_count = sum(len(identities) for identities in chunks[:-1])
+            target_raw_count = len(chunks[-1])
             source_matches: list[tuple[str, OpenFigiIdentity]] = []
             for mic, identities in zip(source_mics, chunks[:-1]):
                 for x in identities:
-                    if punctuation_key(x.ticker or "") == punctuation_key(r.symbol) and openfigi_type_compatible(r, x):
+                    symbol_ok = isin_bridge or punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                    if symbol_ok and openfigi_type_compatible(r, x):
                         source_matches.append((mic, x))
 
             target_matches = [
                 x for x in chunks[-1]
-                if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                if (isin_bridge or punctuation_key(x.ticker or "") == punctuation_key(r.symbol))
                 and openfigi_type_compatible(r, x)
             ]
+            # Diagnostic only: distinguish a true scoped OpenFIGI coverage gap
+            # from a provider taxonomy/symbol post-filter mismatch.  This does
+            # not change the fail-closed bridge decision.
+            if not source_matches:
+                self.stats[f"bridge_source_no_match_{prefix_token}"] += 1
+                self.stats[
+                    f"bridge_source_{'empty' if source_raw_count == 0 else 'postfilter_mismatch'}_{prefix_token}"
+                ] += 1
+
+            source_isin_fallback_used = False
+            if not source_matches:
+                rescued_source_matches = list(bridge_source_isin_fallback_by_id.get(r.tv_id, ()))
+                if rescued_source_matches:
+                    source_matches.extend(rescued_source_matches)
+                    source_isin_fallback_used = True
+                    self.stats["bridge_source_isin_fallback_matches"] += 1
+                    self.stats[f"bridge_source_isin_fallback_matches_{prefix_token}"] += 1
+
+            if not target_matches:
+                self.stats[f"bridge_target_no_match_{prefix_token}"] += 1
+                self.stats[
+                    f"bridge_target_{'empty' if target_raw_count == 0 else 'postfilter_mismatch'}_{prefix_token}"
+                ] += 1
+                if r.isin and r.tv_id not in regional_target_probe_seen:
+                    regional_target_probe_seen.add(r.tv_id)
+                    regional_target_probe_rows.append(r)
+                    regional_bridge_context_by_id[r.tv_id] = {
+                        "source_matches": tuple(source_matches),
+                        "source_mics": source_mics,
+                        "isin_bridge": isin_bridge,
+                        "source_isin_fallback": source_isin_fallback_used,
+                    }
+            # LS Exchange (HAML) and occasional LSSI rows are not always
+            # represented by OpenFIGI at the source venue.  For an ISIN bridge
+            # with exactly one reviewed source MIC, an exact TradingView ISIN
+            # plus an unambiguous ``ID_ISIN + target MIC`` OpenFIGI result is
+            # sufficient security-level evidence to reach Yahoo's target venue.
+            # The source venue is preserved but no source FIGI is fabricated.
+            if isin_bridge and not source_matches and target_matches and len(source_mics) == 1:
+                target_of, target_collapsed = _select_isin_bridge_target(r, target_matches)
+                if target_of is not None and target_of.ticker:
+                    source_security = OpenFigiIdentity(
+                        figi=None,
+                        composite_figi=None,
+                        share_class_figi=target_of.share_class_figi,
+                        ticker=r.symbol,
+                        name=r.name or target_of.name,
+                        security_type=target_of.security_type,
+                        security_type2=target_of.security_type2,
+                        exch_code=None,
+                    )
+                    yahoo_symbol = yahoo_listing_symbol(
+                        target_of.ticker, target_mic, r.prefix, tv_type_kind(r)
+                    )
+                    pending.append({
+                        "row": r,
+                        "identity": target_of,
+                        "source_identity": source_security,
+                        "target_identity": target_of,
+                        "source_mic": source_mics[0],
+                        "source_venue_code": None,
+                        "target_mic": target_mic,
+                        "yahoo_symbol": yahoo_symbol,
+                        "mapping_method": "TV_ISIN_TARGET_BRIDGE",
+                    })
+                    self.stats["tv_isin_target_bridge_matches"] += 1
+                    self.stats[f"tv_isin_target_bridge_matches_{prefix_token}"] += 1
+                    if target_collapsed:
+                        self.stats["bridge_target_share_class_collapses"] += 1
+                        self.stats[f"bridge_target_share_class_collapses_{prefix_token}"] += 1
+                    continue
+
+            if isin_bridge and (not source_matches or not target_matches) and r.tv_id not in isin_bridge_probe_seen:
+                isin_bridge_probe_seen.add(r.tv_id)
+                isin_bridge_probe_rows.append(r)
 
             if not source_matches:
                 rejected.append(self._reject(r, "OPENFIGI_SOURCE_NO_MATCH"))
@@ -1035,14 +1332,27 @@ class BatchResolver:
             source_for_share = [(mic, x) for mic, x in source_matches if x.share_class_figi == share_class]
             target_for_share = [x for x in target_matches if x.share_class_figi == share_class]
             if len(source_for_share) != 1:
+                self.stats[f"bridge_source_venue_ambiguous_{prefix_token}"] += 1
                 rejected.append(self._reject(r, f"OPENFIGI_SOURCE_VENUE_AMBIGUOUS:{len(source_for_share)}"))
                 continue
-            if len(target_for_share) != 1:
+
+            if isin_bridge:
+                target_of, target_collapsed = _select_isin_bridge_target(
+                    r, target_for_share, required_share_class=share_class
+                )
+            elif len(target_for_share) == 1:
+                target_of, target_collapsed = target_for_share[0], False
+            else:
+                target_of, target_collapsed = None, False
+            if target_of is None:
+                self.stats[f"bridge_target_ambiguous_{prefix_token}"] += 1
                 rejected.append(self._reject(r, f"OPENFIGI_TARGET_AMBIGUOUS:{len(target_for_share)}"))
                 continue
+            if target_collapsed:
+                self.stats["bridge_target_share_class_collapses"] += 1
+                self.stats[f"bridge_target_share_class_collapses_{prefix_token}"] += 1
 
             source_mic, source_of = source_for_share[0]
-            target_of = target_for_share[0]
             suffix = MIC_TO_YAHOO_SUFFIX.get(target_mic)
             if suffix is None:
                 rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{target_mic}"))
@@ -1057,9 +1367,285 @@ class BatchResolver:
                 "source_venue_code": None,
                 "target_mic": target_mic,
                 "yahoo_symbol": yahoo_symbol,
-                "mapping_method": "SHARE_CLASS_BRIDGE",
+                "mapping_method": (
+                    "ISIN_SHARE_CLASS_BRIDGE"
+                    if isin_bridge
+                    else "ISIN_SOURCE_SHARE_CLASS_BRIDGE"
+                    if source_isin_fallback_used
+                    else "SHARE_CLASS_BRIDGE"
+                ),
             })
             self.stats["cross_venue_share_class_matches"] += 1
+            if isin_bridge:
+                self.stats["isin_bridge_share_class_matches"] += 1
+
+        # Regional German target fallback for bridge rows whose Xetra target is
+        # absent.  Exact TradingView ISIN is probed only at the bounded regional
+        # MIC set already supported by the resolver, and every candidate must
+        # independently satisfy Yahoo's normal currency/type/venue contract.
+        #
+        # Multiple valid regional venues are *quote-target* alternatives, not an
+        # identity ambiguity, provided they still prove one security.  GETTEX and
+        # TRADEGATE retain the original source-side shareClassFIGI bridge.  LSX/LS
+        # may use the already-established one-sided exact-ISIN contract when their
+        # source venue is absent from OpenFIGI.  A deterministic MIC priority then
+        # chooses one Yahoo quote venue without changing security identity.
+        if regional_target_probe_rows:
+            regional_jobs: list[dict] = []
+            regional_layout: list[tuple[TvRow, str]] = []
+            for r in regional_target_probe_rows:
+                for mic in GERMANY_REGIONAL_TARGET_MICS:
+                    regional_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
+                    regional_layout.append((r, mic))
+
+            try:
+                regional_mapped = self.openfigi.map_jobs(regional_jobs)
+                self.stats["openfigi_regional_target_probe_rows"] += len(regional_target_probe_rows)
+                self.stats["openfigi_regional_target_probe_jobs"] += len(regional_jobs)
+                self.stats["openfigi_jobs"] += len(regional_jobs)
+                self.stats["openfigi_http_batches"] += (len(regional_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError:
+                regional_mapped = [[] for _ in regional_jobs]
+                self.stats["openfigi_regional_target_probe_unavailable"] += len(regional_jobs)
+
+            regional_candidates: list[tuple[TvRow, str, str, OpenFigiIdentity]] = []
+            openfigi_mics_by_row: dict[str, set[str]] = defaultdict(set)
+            for (r, mic), identities in zip(regional_layout, regional_mapped):
+                prefix_token = _telemetry_token(r.prefix)
+                selected, collapsed = _select_isin_bridge_target(r, identities)
+                if selected is None or not selected.ticker:
+                    continue
+                openfigi_mics_by_row[r.tv_id].add(mic)
+                self.stats["openfigi_regional_target_probe_matches"] += 1
+                self.stats[f"openfigi_regional_target_probe_matches_{mic}"] += 1
+                self.stats[f"openfigi_regional_target_probe_matches_{prefix_token}_{mic}"] += 1
+                if collapsed:
+                    self.stats["openfigi_regional_target_probe_collapses"] += 1
+                regional_candidates.append((
+                    r, mic,
+                    yahoo_listing_symbol(selected.ticker, mic, r.prefix, tv_type_kind(r)),
+                    selected,
+                ))
+
+            for r in regional_target_probe_rows:
+                mics = openfigi_mics_by_row.get(r.tv_id, set())
+                prefix_token = _telemetry_token(r.prefix)
+                if not mics:
+                    self.stats["openfigi_regional_target_probe_no_match_rows"] += 1
+                    self.stats[f"openfigi_regional_target_probe_no_match_rows_{prefix_token}"] += 1
+                elif len(mics) == 1:
+                    self.stats["openfigi_regional_target_probe_unique_mic_rows"] += 1
+                    self.stats[f"openfigi_regional_target_probe_unique_mic_rows_{prefix_token}"] += 1
+                else:
+                    self.stats["openfigi_regional_target_probe_multi_mic_rows"] += 1
+                    self.stats[f"openfigi_regional_target_probe_multi_mic_rows_{prefix_token}"] += 1
+
+            yahoo_valid_by_row: dict[str, list[tuple[TvRow, str, str, OpenFigiIdentity]]] = defaultdict(list)
+            if regional_candidates:
+                symbols = [symbol for _, _, symbol, _ in regional_candidates]
+                try:
+                    regional_quotes = self.yahoo.quotes(symbols)
+                    batch_size = max(1, int(getattr(self.yahoo, "batch_size", 75)))
+                    self.stats["yahoo_regional_target_probe_candidates"] += len(regional_candidates)
+                    self.stats["yahoo_regional_target_probe_batches"] += (len(dict.fromkeys(symbols)) + batch_size - 1) // batch_size
+                except ProviderError:
+                    regional_quotes = {}
+                    self.stats["yahoo_regional_target_probe_unavailable"] += len(regional_candidates)
+
+                yahoo_mics_by_row: dict[str, set[str]] = defaultdict(set)
+                for r, mic, symbol, selected in regional_candidates:
+                    q = regional_quotes.get(symbol)
+                    prefix_token = _telemetry_token(r.prefix)
+                    regular_ok = _non_us_quote_compatible(r, mic, symbol, q, False)
+                    taxonomy_ok = _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+                        r, mic, symbol, q, selected, "REGIONAL_PROBE"
+                    )
+                    if regular_ok or taxonomy_ok:
+                        yahoo_mics_by_row[r.tv_id].add(mic)
+                        yahoo_valid_by_row[r.tv_id].append((r, mic, symbol, selected))
+                        self.stats["yahoo_regional_target_probe_matches"] += 1
+                        self.stats[f"yahoo_regional_target_probe_matches_{mic}"] += 1
+                        self.stats[f"yahoo_regional_target_probe_matches_{prefix_token}_{mic}"] += 1
+                        if taxonomy_ok and not regular_ok:
+                            self.stats["yahoo_regional_target_probe_taxonomy_anomaly_matches"] += 1
+                            self.stats[f"yahoo_regional_target_probe_taxonomy_anomaly_matches_{_telemetry_token(q.quote_type if q else None)}"] += 1
+                    elif q is None:
+                        self.stats["yahoo_regional_target_probe_missing"] += 1
+                    else:
+                        reason = _non_us_quote_rejection_reason(r, mic, symbol, q, False) or "INCOMPATIBLE"
+                        reason_token = _telemetry_token(reason.split(":", 1)[0])
+                        self.stats[f"yahoo_regional_target_probe_block_{reason_token}"] += 1
+
+                for r in regional_target_probe_rows:
+                    mics = yahoo_mics_by_row.get(r.tv_id, set())
+                    prefix_token = _telemetry_token(r.prefix)
+                    if not mics:
+                        self.stats["yahoo_regional_target_probe_no_match_rows"] += 1
+                        self.stats[f"yahoo_regional_target_probe_no_match_rows_{prefix_token}"] += 1
+                    elif len(mics) == 1:
+                        self.stats["yahoo_regional_target_probe_unique_mic_rows"] += 1
+                        self.stats[f"yahoo_regional_target_probe_unique_mic_rows_{prefix_token}"] += 1
+                    else:
+                        self.stats["yahoo_regional_target_probe_multi_mic_rows"] += 1
+                        self.stats[f"yahoo_regional_target_probe_multi_mic_rows_{prefix_token}"] += 1
+
+            priority = {mic: i for i, mic in enumerate(GERMANY_REGIONAL_TARGET_MICS)}
+            regional_rescued_ids: set[str] = set()
+            for r in regional_target_probe_rows:
+                valid = yahoo_valid_by_row.get(r.tv_id, [])
+                if not valid:
+                    continue
+                prefix_token = _telemetry_token(r.prefix)
+                ctx = regional_bridge_context_by_id.get(r.tv_id) or {}
+                source_matches = list(ctx.get("source_matches") or ())
+                source_mics = tuple(ctx.get("source_mics") or ())
+                isin_bridge = bool(ctx.get("isin_bridge"))
+
+                eligible: list[tuple[TvRow, str, str, OpenFigiIdentity, str | None, OpenFigiIdentity | None]] = []
+                if source_matches:
+                    for vr, mic, symbol, target_of in valid:
+                        share = target_of.share_class_figi
+                        if not share:
+                            continue
+                        source_for_share = [
+                            (source_mic, source_of)
+                            for source_mic, source_of in source_matches
+                            if source_of.share_class_figi == share
+                        ]
+                        if len(source_for_share) != 1:
+                            continue
+                        source_mic, source_of = source_for_share[0]
+                        eligible.append((vr, mic, symbol, target_of, source_mic, source_of))
+                    if not eligible:
+                        self.stats["regional_target_bridge_source_share_class_no_match"] += 1
+                        self.stats[f"regional_target_bridge_source_share_class_no_match_{prefix_token}"] += 1
+                        continue
+                elif isin_bridge and len(source_mics) == 1:
+                    # Same contract as TV_ISIN_TARGET_BRIDGE: TradingView supplied
+                    # an exact ISIN and the provider namespace maps to one reviewed
+                    # source MIC, but OpenFIGI lacks that source listing.
+                    eligible = [(*record, source_mics[0], None) for record in valid]
+                else:
+                    self.stats["regional_target_bridge_source_proof_missing"] += 1
+                    self.stats[f"regional_target_bridge_source_proof_missing_{prefix_token}"] += 1
+                    continue
+
+                # All candidate targets came from the same exact ISIN.  Still
+                # fail closed if OpenFIGI explicitly assigns conflicting non-null
+                # share classes across otherwise-valid regional targets.
+                target_shares = {
+                    record[3].share_class_figi for record in eligible
+                    if record[3].share_class_figi
+                }
+                if len(target_shares) > 1:
+                    self.stats["regional_target_bridge_security_ambiguous"] += 1
+                    self.stats[f"regional_target_bridge_security_ambiguous_{prefix_token}"] += 1
+                    continue
+
+                chosen = min(eligible, key=lambda x: priority.get(x[1], len(priority)))
+                _, target_mic, yahoo_symbol, target_of, source_mic, source_of = chosen
+                if source_of is None:
+                    source_of = OpenFigiIdentity(
+                        figi=None,
+                        composite_figi=None,
+                        share_class_figi=target_of.share_class_figi,
+                        ticker=r.symbol,
+                        name=r.name or target_of.name,
+                        security_type=target_of.security_type,
+                        security_type2=target_of.security_type2,
+                        exch_code=None,
+                    )
+                    mapping_method = "TV_ISIN_REGIONAL_TARGET_BRIDGE"
+                    identity = target_of
+                    self.stats["tv_isin_regional_target_bridge_matches"] += 1
+                    self.stats[f"tv_isin_regional_target_bridge_matches_{prefix_token}"] += 1
+                else:
+                    mapping_method = (
+                        "ISIN_REGIONAL_SHARE_CLASS_BRIDGE"
+                        if isin_bridge
+                        else "ISIN_SOURCE_REGIONAL_SHARE_CLASS_BRIDGE"
+                        if bool(ctx.get("source_isin_fallback"))
+                        else "REGIONAL_SHARE_CLASS_BRIDGE"
+                    )
+                    identity = source_of
+                    self.stats["regional_share_class_bridge_matches"] += 1
+                    self.stats[f"regional_share_class_bridge_matches_{prefix_token}"] += 1
+
+                pending.append({
+                    "row": r,
+                    "identity": identity,
+                    "source_identity": source_of,
+                    "target_identity": target_of,
+                    "source_mic": source_mic,
+                    "source_venue_code": None,
+                    "target_mic": target_mic,
+                    "yahoo_symbol": yahoo_symbol,
+                    "mapping_method": mapping_method,
+                })
+                regional_rescued_ids.add(r.tv_id)
+                self.stats["regional_target_bridge_matches"] += 1
+                self.stats[f"regional_target_bridge_matches_{prefix_token}"] += 1
+                self.stats[f"regional_target_bridge_matches_{target_mic}"] += 1
+                if len(eligible) > 1:
+                    self.stats["regional_target_bridge_multi_mic_matches"] += 1
+                    self.stats[f"regional_target_bridge_multi_mic_matches_{prefix_token}"] += 1
+
+            if regional_rescued_ids:
+                rejected = [b for b in rejected if b.tv_id not in regional_rescued_ids]
+                # Once an exact regional target has been admitted, the old
+                # unscoped diagnostic no longer adds evidence and would only
+                # spend another OpenFIGI job for the same security.
+                isin_bridge_probe_rows = [
+                    row for row in isin_bridge_probe_rows
+                    if row.tv_id not in regional_rescued_ids
+                ]
+
+        # Diagnostic-only unscoped ISIN probe for failed ISIN bridges.  The
+        # official OpenFIGI mapping API permits ID_ISIN without micCode; use it
+        # only to determine whether OpenFIGI knows the security at all when a
+        # venue-scoped MUNC/MUND/HAML/LSSI/XETR job returned no compatible row.
+        # Probe results never create or upgrade a binding.
+        if isin_bridge_probe_rows:
+            probe_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in isin_bridge_probe_rows]
+            try:
+                probe_mapped = self.openfigi.map_jobs(probe_jobs)
+                self.stats["openfigi_isin_bridge_unscoped_probe_jobs"] += len(probe_jobs)
+                self.stats["openfigi_jobs"] += len(probe_jobs)
+                self.stats["openfigi_http_batches"] += (len(probe_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError:
+                probe_mapped = [[] for _ in probe_jobs]
+                self.stats["openfigi_isin_bridge_unscoped_probe_unavailable"] += len(probe_jobs)
+
+            for r, identities in zip(isin_bridge_probe_rows, probe_mapped):
+                prefix_token = _telemetry_token(r.prefix)
+                compatible = [x for x in identities if openfigi_type_compatible(r, x)]
+                if not compatible:
+                    self.stats["openfigi_isin_bridge_unscoped_unknown"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_unknown_{prefix_token}"] += 1
+                    continue
+                self.stats["openfigi_isin_bridge_unscoped_known"] += 1
+                self.stats[f"openfigi_isin_bridge_unscoped_known_{prefix_token}"] += 1
+                shares = {x.share_class_figi for x in compatible if x.share_class_figi}
+                if len(shares) == 1 and all(x.share_class_figi for x in compatible):
+                    self.stats["openfigi_isin_bridge_unscoped_unique_share_class"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_unique_share_class_{prefix_token}"] += 1
+                elif len(shares) > 1:
+                    self.stats["openfigi_isin_bridge_unscoped_share_class_ambiguous"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_share_class_ambiguous_{prefix_token}"] += 1
+                else:
+                    self.stats["openfigi_isin_bridge_unscoped_share_class_missing"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_share_class_missing_{prefix_token}"] += 1
+
+                ticker_keys = {punctuation_key(x.ticker or "") for x in compatible if x.ticker}
+                if len(ticker_keys) == 1 and all(x.ticker for x in compatible):
+                    self.stats["openfigi_isin_bridge_unscoped_unique_ticker"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_unique_ticker_{prefix_token}"] += 1
+                elif len(ticker_keys) > 1:
+                    self.stats["openfigi_isin_bridge_unscoped_ticker_ambiguous"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_ticker_ambiguous_{prefix_token}"] += 1
+                else:
+                    self.stats["openfigi_isin_bridge_unscoped_ticker_missing"] += 1
+                    self.stats[f"openfigi_isin_bridge_unscoped_ticker_missing_{prefix_token}"] += 1
 
         # OpenFIGI exchange-code -> MIC share-class bridges.  LSIN is TradingView's
         # London International namespace.  OpenFIGI models that source as exchCode
@@ -1278,6 +1864,8 @@ class BatchResolver:
         reviewed_mutualfund_match_ids: set[str] = set()
         reviewed_mutualfund_block_by_id: dict[str, str] = {}
         reviewed_mutualfund_venue_observation_by_id: dict[str, tuple[str | None, str | None, str | None]] = {}
+        germany_yahoo_failure_probe_items: list[tuple[dict, str]] = []
+        germany_probe_prefixes = {"GETTEX", "LS", "LSX", "TRADEGATE", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
         for item in pending:
             r = item["row"]
             ys = item["yahoo_symbol"]
@@ -1295,6 +1883,29 @@ class BatchResolver:
             primary_reviewed_taxonomy_ok = _reviewed_yahoo_mutualfund_taxonomy_anomaly_compatible(
                 r, item["target_mic"], ys, q, item.get("identity"), item.get("mapping_method")
             )
+            primary_germany_taxonomy_ok = _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+                r, item["target_mic"], ys, q, item.get("identity"), item.get("mapping_method")
+            )
+            if (not primary_regular_ok and not primary_reviewed_taxonomy_ok
+                    and not primary_germany_taxonomy_ok
+                    and _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+                        r, item["target_mic"], ys, cq, item.get("identity"), item.get("mapping_method")
+                    )):
+                q = cq
+                primary_germany_taxonomy_ok = True
+                self.stats["yahoo_chart_fallback_matches"] += 1
+            if (q is not None and (q.quote_type or "").upper() in {"MUTUALFUND", "ETF"}
+                    and r.prefix in {"GETTEX", "LS", "LSX", "TRADEGATE", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
+                    and item["target_mic"] in GERMANY_REGIONAL_TARGET_MICS
+                    and tv_type_kind(r) == "STOCK"):
+                self.stats["yahoo_germany_regional_fund_taxonomy_candidates"] += 1
+                self.stats[f"yahoo_germany_regional_fund_taxonomy_candidates_{_telemetry_token(q.quote_type)}"] += 1
+            if primary_germany_taxonomy_ok:
+                item["yahoo_type_anomaly"] = "GERMANY_REGIONAL_FUND_TAXONOMY"
+                self.stats["yahoo_germany_regional_fund_taxonomy_matches"] += 1
+                self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(q.quote_type if q else None)}"] += 1
+                self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(r.prefix)}"] += 1
+                self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(item['target_mic'])}"] += 1
             if (q is not None and (q.quote_type or "").upper() == "MUTUALFUND"
                     and r.tv_id in REVIEWED_YAHOO_MUTUALFUND_TAXONOMY):
                 reviewed_mutualfund_candidate_ids.add(r.tv_id)
@@ -1317,7 +1928,7 @@ class BatchResolver:
 
             # If the reviewed LSIN primary (.IL) is not compatible, try exactly
             # one pre-defined .L alternative. The same metadata contract applies.
-            if not (primary_regular_ok or primary_reviewed_taxonomy_ok):
+            if not (primary_regular_ok or primary_reviewed_taxonomy_ok or primary_germany_taxonomy_ok):
                 alt = alternate_by_tv_id.get(r.tv_id)
                 if alt:
                     aq = alternate_quotes.get(alt)
@@ -1414,6 +2025,8 @@ class BatchResolver:
                     rejected.append(self._reject(r, diagnostic_reason))
                 else:
                     rejected.append(self._reject(r, "YAHOO_NO_MATCH"))
+                    if r.prefix in germany_probe_prefixes and r.isin:
+                        germany_yahoo_failure_probe_items.append((item, "YAHOO_NO_MATCH"))
                 continue
             # Normal non-US mappings already have independent OpenFIGI proof, so
             # missing Yahoo metadata is absence of corroboration, not conflict.
@@ -1423,6 +2036,8 @@ class BatchResolver:
             yahoo_currency_unreported = q.currency is None
             if target_only and q.currency is None:
                 rejected.append(self._reject(r, "YAHOO_CURRENCY_UNREPORTED_TARGET_ONLY"))
+                if r.prefix in germany_probe_prefixes and r.isin:
+                    germany_yahoo_failure_probe_items.append((item, "YAHOO_CURRENCY_UNREPORTED_TARGET_ONLY"))
                 continue
             if q.currency is not None and not currency_compatible(r.currency, q.currency):
                 rejected.append(self._reject(r, f"YAHOO_CURRENCY_MISMATCH:{q.currency}"))
@@ -1433,8 +2048,15 @@ class BatchResolver:
                 rejected.append(self._reject(r, "YAHOO_TYPE_UNREPORTED_TARGET_ONLY"))
                 continue
             if q.quote_type is not None and not yahoo_type_compatible(r, q.quote_type):
-                if item.get("yahoo_type_anomaly") not in {"LSIN_DR_MUTUALFUND", "REVIEWED_MUTUALFUND"}:
-                    rejected.append(self._reject(r, f"YAHOO_TYPE_MISMATCH:{q.quote_type}"))
+                if item.get("yahoo_type_anomaly") not in {"LSIN_DR_MUTUALFUND", "REVIEWED_MUTUALFUND", "GERMANY_REGIONAL_FUND_TAXONOMY"}:
+                    reason = f"YAHOO_TYPE_MISMATCH:{q.quote_type}"
+                    rejected.append(self._reject(r, reason))
+                    if (
+                        r.prefix in germany_probe_prefixes
+                        and r.isin
+                        and (q.quote_type or "").upper() in {"MUTUALFUND", "ETF"}
+                    ):
+                        germany_yahoo_failure_probe_items.append((item, reason))
                     continue
 
             target_mic = item["target_mic"]
@@ -1488,6 +2110,222 @@ class BatchResolver:
             elif yahoo_venue_unreported:
                 binding.quote_status = "FRESH_VENUE_UNREPORTED"
             verified.append(binding)
+        # Evidence-gated alternate German regional target fallback for Yahoo
+        # coverage/taxonomy failures that remain after normal admission.
+        #
+        # Every candidate must independently prove the exact TradingView ISIN at
+        # a bounded German MIC and pass the *ordinary* Yahoo contract there.  If
+        # the current mapping already has OpenFIGI security evidence, the new
+        # target must carry the same non-null shareClassFIGI.  A direct German
+        # same-venue strict fallback may also be rescued one-sided: exact TV ISIN
+        # + exact regional OpenFIGI target + ordinary Yahoo evidence, while the
+        # original direct source MIC is retained and no source FIGI is invented.
+        if germany_yahoo_failure_probe_items:
+            probe_jobs: list[dict] = []
+            probe_layout: list[tuple[dict, str, str, int]] = []
+            for item, reason in germany_yahoo_failure_probe_items:
+                r = item["row"]
+                for mic in GERMANY_REGIONAL_TARGET_MICS:
+                    if mic == item.get("target_mic"):
+                        continue
+                    offset = len(probe_jobs)
+                    probe_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
+                    probe_layout.append((item, reason, mic, offset))
+            self.stats["yahoo_failure_regional_probe_rows"] += len(germany_yahoo_failure_probe_items)
+            self.stats["yahoo_failure_regional_probe_openfigi_jobs"] += len(probe_jobs)
+            try:
+                probe_mapped = self.openfigi.map_jobs(probe_jobs)
+                self.stats["openfigi_jobs"] += len(probe_jobs)
+                self.stats["openfigi_http_batches"] += (len(probe_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError:
+                probe_mapped = [[] for _ in probe_jobs]
+
+            candidates: list[tuple[dict, str, str, OpenFigiIdentity, str]] = []
+            openfigi_mics_by_id: dict[str, set[str]] = defaultdict(set)
+            for item, reason, mic, offset in probe_layout:
+                if offset >= len(probe_mapped):
+                    continue
+                r = item["row"]
+                target_of, _ = _select_isin_bridge_target(r, probe_mapped[offset])
+                if target_of is None:
+                    continue
+                ref = item.get("target_identity") or item.get("source_identity") or item.get("identity")
+                ref_share = getattr(ref, "share_class_figi", None) if ref is not None else None
+                if ref_share and target_of.share_class_figi and ref_share != target_of.share_class_figi:
+                    self.stats["yahoo_failure_regional_probe_share_class_mismatch"] += 1
+                    continue
+                ticker = target_of.ticker or r.symbol
+                symbol = yahoo_listing_symbol(ticker, mic, r.prefix, tv_type_kind(r))
+                candidates.append((item, reason, mic, target_of, symbol))
+                openfigi_mics_by_id[r.tv_id].add(mic)
+                self.stats["yahoo_failure_regional_probe_openfigi_matches"] += 1
+                self.stats[f"yahoo_failure_regional_probe_openfigi_matches_{_telemetry_token(mic)}"] += 1
+
+            symbols = sorted({record[4] for record in candidates})
+            try:
+                probe_quotes = self.yahoo.quotes(symbols) if symbols else {}
+                if symbols:
+                    self.stats["yahoo_failure_regional_probe_batches"] += (len(symbols) + self.yahoo.batch_size - 1) // self.yahoo.batch_size
+            except ProviderError:
+                probe_quotes = {}
+
+            yahoo_mics_by_id: dict[str, set[str]] = defaultdict(set)
+            yahoo_valid_by_id: dict[
+                str, list[tuple[dict, str, str, OpenFigiIdentity, str, YahooQuote]]
+            ] = defaultdict(list)
+            for item, reason, mic, target_of, symbol in candidates:
+                r = item["row"]
+                q = probe_quotes.get(symbol)
+                if _non_us_quote_compatible(r, mic, symbol, q, False):
+                    yahoo_mics_by_id[r.tv_id].add(mic)
+                    yahoo_valid_by_id[r.tv_id].append((item, reason, mic, target_of, symbol, q))
+                    self.stats["yahoo_failure_regional_probe_matches"] += 1
+                    self.stats[f"yahoo_failure_regional_probe_matches_{_telemetry_token(mic)}"] += 1
+                    self.stats[f"yahoo_failure_regional_probe_matches_{_telemetry_token(r.prefix)}"] += 1
+                    self.stats[f"yahoo_failure_regional_probe_matches_reason_{_telemetry_token(reason)}"] += 1
+
+            for item, reason in germany_yahoo_failure_probe_items:
+                r = item["row"]
+                mics = yahoo_mics_by_id.get(r.tv_id, set())
+                if not mics:
+                    self.stats["yahoo_failure_regional_probe_no_match_rows"] += 1
+                    self.stats[f"yahoo_failure_regional_probe_no_match_rows_{_telemetry_token(r.prefix)}"] += 1
+                elif len(mics) == 1:
+                    self.stats["yahoo_failure_regional_probe_unique_mic_rows"] += 1
+                else:
+                    self.stats["yahoo_failure_regional_probe_multi_mic_rows"] += 1
+
+            direct_german_prefixes = {"FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
+            priority = {mic: i for i, mic in enumerate(GERMANY_REGIONAL_TARGET_MICS)}
+            yahoo_failure_rescued_ids: set[str] = set()
+            for item, reason in germany_yahoo_failure_probe_items:
+                r = item["row"]
+                valid = yahoo_valid_by_id.get(r.tv_id, [])
+                if not valid:
+                    continue
+
+                ref = item.get("target_identity") or item.get("source_identity") or item.get("identity")
+                ref_share = getattr(ref, "share_class_figi", None) if ref is not None else None
+                eligible: list[
+                    tuple[dict, str, str, OpenFigiIdentity, str, YahooQuote]
+                ] = []
+
+                if ref_share:
+                    eligible = [
+                        record for record in valid
+                        if record[3].share_class_figi
+                        and record[3].share_class_figi == ref_share
+                    ]
+                    if not eligible:
+                        self.stats["yahoo_failure_regional_fallback_share_class_no_match"] += 1
+                        self.stats[
+                            f"yahoo_failure_regional_fallback_share_class_no_match_{_telemetry_token(r.prefix)}"
+                        ] += 1
+                        continue
+                    one_sided_tv_isin = False
+                elif (
+                    item.get("mapping_method") == "TARGET_PROVIDER_STRICT_FALLBACK"
+                    and r.prefix in direct_german_prefixes
+                    and r.isin
+                    and item.get("source_mic") == TV_PREFIX_TO_MIC.get(r.prefix)
+                ):
+                    # OpenFIGI could not prove the direct source listing, but
+                    # TradingView supplied an exact ISIN and the direct prefix has
+                    # one known source MIC.  The alternate target itself is exact
+                    # ISIN + MIC OpenFIGI evidence and Yahoo must pass the normal
+                    # OpenFIGI-backed contract there.
+                    eligible = [
+                        record for record in valid
+                        if record[3].share_class_figi
+                    ]
+                    one_sided_tv_isin = True
+                else:
+                    self.stats["yahoo_failure_regional_fallback_source_proof_missing"] += 1
+                    self.stats[
+                        f"yahoo_failure_regional_fallback_source_proof_missing_{_telemetry_token(r.prefix)}"
+                    ] += 1
+                    continue
+
+                target_shares = {record[3].share_class_figi for record in eligible if record[3].share_class_figi}
+                if len(target_shares) != 1:
+                    self.stats["yahoo_failure_regional_fallback_security_ambiguous"] += 1
+                    self.stats[
+                        f"yahoo_failure_regional_fallback_security_ambiguous_{_telemetry_token(r.prefix)}"
+                    ] += 1
+                    continue
+
+                chosen = min(eligible, key=lambda record: priority.get(record[2], len(priority)))
+                _, _reason, target_mic, target_of, yahoo_symbol, q = chosen
+
+                source_of = item.get("source_identity")
+                identity = item.get("identity")
+                source_mic = item.get("source_mic")
+                if one_sided_tv_isin:
+                    source_of = OpenFigiIdentity(
+                        figi=None,
+                        composite_figi=None,
+                        share_class_figi=target_of.share_class_figi,
+                        ticker=r.symbol,
+                        name=r.name or target_of.name,
+                        security_type=target_of.security_type,
+                        security_type2=target_of.security_type2,
+                        exch_code=None,
+                    )
+                    identity = target_of
+                    mapping_method = "TV_ISIN_GERMANY_REGIONAL_TARGET_FALLBACK"
+                    self.stats["tv_isin_germany_regional_target_fallback_matches"] += 1
+                    self.stats[
+                        f"tv_isin_germany_regional_target_fallback_matches_{_telemetry_token(r.prefix)}"
+                    ] += 1
+                else:
+                    mapping_method = "GERMANY_YAHOO_REGIONAL_TARGET_FALLBACK"
+
+                binding = self._verified(
+                    r,
+                    fh=None,
+                    of=identity or target_of,
+                    y=q,
+                    mic=target_mic,
+                    source_mic=source_mic,
+                    target_mic=target_mic,
+                    source_venue_code=item.get("source_venue_code"),
+                    mapping_method=mapping_method,
+                    source_of=source_of,
+                    target_of=target_of,
+                )
+                yahoo_currency_unreported = q.currency is None
+                yahoo_type_unreported = q.quote_type is None
+                yahoo_venue_unreported = q.exchange is None and q.full_exchange_name is None
+                missing_meta = sum((yahoo_currency_unreported, yahoo_type_unreported, yahoo_venue_unreported))
+                if q.price is None:
+                    binding.quote_status = "UNAVAILABLE"
+                elif missing_meta >= 2:
+                    binding.quote_status = "FRESH_METADATA_UNREPORTED"
+                elif yahoo_currency_unreported:
+                    binding.quote_status = "FRESH_CURRENCY_UNREPORTED"
+                elif yahoo_type_unreported:
+                    binding.quote_status = "FRESH_TYPE_UNREPORTED"
+                elif yahoo_venue_unreported:
+                    binding.quote_status = "FRESH_VENUE_UNREPORTED"
+
+                verified.append(binding)
+                yahoo_failure_rescued_ids.add(r.tv_id)
+                self.stats["yahoo_failure_regional_fallback_matches"] += 1
+                self.stats[
+                    f"yahoo_failure_regional_fallback_matches_{_telemetry_token(r.prefix)}"
+                ] += 1
+                self.stats[
+                    f"yahoo_failure_regional_fallback_matches_{_telemetry_token(target_mic)}"
+                ] += 1
+                self.stats[
+                    f"yahoo_failure_regional_fallback_matches_reason_{_telemetry_token(reason)}"
+                ] += 1
+                if len(eligible) > 1:
+                    self.stats["yahoo_failure_regional_fallback_multi_mic_matches"] += 1
+
+            if yahoo_failure_rescued_ids:
+                rejected = [b for b in rejected if b.tv_id not in yahoo_failure_rescued_ids]
+
         self.stats["reviewed_yahoo_mutualfund_taxonomy_candidates"] += len(reviewed_mutualfund_candidate_ids)
         self.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] += len(reviewed_mutualfund_match_ids)
         for tv_id in sorted(reviewed_mutualfund_candidate_ids - reviewed_mutualfund_match_ids):

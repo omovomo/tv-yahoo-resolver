@@ -53,3 +53,7 @@ def test_fetch_screen_is_single_request(monkeypatch):
     total, _ = tv.fetch_screen(cfg(limit=2000))
     assert total == 1086
     assert calls["get"] == 1
+
+
+def test_isin_column_requested_for_cross_venue_identity():
+    assert "isin" in tv.TV_COLUMNS

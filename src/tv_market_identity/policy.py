@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.3.34-policy34"
+RESOLVER_VERSION = "0.3.44-policy44"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -32,6 +32,16 @@ TV_PREFIX_TO_MIC = {
     "FWB": "XFRA",
     "DUS": "XDUS",
     "HAM": "XHAM",
+    # Reviewed German regional provider prefixes. TradingView SWB is Börse
+    # Stuttgart; MUN is Börse München (specialist model); HAN is Hannover.
+    "SWB": "XSTU",
+    "MUN": "XMUN",
+    "HAN": "XHAN",
+    # GETTEX/LSX/LS are not direct aliases: they use distinct execution venues
+    # and are handled through ISIN-gated cross-venue bridges below.
+    "GETTEX": None,
+    "LSX": None,
+    "LS": None,
     "EURONEXT": None,
 }
 
@@ -45,6 +55,25 @@ CROSS_VENUE_BRIDGES = {
     },
 }
 
+# TradingView providers whose local symbol is not reliably portable to Xetra
+# (LS/LSX commonly use WKN-style symbols). TradingView ISIN is therefore used
+# as the bridge identifier. Admission still requires an exact source MIC mapping,
+# an exact Xetra target mapping, one shared shareClassFIGI, and normal Yahoo checks.
+# Bounded target priority for German bridge rows that have no Xetra listing.
+# Every venue is independently proven by exact ISIN + MIC and Yahoo metadata;
+# ordering only chooses a deterministic quote venue when the same security is
+# valid on several regional exchanges. It never substitutes for identity proof.
+GERMANY_REGIONAL_TARGET_MICS = ("XFRA", "XSTU", "XMUN", "XHAN", "XDUS", "XHAM")
+
+ISIN_SHARE_CLASS_BRIDGES = {
+    # gettex is the Börse München market-maker model: regulated MUNC / open MUND.
+    "GETTEX": {"source_mics": ("MUNC", "MUND"), "target_mic": "XETR"},
+    # LS Exchange is an electronic market of BÖAG Börsen AG.
+    "LSX": {"source_mics": ("HAML",), "target_mic": "XETR"},
+    # Lang & Schwarz TradeCenter is a systematic internaliser, MIC LSSI.
+    "LS": {"source_mics": ("LSSI",), "target_mic": "XETR"},
+}
+
 # Source provider namespace is an OpenFIGI exchange code rather than an ISO MIC.
 # Admission requires exact shareClassFIGI equality with the target MIC listing.
 EXCHCODE_SHARE_CLASS_BRIDGES = {}
@@ -56,7 +85,7 @@ EXCHCODE_SHARE_CLASS_BRIDGES = {}
 # be used after exhaustive OpenFIGI no-match. This does not invent FIGIs: Yahoo
 # must explicitly confirm exact symbol, quote currency, security type and venue.
 # Keep this list narrow and evidence-driven.
-TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES = {"LSE", "LSIN", "SIX", "AQUIS", "XETR", "FWB", "DUS", "HAM"}
+TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES = {"LSE", "LSIN", "SIX", "AQUIS", "XETR", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
 
 # Rare exact-reference fallbacks for provider ambiguities that cannot be
 # disambiguated by TradingView ticker+MIC alone.  Each entry is a reviewed
@@ -149,6 +178,9 @@ MIC_TO_YAHOO_SUFFIX = {
     "XFRA": ".F",
     "XDUS": ".DU",
     "XHAM": ".HM",
+    "XSTU": ".SG",
+    "XMUN": ".MU",
+    "XHAN": ".HA",
     "XHKG": ".HK",
     "XTKS": ".T",
     "XASX": ".AX",
@@ -416,6 +448,9 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XFRA": {"FRA"},
         "XDUS": {"DUS"},
         "XHAM": {"HAM"},
+        "XSTU": {"STU"},
+        "XMUN": {"MUN"},
+        "XHAN": {"HAN"},
         # Cboe BZX equity MIC / Yahoo exchange code.
         "BATS": {"BTS"},
         # OTCM is the ISO 10383 operating MIC for OTC Markets. Yahoo exposes
@@ -455,6 +490,9 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XFRA": ("FRANKFURT",),
         "XDUS": ("DUSSELDORF", "DÜSSELDORF"),
         "XHAM": ("HAMBURG",),
+        "XSTU": ("STUTTGART",),
+        "XMUN": ("MUNICH", "MUENCHEN", "MÜNCHEN"),
+        "XHAN": ("HANNOVER", "HANOVER"),
         "BATS": ("CBOE US", "CBOE BZX", "BZX"),
         "OTCM": ("OTC MARKETS OTCQX", "OTC MARKETS OTCQB", "OTC MARKETS OTCPK", "OTCQX", "OTCQB", "OTCPK"),
         "OTCQ": ("OTCQX",),
@@ -500,6 +538,9 @@ def yahoo_market_compatible(mic: str | None, market: str | None) -> bool:
         "XFRA": {"DE_MARKET"},
         "XDUS": {"DE_MARKET"},
         "XHAM": {"DE_MARKET"},
+        "XSTU": {"DE_MARKET"},
+        "XMUN": {"DE_MARKET"},
+        "XHAN": {"DE_MARKET"},
     }
     return market.upper() in allowed.get(mic, set())
 

@@ -1,23 +1,161 @@
-# TV Market Identity Prototype v0.3.34
+# TV Market Identity Prototype v0.3.44
+
+## v0.3.44 — Germany final evidence-gated regional rerouting
+
+The v0.3.43 rejection audit reduced the Germany top-4000 residual set to 22
+rows and showed that every residual security has at least one bounded German
+regional target where exact TradingView ISIN + MIC resolves in OpenFIGI and
+Yahoo passes the ordinary equity/currency/venue contract.  v0.3.44 promotes
+only those already-measured evidence paths.
+
+- Final Yahoo failures (`YAHOO_NO_MATCH` and German `MUTUALFUND`/`ETF`
+  taxonomy mismatches) may reroute to another reviewed German regional MIC
+  only when `ID_ISIN + target MIC` is unambiguous, Yahoo passes the ordinary
+  non-US contract there, and any existing OpenFIGI evidence has the same
+  non-null `shareClassFIGI`.
+- Direct German prefixes (`FWB`, `DUS`, `HAM`, `SWB`, `MUN`, `HAN`) get a
+  one-sided exact-ISIN regional fallback only after the same-venue OpenFIGI
+  path is exhausted.  The original source MIC is retained, no source FIGI is
+  fabricated, and the alternate target must provide a non-null shareClassFIGI
+  plus ordinary Yahoo evidence.  Mapping:
+  `TV_ISIN_GERMANY_REGIONAL_TARGET_FALLBACK`.
+- Cross-venue bridges such as `TRADEGATE` now retry a primary source miss with
+  exact TradingView `ISIN + the same reviewed source MIC`.  That source result
+  must still share exactly one `shareClassFIGI` with the target.  New mappings:
+  `ISIN_SOURCE_SHARE_CLASS_BRIDGE` and
+  `ISIN_SOURCE_REGIONAL_SHARE_CLASS_BRIDGE`.
+- The former Yahoo-failure regional diagnostic is now production-capable, but
+  only for the exact evidence class proven by the audit; conflicting
+  shareClassFIGIs and missing source/security proof remain fail-closed.
+- Existing UK/Swiss policies and reviewed exceptions are unchanged.
+- Key counters:
+  `openfigi_bridge_source_isin_fallback_*`,
+  `bridge_source_isin_fallback_matches*`,
+  `yahoo_failure_regional_fallback_matches*`,
+  `tv_isin_germany_regional_target_fallback_matches*`.
+- Resolver policy: `0.3.44-policy44`. Regression suite: 122 tests.
+
+
+## v0.3.43 — rejection evidence audit (no admission-policy change)
+
+This is an audit-only utility release. Resolver admission remains exactly
+`0.3.42-policy42`, so the Germany `3978 VERIFIED / 22 REJECTED` baseline is
+directly comparable.
+
+- Adds `run --rejection-audit <path.jsonl>`.
+- For every rejected row, writes exact TradingView identity fields, current
+  resolver mapping, bounded source/regional MIC probes, OpenFIGI FIGI /
+  compositeFIGI / shareClassFIGI / security taxonomy, Yahoo symbol / venue /
+  quoteType / currency / price, and ordinary-contract blockers.
+- The audit performs evidence probes only; it never upgrades a rejected row or
+  changes production bindings.
+- Fixed and regression-tested the Yahoo venue compatibility call used by the
+  audit path.
+
+## v0.3.42 — German exact-ISIN same-venue proof + bounded Yahoo fund-taxonomy anomaly
+
+The Germany top-4000 audit reduced the remaining failures to exact repeated
+security groups.  v0.3.42 strengthens evidence before relaxing any Yahoo
+metadata rule.
+
+- Reviewed direct German prefixes (`FWB`, `DUS`, `HAM`, `SWB`, `MUN`, `HAN`)
+  now retry an exhausted `ID_EXCH_SYMBOL + MIC` lookup with exact TradingView
+  `ISIN + the same MIC`.  A successful result uses
+  `TV_ISIN_SAME_VENUE_FALLBACK`; no FIGI or venue is fabricated.
+- An OpenFIGI-backed German regional common-stock/REIT identity may tolerate
+  Yahoo `quoteType=MUTUALFUND` or `ETF` only when Yahoo returns the exact bounded
+  symbol, explicit matching currency, and explicit compatible German regional
+  venue.  Yahoo-only strict fallbacks are never eligible for this taxonomy
+  exception.
+- This also aligns missing Yahoo currency with the existing non-US contract: once
+  exact `ISIN + MIC` has independently proven the listing, missing Yahoo currency
+  is absence of corroboration rather than a contradiction.
+- Remaining German `YAHOO_NO_MATCH` / strict missing-currency rows get a
+  diagnostic-only alternate-regional probe across `XFRA/XSTU/XMUN/XHAN/XDUS/XHAM`.
+  These probes never upgrade the row in v0.3.42; they only measure whether a
+  stronger alternate quote target exists for the next policy step.
+
+Key counters include `openfigi_german_direct_isin_fallback_*`,
+`yahoo_germany_regional_fund_taxonomy_*`, and
+`yahoo_failure_regional_probe_*`.
+
+
+## v0.3.41 — Germany evidence-gated regional target routing
+
+The live v0.3.40 Germany audit proved that Xetra is not a universal Yahoo/OpenFIGI target for the remaining bridge rows. Across 457 rows with no Xetra target, exact-ISIN regional probes found 2,129 OpenFIGI venue candidates and Yahoo validated 1,980 of them; 440/457 rows had at least one valid regional Yahoo target, while most had several.
+
+- Regional probes across `XFRA`, `XSTU`, `XMUN`, `XHAN`, `XDUS`, and `XHAM` can now create production bindings instead of telemetry only. Every candidate still requires exact `ID_ISIN + MIC`, compatible OpenFIGI security type, a bounded Yahoo suffix, and normal Yahoo currency/type/venue validation.
+- Multiple valid regional venues are treated as quote-target alternatives for the **same exact ISIN**, not as an identity ambiguity. A fixed MIC priority selects one target only after security consistency is proven. Explicitly conflicting non-null `shareClassFIGI` values remain fail-closed.
+- `GETTEX` and `TRADEGATE` retain source-side protection: a regional target is admissible only when its non-null `shareClassFIGI` matches exactly one source listing. No source venue is guessed.
+- `LSX` and `LS` retain the reviewed one-sided exact-ISIN rule established for Xetra: when OpenFIGI lacks the single reviewed source MIC (`HAML`/`LSSI`), TradingView's exact ISIN plus an independently proven regional target may bind without fabricating a source venue FIGI.
+- New mapping methods: `TV_ISIN_REGIONAL_TARGET_BRIDGE`, `ISIN_REGIONAL_SHARE_CLASS_BRIDGE`, and `REGIONAL_SHARE_CLASS_BRIDGE`. Warm-cache quote refresh uses the normal cached target-MIC contract.
+- Added production telemetry `regional_target_bridge_matches*`, `regional_target_bridge_multi_mic_matches*`, `tv_isin_regional_target_bridge_matches*`, `regional_share_class_bridge_matches*`, and bounded failure counters for source proof/share-class/security ambiguity.
+- Resolver policy: `0.3.41-policy41`. Regression suite: 109 tests.
+
+## v0.3.40 — Germany regional-target diagnostics
+
+- The live v0.3.39 Germany run proved that `ID_WERTPAPIER + XETR` does not rescue the remaining LSX/LS target gaps: `0/253` matches. The WKN-to-Xetra fallback is therefore removed rather than retained as dead provider traffic.
+- For bridge rows with no Xetra target, v0.3.40 performs a diagnostic-only exact-ISIN probe across the German regional venues already supported by the resolver: `XFRA`, `XSTU`, `XMUN`, `XHAN`, `XDUS`, `XHAM`.
+- Any unambiguous regional OpenFIGI result is converted to its bounded Yahoo suffix (`.F`, `.SG`, `.MU`, `.HA`, `.DU`, `.HM`) and checked with the normal currency/type/venue contract. Results are telemetry only and **never create VERIFIED bindings** in this version.
+- New stats distinguish OpenFIGI regional coverage from Yahoo-valid production targets, including per-prefix/per-MIC counts and unique-vs-multiple target rows.
+- Resolver policy: `0.3.40-policy40`.
+
+## v0.3.39 — historical WKN-to-Xetra experiment (removed in v0.3.40)
+
+The v0.3.38 Germany live audit proved that Bloomberg-style `exchCode=GY` is not a usable Mapping API fallback for these Xetra targets: all **457/457** scoped fallback jobs returned no compatible identity. That path is removed rather than kept as dead traffic.
+
+- For `LSX` and `LS` only, when the primary `ID_ISIN + micCode=XETR` target lookup is empty and the TradingView venue symbol has the strict six-character WKN shape, the resolver retries the target as `ID_WERTPAPIER + micCode=XETR`. OpenFIGI documents `ID_WERTPAPIER` as the German Wertpapierkennnummer identifier.
+- This is not generic ticker rewriting. TradingView exposes WKN-style symbols on these namespaces (for example `LSX:BASF11` and `LS:887915`), and OpenFIGI itself must recognize the exact six-character value as `ID_WERTPAPIER` at Xetra before it can participate in resolution.
+- If the source venue OpenFIGI identity exists, the WKN-derived Xetra target must still share exactly one non-empty `shareClassFIGI` with that source before Yahoo is consulted (`ISIN_WKN_SHARE_CLASS_BRIDGE`).
+- If `LSX -> HAML` or `LS -> LSSI` remains unindexed at OpenFIGI, the existing one-sided source policy may use the exact WKN-derived Xetra target (`TV_WKN_TARGET_BRIDGE`), preserving the reviewed source MIC while leaving `source_venue_figi=null`. GETTEX and TRADEGATE do **not** receive this shortcut.
+- Added stats `openfigi_wkn_target_fallback_jobs/matches/no_match`, per-prefix variants, `tv_wkn_target_bridge_matches*`, and `isin_wkn_share_class_bridge_matches*`.
+- Resolver policy: `0.3.39-policy39`.
+- Regression suite: 104 tests.
+
+
+## v0.3.38 — Xetra OpenFIGI exchange-code target fallback (superseded)
+
+- Keeps `micCode=XETR` as the primary OpenFIGI target proof. If that exact target returns no compatible identity for a German cross-venue bridge, the resolver performs one second **scoped Xetra** lookup using Bloomberg/OpenFIGI `exchCode=GY`. OpenFIGI's FIGI allocation rules explicitly show Xetra securities with the `GY` exchange code (for example `STM GY`), while Tradegate uses `TH`.
+- For `GETTEX` / `LSX` / `LS`, the fallback remains `ID_ISIN + exchCode=GY`; for ticker-based `TRADEGATE`, it remains exact `ID_EXCH_SYMBOL + exchCode=GY` with currency/type filters. No unscoped ticker inference is used.
+- `target_mic` stays `XETR`. Mapping methods using this fallback are marked `*_XETRA_EXCHCODE` so cached provenance remains explicit. Existing share-class bridge requirements are unchanged; the one-sided `TV_ISIN_TARGET_BRIDGE` remains limited to reviewed single-source-MIC namespaces (`LSX`, `LS`). GETTEX still cannot guess between `MUNC` and `MUND`.
+- Added stats `openfigi_xetra_exchcode_fallback_jobs`, `openfigi_xetra_exchcode_fallback_matches/no_match` and per-prefix variants.
+- Resolver policy: `0.3.38-policy38`. The Germany-wide live run returned `openfigi_xetra_exchcode_fallback_no_match=457` and zero matches; v0.3.39 removes this fallback.
+
+## v0.3.37 — one-sided TV-ISIN target bridge + duplicate Xetra collapse
+
+The v0.3.36 Germany diagnostic showed that OpenFIGI knows every failed GETTEX/LSX/LS ISIN unscoped, but its venue coverage is asymmetric: all 432 LSX rows returned no `HAML` source row while many still returned an exact `ID_ISIN + XETR` target. This release uses that evidence without pretending OpenFIGI proved the missing source listing.
+
+- For an ISIN bridge with **exactly one reviewed source MIC** (`LSX -> HAML`, `LS -> LSSI`), if the source-scoped OpenFIGI job is empty but `ID_ISIN + XETR` returns one unambiguous type-compatible target, the resolver may use `TV_ISIN_TARGET_BRIDGE`. TradingView supplies the source namespace + exact ISIN; OpenFIGI proves that same ISIN at Xetra; Yahoo must still validate the bounded `.DE` target. No source venue FIGI is fabricated.
+- GETTEX deliberately does **not** receive this fallback because its provider namespace spans two source MICs (`MUNC` and `MUND`); if both source probes are absent the resolver cannot guess which segment applies.
+- Duplicate Xetra rows from an ISIN bridge are collapsed only when every surviving row has the same non-null `shareClassFIGI` and the same normalized ticker. The collapsed target keeps no arbitrary venue FIGI. Any differing ticker/share class remains fail-closed as `OPENFIGI_TARGET_AMBIGUOUS`.
+- Unresolved unscoped ISIN diagnostics now also report whether all compatible OpenFIGI rows expose one unique normalized ticker (`openfigi_isin_bridge_unscoped_unique_ticker*`) or conflicting/missing ticker metadata. This is telemetry only and does not create a binding.
+- Resolver policy: `0.3.37-policy37`.
+- Regression suite: 100 tests.
+
+## v0.3.36 — Germany bridge diagnostics (no admission-policy relaxation)
+
+- Keeps the v0.3.35 German venue model unchanged. No new instrument is admitted solely by this release.
+- Adds bounded per-prefix bridge telemetry for `TRADEGATE`, `GETTEX`, `LSX`, and `LS`, separating true scoped OpenFIGI empties from post-filter type/symbol mismatches and reporting target ambiguity by prefix.
+- For failed ISIN-gated `GETTEX`/`LSX`/`LS` bridges only, performs a diagnostic unscoped `ID_ISIN` lookup. It records whether OpenFIGI knows the security and whether all compatible rows share one `shareClassFIGI`; the result is telemetry only and cannot create a binding.
+- Resolver policy: `0.3.36-policy36`.
+
+## v0.3.35 — Germany venue expansion + ISIN-gated LS/gettex bridges
+
+The first Germany market-only audit (`Limit=4000`) returned 2,283 `MIC_UNKNOWN` rows, exactly accounted for by six TradingView provider prefixes: GETTEX, LSX, LS, SWB, MUN and HAN. This release adds reviewed venue semantics without treating provider names as aliases for Xetra.
+
+- Direct regional mappings: `SWB -> XSTU -> .SG`, `MUN -> XMUN -> .MU`, `HAN -> XHAN -> .HA`. Yahoo venue validation accepts only the corresponding Stuttgart/Munich/Hannover metadata (or the existing reviewed `de_market` missing-venue fallback).
+- `GETTEX` is not collapsed to Munich/Xetra: official gettex MICs are `MUNC` (regulated) and `MUND` (open market).
+- `LSX` uses source MIC `HAML` (LS Exchange); `LS` uses source MIC `LSSI` (Lang & Schwarz TradeCenter systematic internaliser).
+- GETTEX/LSX/LS use `ISIN_SHARE_CLASS_BRIDGE` to Xetra. TradingView ISIN is queried at the exact source MIC(s) and at `XETR`; the resolver requires exactly one common non-empty `shareClassFIGI` before generating the Yahoo `.DE` target. This handles WKN-style TradingView symbols such as LSX `BASF11` without fuzzy ticker rewriting. Missing TradingView ISIN fails closed as `TV_ISIN_UNKNOWN`.
+- Added stats `openfigi_isin_bridge_jobs` and `isin_bridge_share_class_matches`.
+- Resolver policy: `0.3.35-policy35`.
+- Regression suite: 93 tests.
+
+The Germany coverage profile is still a *top-N audit* when TradingView reports `totalCount > Limit`; a separate pagination change should be validated only after venue semantics are stable.
 
 
 
 ## v0.3.34 — exact reviewed Yahoo YHD venue artifact
-
-UK full-market validation
--------------------------
-TradingView rows: 3793
-VERIFIED: 3792
-REJECTED: 1
-Coverage: 99.974%
-
-Expected rejection:
-LSE:CAGP — TradingView preferred vs Yahoo BOND
-
-Warm-cache validation:
-CACHE_HIT: 3793
-cache_misses: 0
-Yahoo quote refresh preserved
 
 The four reviewed Yahoo `MUTUALFUND` taxonomy overrides now also tolerate one exact synthetic Yahoo venue tuple observed live for all four rows: `exchange=YHD`, `fullExchangeName=YHD`, `market=us_market`. This is **not** added to generic London venue compatibility. It is accepted only when the row is already in the exact reviewed registry, independent OpenFIGI identity is present, mapping is not target-provider-only, ticker/MIC/kind/name guards pass, Yahoo returns the exact bounded symbol, and any reported currency is compatible. Any other `YHD`, market, venue, type, symbol, or currency combination remains fail-closed.
 

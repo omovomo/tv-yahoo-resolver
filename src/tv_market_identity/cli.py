@@ -13,7 +13,18 @@ from dotenv import find_dotenv, load_dotenv
 from .cache import CacheDB
 from .config import load_screen_config
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
-from .policy import currency_compatible, openfigi_currency
+from .policy import (
+    CROSS_VENUE_BRIDGES,
+    GERMANY_REGIONAL_TARGET_MICS,
+    ISIN_SHARE_CLASS_BRIDGES,
+    TV_PREFIX_TO_MIC,
+    currency_compatible,
+    openfigi_currency,
+    tv_type_kind,
+    yahoo_listing_symbol,
+    yahoo_type_compatible,
+    yahoo_venue_compatible,
+)
 from .resolver import BatchResolver
 from .tradingview import dataframe_to_tv_rows, fetch_screen
 
@@ -99,6 +110,116 @@ def _write_csv(path: Path, df, bindings: dict) -> None:
         w.writerows(records)
 
 
+
+def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """Write evidence-only JSONL for rejected German rows.
+
+    This never changes admission.  It re-probes exact TradingView ISIN across
+    the row's source venue(s) and bounded German regional MICs, then records
+    OpenFIGI identity metadata plus the corresponding Yahoo quote metadata.
+    """
+    rejected_rows = [
+        r for r in rows
+        if (b := bindings.get(r.tv_id)) is not None and b.status == "REJECTED"
+    ]
+    records = []
+    for r in rejected_rows:
+        b = bindings[r.tv_id]
+        source_mics = []
+        direct = TV_PREFIX_TO_MIC.get(r.prefix)
+        if direct:
+            source_mics.append(direct)
+        bridge = ISIN_SHARE_CLASS_BRIDGES.get(r.prefix)
+        if bridge:
+            source_mics.extend(bridge.get("source_mics", ()))
+        cross = CROSS_VENUE_BRIDGES.get(r.prefix)
+        if cross:
+            source_mics.extend(cross.get("source_mics", ()))
+
+        probe_mics = []
+        for mic in [*source_mics, *GERMANY_REGIONAL_TARGET_MICS]:
+            if mic and mic not in probe_mics:
+                probe_mics.append(mic)
+
+        evidence = []
+        if r.isin:
+            jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic} for mic in probe_mics]
+            try:
+                mapped = resolver.openfigi.map_jobs(jobs)
+            except ProviderError:
+                mapped = [[] for _ in jobs]
+
+            yahoo_symbols = set()
+            staged = []
+            for mic, identities in zip(probe_mics, mapped):
+                for x in identities:
+                    symbol = yahoo_listing_symbol(x.ticker or r.symbol, mic, r.prefix, tv_type_kind(r))
+                    yahoo_symbols.add(symbol)
+                    staged.append((mic, x, symbol))
+            try:
+                quotes = resolver.yahoo.quotes(sorted(yahoo_symbols)) if yahoo_symbols else {}
+            except ProviderError:
+                quotes = {}
+
+            for mic, x, symbol in staged:
+                q = quotes.get(symbol)
+                ordinary_blocks = []
+                if q is None:
+                    ordinary_blocks.append("YAHOO_NOT_RETURNED")
+                else:
+                    if q.currency is not None and not currency_compatible(r.currency, q.currency):
+                        ordinary_blocks.append(f"CURRENCY_MISMATCH:{q.currency}")
+                    if q.quote_type is not None and not yahoo_type_compatible(r, q.quote_type):
+                        ordinary_blocks.append(f"TYPE_MISMATCH:{q.quote_type}")
+                    if not yahoo_venue_compatible(mic, q):
+                        ordinary_blocks.append(
+                            f"VENUE_MISMATCH:{q.exchange}/{q.full_exchange_name}/{q.market}"
+                        )
+                evidence.append({
+                    "mic": mic,
+                    "role": "source" if mic in source_mics else "regional_target",
+                    "figi": x.figi,
+                    "composite_figi": x.composite_figi,
+                    "share_class_figi": x.share_class_figi,
+                    "openfigi_ticker": x.ticker,
+                    "openfigi_name": x.name,
+                    "openfigi_security_type": x.security_type,
+                    "openfigi_security_type2": x.security_type2,
+                    "openfigi_exch_code": x.exch_code,
+                    "yahoo_symbol": symbol,
+                    "yahoo_returned": q is not None,
+                    "yahoo_exchange": q.exchange if q else None,
+                    "yahoo_full_exchange_name": q.full_exchange_name if q else None,
+                    "yahoo_market": q.market if q else None,
+                    "yahoo_quote_type": q.quote_type if q else None,
+                    "yahoo_currency": q.currency if q else None,
+                    "yahoo_price": q.price if q else None,
+                    "ordinary_contract_blocks": ordinary_blocks,
+                })
+
+        records.append({
+            "tv_id": r.tv_id,
+            "ticker": r.symbol,
+            "name": r.name,
+            "currency": r.currency,
+            "type": r.tv_type,
+            "typespecs": list(r.type_specs),
+            "isin": r.isin,
+            "rejection_reason": b.rejection_reason,
+            "resolved_mic": b.resolved_mic,
+            "source_mic": b.source_mic,
+            "target_mic": b.target_mic,
+            "mapping_method": b.mapping_method,
+            "yahoo_symbol": b.yahoo_symbol,
+            "source_probe_mics": source_mics,
+            "evidence": evidence,
+        })
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
 def cmd_run(args) -> int:
     cfg = load_screen_config(args.config)
     print(f"TradingView: market={cfg.market}, limit={cfg.limit}, order={cfg.order_by} {'ASC' if cfg.ascending else 'DESC'}")
@@ -158,6 +279,10 @@ def cmd_run(args) -> int:
         print("Resolver stats:", json.dumps(dict(resolver.stats), sort_keys=True))
         _write_csv(Path(args.output), df, bindings)
         print(f"CSV: {Path(args.output).resolve()}")
+        if args.rejection_audit:
+            audit_path = Path(args.rejection_audit)
+            _write_rejection_audit(audit_path, rows, bindings, resolver)
+            print(f"Rejection audit: {audit_path.resolve()}")
         return 3 if (args.strict_exit and rejected) else 0
     finally:
         cache.close()
@@ -389,6 +514,11 @@ def parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="Run TradingView + persistent identity resolution")
     common(r)
     r.add_argument("--refresh", action="store_true", help="Ignore binding cache and resolve again")
+    r.add_argument(
+        "--rejection-audit",
+        default=None,
+        help="Write evidence-only JSONL for rejected rows (exact ISIN/OpenFIGI + bounded German Yahoo probes)",
+    )
     r.add_argument("--strict-exit", action="store_true", help="Return exit code 3 when any instrument is REJECTED")
     r.add_argument("--yahoo-batch", type=int, default=75)
     r.add_argument("--verified-ttl-days", type=int, default=60)

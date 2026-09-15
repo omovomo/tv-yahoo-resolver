@@ -17,6 +17,7 @@ src/tv_market_identity.egg-info/requires.txt
 src/tv_market_identity.egg-info/top_level.txt
 tests/test_bulk_700.py
 tests/test_cache.py
+tests/test_cli_rejection_audit.py
 tests/test_config_optional_filters.py
 tests/test_env.py
 tests/test_policy.py

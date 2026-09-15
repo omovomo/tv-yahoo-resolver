@@ -21,6 +21,7 @@ TV_COLUMNS = (
     "price_earnings_ttm",
     "close",
     "is_primary",
+    "isin",
 )
 
 
@@ -82,6 +83,7 @@ def dataframe_to_tv_rows(df) -> list[TvRow]:
             sector=record.get("sector"),
             market_cap=_float(record.get("market_cap_basic")),
             close=_float(record.get("close")),
+            isin=(str(record.get("isin")).upper().strip() if record.get("isin") else None),
         ))
     return rows
 

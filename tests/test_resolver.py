@@ -1922,3 +1922,4 @@ def test_reviewed_yahoo_mutualfund_yhd_survives_warm_cache_refresh(tmp_path):
     assert got[row.tv_id].yahoo_quote_type == "MUTUALFUND"
     assert got[row.tv_id].quote_status == "FRESH_CURRENCY_UNREPORTED"
     db.close()
+
