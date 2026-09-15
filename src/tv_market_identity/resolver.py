@@ -1,0 +1,1732 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import time
+from collections import defaultdict
+
+from .cache import CacheDB
+from .models import Binding, FinnhubIdentity, OpenFigiIdentity, TvRow, YahooQuote
+from .policy import (
+    CROSS_VENUE_BRIDGES,
+    EXCHCODE_SHARE_CLASS_BRIDGES,
+    MIC_TO_YAHOO_SUFFIX,
+    RESOLVER_VERSION,
+    REVIEWED_ISIN_FALLBACKS,
+    REVIEWED_YAHOO_SYMBOL_ALIASES,
+    REVIEWED_YAHOO_MUTUALFUND_TAXONOMY,
+    SECONDARY_MIC_FALLBACKS,
+    TV_PREFIX_ALLOWED_MICS,
+    TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES,
+    TV_PREFIX_TO_MIC,
+    bounded_symbol_variants,
+    currency_compatible,
+    finnhub_identity_from_row,
+    finnhub_type_compatible,
+    is_us_tv,
+    openfigi_currency,
+    openfigi_security_type,
+    openfigi_type_compatible,
+    punctuation_key,
+    yahoo_listing_symbol,
+    yahoo_listing_alternative_symbol,
+    symbol_index_keys,
+    tv_type_kind,
+    yahoo_type_compatible,
+    yahoo_venue_compatible,
+    yahoo_market_compatible,
+)
+from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
+
+def _telemetry_token(value: str | None) -> str:
+    """Bound provider metadata into a stable, low-cardinality stats token."""
+    if value is None:
+        return "UNREPORTED"
+    token = re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
+    return (token or "EMPTY")[:48]
+
+
+def _select_openfigi_identity(row: TvRow, identities: list[OpenFigiIdentity]):
+    """Select one security identity without inventing a venue-level FIGI.
+
+    OpenFIGI can return multiple venue rows for the same exact ticker/MIC query.
+    If every surviving row has the same non-null shareClassFIGI, the share-class
+    identity is unambiguous even when OpenFIGI returns multiple composite/venue
+    rows. Return a synthetic security-level identity with figi/compositeFIGI
+    unset so the cache does not pretend one arbitrary lower-level identifier
+    was authoritative.
+    """
+    exact = [
+        x for x in identities
+        if punctuation_key(x.ticker or "") == punctuation_key(row.symbol)
+        and openfigi_type_compatible(row, x)
+    ]
+    if not exact:
+        return None, False, "OPENFIGI_NO_MATCH"
+    if len(exact) == 1:
+        return exact[0], False, None
+
+    shares = {x.share_class_figi for x in exact if x.share_class_figi}
+    composites = {x.composite_figi for x in exact if x.composite_figi}
+    all_have_share = all(bool(x.share_class_figi) for x in exact)
+    # Share-class FIGI is explicitly the OpenFIGI level that links multiple
+    # composite/venue FIGIs representing the same class of the same equity.
+    # Therefore multiple exact ticker+MIC+currency rows are security-level
+    # unambiguous when *all* surviving rows share one shareClassFIGI, even if
+    # their compositeFIGIs differ. A compositeFIGI is retained only when all
+    # rows agree on that level; venue FIGI is never chosen arbitrarily.
+    if all_have_share and len(shares) == 1:
+        first = exact[0]
+        return OpenFigiIdentity(
+            figi=None,
+            composite_figi=(next(iter(composites)) if len(composites) == 1 else None),
+            share_class_figi=next(iter(shares)),
+            ticker=first.ticker or row.symbol,
+            name=first.name,
+            security_type=first.security_type,
+            security_type2=first.security_type2,
+            exch_code=None,
+        ), True, None
+    return None, False, f"OPENFIGI_AMBIGUOUS:{len(exact)}"
+
+
+def _strict_yahoo_mapping(mapping_method: str | None) -> bool:
+    """Whether Yahoo must explicitly confirm currency, type and venue.
+
+    These paths lack a provider-scoped OpenFIGI venue proof. They remain
+    admissible only when Yahoo returns complete, non-conflicting metadata.
+    """
+    return mapping_method in {
+        "TARGET_PROVIDER_STRICT_FALLBACK",
+        "REVIEWED_ISIN_SECURITY_FALLBACK",
+    }
+
+
+def _openfigi_explicit_depositary_receipt(identity: OpenFigiIdentity | None) -> bool:
+    """Require explicit OpenFIGI DR taxonomy, not merely equity compatibility.
+
+    ``openfigi_type_compatible`` intentionally accepts a few coarse provider
+    labels for discovery.  The Yahoo MUTUALFUND exception below is narrower:
+    it is allowed only when OpenFIGI itself explicitly identifies the security
+    as a depositary receipt / ADR.
+    """
+    if identity is None:
+        return False
+    values = {
+        (identity.security_type or "").strip().lower(),
+        (identity.security_type2 or "").strip().lower(),
+    }
+    return bool(values & {
+        "depositary receipt",
+        "depositary receipts",
+        "adr",
+        "global depositary receipt",
+        "gdr",
+    })
+
+
+def _lsin_dr_mutualfund_taxonomy_anomaly_compatible(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    identity: OpenFigiIdentity | None,
+    mapping_method: str | None,
+) -> bool:
+    """Bounded Yahoo taxonomy exception for independently proven LSIN DRs.
+
+    Yahoo currently labels some London IOB/PSM depositary receipts as
+    ``MUTUALFUND`` even though TradingView and OpenFIGI identify the security as
+    a DR.  This exception does *not* let Yahoo establish identity: it requires
+    explicit OpenFIGI DR proof, a London MIC, the exact bounded Yahoo symbol,
+    explicit matching currency, and explicit compatible venue metadata.
+
+    Target-provider-only mappings are excluded because they have no independent
+    OpenFIGI identity proof.
+    """
+    if row.prefix != "LSIN" or tv_type_kind(row) != "ADR":
+        return False
+    if target_mic not in {"XLON", "XLOM"}:
+        return False
+    if _strict_yahoo_mapping(mapping_method):
+        return False
+    if not _openfigi_explicit_depositary_receipt(identity):
+        return False
+    if q is None or q.symbol != expected_symbol:
+        return False
+    if (q.quote_type or "").upper() != "MUTUALFUND":
+        return False
+    # Unlike the ordinary OpenFIGI-backed path, this provider-taxonomy anomaly
+    # requires Yahoo to corroborate both currency and venue explicitly.
+    if q.currency is None or not currency_compatible(row.currency, q.currency):
+        return False
+    if q.exchange is None and q.full_exchange_name is None:
+        return False
+    return yahoo_venue_compatible(target_mic, q)
+
+
+
+
+def _reviewed_yahoo_synthetic_yhd_venue(q: YahooQuote | None) -> bool:
+    """Match Yahoo's exact synthetic delayed-quote venue artifact.
+
+    Live Yahoo chart metadata can label reviewed non-US securities as
+    ``MUTUALFUND`` while simultaneously reporting ``exchange=YHD``,
+    ``fullExchangeName=YHD`` and ``market=us_market``.  This triplet is not
+    treated as a real venue.  It is admissible only inside the exact reviewed
+    taxonomy override, never by the generic venue policy.
+    """
+    if q is None:
+        return False
+    return (
+        (q.exchange or "").upper() == "YHD"
+        and (q.full_exchange_name or "").upper() == "YHD"
+        and (q.market or "").lower() == "us_market"
+    )
+
+
+def _cached_reviewed_yahoo_mutualfund_yhd_compatible(
+    binding: Binding, q: YahooQuote | None
+) -> bool:
+    """Preserve a cold-path reviewed YHD anomaly across cache refreshes."""
+    rule = REVIEWED_YAHOO_MUTUALFUND_TAXONOMY.get(binding.tv_id)
+    if not rule or q is None:
+        return False
+    if _strict_yahoo_mapping(binding.mapping_method):
+        return False
+    if binding.resolved_mic != str(rule.get("mic") or ""):
+        return False
+    if q.symbol != binding.yahoo_symbol:
+        return False
+    if (binding.yahoo_quote_type or "").upper() != "MUTUALFUND":
+        return False
+    if (q.quote_type or "").upper() != "MUTUALFUND":
+        return False
+    if q.currency is not None and not currency_compatible(binding.tv_currency, q.currency):
+        return False
+    return _reviewed_yahoo_synthetic_yhd_venue(q)
+
+def _reviewed_yahoo_mutualfund_taxonomy_block_reason(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    identity: OpenFigiIdentity | None,
+    mapping_method: str | None,
+) -> str | None:
+    """Return the first guard blocking the exact reviewed taxonomy override.
+
+    ``None`` means every guard passed.  This helper intentionally mirrors the
+    admission contract so live coverage runs can distinguish a provider-data
+    limitation from an overly strict reviewed guard without weakening policy.
+    """
+    rule = REVIEWED_YAHOO_MUTUALFUND_TAXONOMY.get(row.tv_id)
+    if not rule:
+        return "NOT_REVIEWED"
+    if identity is None:
+        return "NO_OPENFIGI_IDENTITY"
+    if _strict_yahoo_mapping(mapping_method):
+        return "STRICT_MAPPING"
+    if tv_type_kind(row) != str(rule.get("kind") or ""):
+        return "KIND_MISMATCH"
+    if target_mic != str(rule.get("mic") or ""):
+        return "MIC_MISMATCH"
+    if q is None:
+        return "NO_YAHOO_ROW"
+    if q.symbol != expected_symbol:
+        return "SYMBOL_MISMATCH"
+    if (q.quote_type or "").upper() != "MUTUALFUND":
+        return "TYPE_NOT_MUTUALFUND"
+    # The ordinary OpenFIGI-backed non-US contract already treats missing Yahoo
+    # currency as absence of corroboration rather than a contradiction.  The
+    # exact reviewed taxonomy override follows the same rule: an explicit Yahoo
+    # currency must agree, but an unreported currency does not veto otherwise
+    # independently proven identity.
+    if q.currency is not None and not currency_compatible(row.currency, q.currency):
+        return "CURRENCY_MISMATCH"
+    if q.exchange is None and q.full_exchange_name is None:
+        return "VENUE_UNREPORTED"
+    if not yahoo_venue_compatible(target_mic, q) and not _reviewed_yahoo_synthetic_yhd_venue(q):
+        return "VENUE_MISMATCH"
+    tokens = tuple(str(x).upper() for x in rule.get("name_tokens", ()))
+    row_name = (row.name or "").upper()
+    if tokens and not any(token in row_name for token in tokens):
+        return "NAME_MISMATCH"
+    return None
+
+
+def _reviewed_yahoo_mutualfund_taxonomy_anomaly_compatible(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    identity: OpenFigiIdentity | None,
+    mapping_method: str | None,
+) -> bool:
+    """Exact reviewed exception for Yahoo ``MUTUALFUND`` misclassification."""
+    return _reviewed_yahoo_mutualfund_taxonomy_block_reason(
+        row, target_mic, expected_symbol, q, identity, mapping_method
+    ) is None
+
+
+def _non_us_quote_compatible(row: TvRow, target_mic: str, expected_symbol: str, q: YahooQuote | None, target_only: bool) -> bool:
+    """Return whether a Yahoo row satisfies the current non-US evidence contract.
+
+    Normal OpenFIGI-backed mappings tolerate missing Yahoo metadata but never an
+    explicit contradiction. Target-provider-only mappings require all key Yahoo
+    metadata to be present because no OpenFIGI identity was available.
+    """
+    if q is None or q.symbol != expected_symbol:
+        return False
+    if target_only:
+        if q.currency is None or not currency_compatible(row.currency, q.currency):
+            return False
+        if q.quote_type is None or not yahoo_type_compatible(row, q.quote_type):
+            return False
+        if q.exchange is None and q.full_exchange_name is None:
+            return False
+        return yahoo_venue_compatible(target_mic, q)
+    if q.currency is not None and not currency_compatible(row.currency, q.currency):
+        return False
+    if q.quote_type is not None and not yahoo_type_compatible(row, q.quote_type):
+        return False
+    if q.exchange is None and q.full_exchange_name is None:
+        return q.market is None or yahoo_market_compatible(target_mic, q.market)
+    return yahoo_venue_compatible(target_mic, q)
+
+
+def _non_us_quote_rejection_reason(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    target_only: bool,
+    *,
+    source: str | None = None,
+) -> str | None:
+    """Return the first exact Yahoo contradiction for diagnostics.
+
+    Compatibility remains defined by ``_non_us_quote_compatible``. This helper
+    exists only so a chart row that was returned but rejected is not later
+    flattened into ``YAHOO_NO_MATCH``. Missing metadata on normal OpenFIGI-backed
+    mappings remains tolerated exactly as before; target-only paths still require
+    explicit metadata.
+    """
+    prefix = f"YAHOO_{source.upper()}_" if source else "YAHOO_"
+    if q is None:
+        return None
+    if q.symbol != expected_symbol:
+        return f"{prefix}SYMBOL_MISMATCH:{q.symbol}"
+
+    if target_only and q.currency is None:
+        return f"{prefix}CURRENCY_UNREPORTED_TARGET_ONLY"
+    if q.currency is not None and not currency_compatible(row.currency, q.currency):
+        return f"{prefix}CURRENCY_MISMATCH:{q.currency}"
+
+    if target_only and q.quote_type is None:
+        return f"{prefix}TYPE_UNREPORTED_TARGET_ONLY"
+    if q.quote_type is not None and not yahoo_type_compatible(row, q.quote_type):
+        return f"{prefix}TYPE_MISMATCH:{q.quote_type}"
+
+    venue_missing = q.exchange is None and q.full_exchange_name is None
+    if target_only and venue_missing:
+        return f"{prefix}VENUE_UNREPORTED_TARGET_ONLY"
+    if venue_missing:
+        if q.market is not None and not yahoo_market_compatible(target_mic, q.market):
+            return f"{prefix}MARKET_MISMATCH:{target_mic}->{q.market}"
+    elif not yahoo_venue_compatible(target_mic, q):
+        return f"{prefix}VENUE_MISMATCH:{target_mic}->{q.exchange}/{q.full_exchange_name}/{q.market}"
+
+    return None
+
+
+def _cached_non_us_quote_compatible(binding: Binding, q: YahooQuote | None) -> bool:
+    if q is None or q.symbol != binding.yahoo_symbol:
+        return False
+    target_only = _strict_yahoo_mapping(binding.mapping_method)
+    quote_type = (q.quote_type or "").upper()
+    if q.quote_type is None and not target_only:
+        type_ok = True
+    elif binding.yahoo_quote_type and quote_type == (binding.yahoo_quote_type or "").upper():
+        # The cached binding already records the Yahoo type that was admitted
+        # during full discovery (including special TV classifications such as
+        # REIT represented as fund+reit). Preserve that exact contract.
+        type_ok = True
+    else:
+        type_ok = ((binding.tv_type or "").lower() == "fund" and quote_type in {"ETF", "MUTUALFUND"}) or \
+                  ((binding.tv_type or "").lower() != "fund" and quote_type == "EQUITY")
+    if target_only and q.quote_type is None:
+        type_ok = False
+    if target_only:
+        currency_ok = q.currency is not None and currency_compatible(binding.tv_currency, q.currency)
+    else:
+        currency_ok = q.currency is None or currency_compatible(binding.tv_currency, q.currency)
+    venue_missing = q.exchange is None and q.full_exchange_name is None
+    if target_only:
+        venue_ok = (not venue_missing) and yahoo_venue_compatible(binding.resolved_mic, q)
+    elif venue_missing:
+        venue_ok = q.market is None or yahoo_market_compatible(binding.resolved_mic, q.market)
+    else:
+        venue_ok = yahoo_venue_compatible(binding.resolved_mic, q)
+        if not venue_ok and _cached_reviewed_yahoo_mutualfund_yhd_compatible(binding, q):
+            venue_ok = True
+    return type_ok and currency_ok and venue_ok
+
+
+class BatchResolver:
+    def __init__(
+        self,
+        cache: CacheDB,
+        finnhub: FinnhubProvider | None,
+        openfigi: OpenFigiProvider,
+        yahoo: YahooProvider,
+        verified_ttl_days: int = 60,
+        rejected_ttl_hours: int = 6,
+        finnhub_ttl_hours: int = 24,
+    ):
+        self.cache = cache
+        self.finnhub = finnhub
+        self.openfigi = openfigi
+        self.yahoo = yahoo
+        self.verified_ttl = verified_ttl_days * 86400
+        self.rejected_ttl = rejected_ttl_hours * 3600
+        self.finnhub_ttl = finnhub_ttl_hours * 3600
+        self.stats = defaultdict(int)
+
+    def resolve(self, rows: list[TvRow], refresh: bool = False) -> dict[str, Binding]:
+        current = {r.tv_id: (r.currency, r.tv_type) for r in rows}
+        cached = {} if refresh else self.cache.get_bindings([r.tv_id for r in rows], RESOLVER_VERSION, current)
+        self.stats["cache_hits"] += len(cached)
+        missing = [r for r in rows if r.tv_id not in cached]
+        self.stats["cache_misses"] += len(missing)
+
+        us = [r for r in missing if is_us_tv(r)]
+        non_us = [r for r in missing if not is_us_tv(r)]
+        new_bindings: list[Binding] = []
+        if us:
+            new_bindings.extend(self._resolve_us(us))
+        if non_us:
+            new_bindings.extend(self._resolve_non_us(non_us))
+
+        persistent = [b for b in new_bindings if not self._is_transient_rejection(b)]
+        self.cache.put_bindings(persistent)
+        self.stats["transient_rejections_not_cached"] += len(new_bindings) - len(persistent)
+        out = dict(cached)
+        out.update({b.tv_id: b for b in new_bindings})
+        return out
+
+    @staticmethod
+    def _is_transient_rejection(binding: Binding) -> bool:
+        if binding.status != "REJECTED":
+            return False
+        reason = binding.rejection_reason or ""
+        return reason.startswith((
+            "FINNHUB_UNAVAILABLE:",
+            "OPENFIGI_UNAVAILABLE:",
+            "YAHOO_UNAVAILABLE:",
+        ))
+
+    def _ensure_finnhub_us(self) -> None:
+        age = self.cache.finnhub_age_seconds()
+        if age is not None and age < self.finnhub_ttl:
+            self.stats["finnhub_universe_cache_hits"] += 1
+            return
+        if self.finnhub is None:
+            raise ProviderError("Finnhub US universe cache is stale/missing and FINNHUB_API_KEY is unavailable")
+        rows = self.finnhub.us_symbols()
+        self.stats["finnhub_http_calls"] += 1
+        self.cache.replace_finnhub_us(rows)
+        self.stats["finnhub_rows_refreshed"] += len(rows)
+
+    def _resolve_us(self, rows: list[TvRow]) -> list[Binding]:
+        try:
+            self._ensure_finnhub_us()
+        except ProviderError as exc:
+            return [self._reject(r, f"FINNHUB_UNAVAILABLE: {exc}") for r in rows]
+
+        # Load the ~31k-symbol US universe once and index locally.  The normalized
+        # key is candidate generation only; admission still requires exact
+        # currency/type/MIC compatibility and a unique surviving row.
+        universe = self.cache.load_finnhub_universe()
+        norm_index: dict[str, list[dict]] = defaultdict(list)
+        for raw in universe:
+            symbol = str(raw.get("symbol") or "").upper().strip()
+            if symbol:
+                for key in symbol_index_keys(symbol):
+                    norm_index[key].append(raw)
+        self.stats["finnhub_local_rows_indexed"] += len(universe)
+
+        candidates: dict[str, tuple[TvRow, FinnhubIdentity, list[str]]] = {}
+        rejected: list[Binding] = []
+        all_yahoo_candidates: set[str] = set()
+
+        for r in rows:
+            raw_symbol_rows: list[dict] = []
+            seen_raw: set[tuple] = set()
+            for key in symbol_index_keys(r.symbol):
+                for raw in norm_index.get(key, []):
+                    identity_key = (
+                        raw.get("symbol"), raw.get("mic"), raw.get("currency"),
+                        raw.get("type"), raw.get("figi"), raw.get("shareClassFIGI"),
+                    )
+                    if identity_key not in seen_raw:
+                        seen_raw.add(identity_key)
+                        raw_symbol_rows.append(raw)
+            if not raw_symbol_rows:
+                rejected.append(self._reject(r, "FINNHUB_NO_SYMBOL"))
+                continue
+
+            identities = [finnhub_identity_from_row(raw) for raw in raw_symbol_rows]
+
+            currency_ok = [fh for fh in identities if currency_compatible(r.currency, fh.currency)]
+            if not currency_ok:
+                actual = sorted({str(fh.currency or "?") for fh in identities})
+                rejected.append(self._reject(r, f"FINNHUB_CURRENCY_MISMATCH:{','.join(actual)}"))
+                continue
+
+            type_ok = [fh for fh in currency_ok if finnhub_type_compatible(r, fh.security_type)]
+            if not type_ok:
+                actual = sorted({str(fh.security_type or "?") for fh in currency_ok})
+                rejected.append(self._reject(r, f"FINNHUB_TYPE_MISMATCH:{','.join(actual)}"))
+                continue
+
+            allowed = TV_PREFIX_ALLOWED_MICS.get(r.prefix)
+            mic_ok = type_ok if not allowed else [fh for fh in type_ok if fh.mic in allowed]
+            if not mic_ok:
+                actual = sorted({str(fh.mic or "?") for fh in type_ok})
+                rejected.append(self._reject(r, f"FINNHUB_MIC_MISMATCH:{','.join(actual)}"))
+                continue
+
+            # De-duplicate identical provider identities before ambiguity check.
+            unique: dict[tuple, FinnhubIdentity] = {}
+            for fh in mic_ok:
+                key = (fh.symbol, fh.mic, fh.currency, fh.security_type, fh.composite_figi, fh.share_class_figi)
+                unique[key] = fh
+            possible = list(unique.values())
+
+            if len(possible) != 1:
+                rejected.append(self._reject(r, f"FINNHUB_AMBIGUOUS:{len(possible)}"))
+                continue
+
+            fh = possible[0]
+            yvars = bounded_symbol_variants(fh.symbol)
+            candidates[r.tv_id] = (r, fh, yvars)
+            all_yahoo_candidates.update(yvars)
+
+        try:
+            yahoo_quotes = self.yahoo.quotes(sorted(all_yahoo_candidates))
+            self.stats["yahoo_http_batches"] += (len(all_yahoo_candidates) + self.yahoo.batch_size - 1) // self.yahoo.batch_size
+        except ProviderError as exc:
+            rejected.extend(self._reject(r, f"YAHOO_UNAVAILABLE: {exc}") for r, _, _ in candidates.values())
+            return rejected
+
+        verified: list[Binding] = []
+        for r, fh, yvars in candidates.values():
+            returned = [yahoo_quotes[ys] for ys in yvars if ys in yahoo_quotes]
+            currency_ok = [q for q in returned if currency_compatible(r.currency, q.currency)]
+            type_ok = [q for q in currency_ok if yahoo_type_compatible(r, q.quote_type)]
+            admitted = [q for q in type_ok if yahoo_venue_compatible(fh.mic, q)]
+
+            if len(admitted) != 1:
+                if len(admitted) > 1:
+                    reason = f"YAHOO_AMBIGUOUS:{len(admitted)}"
+                elif not returned:
+                    reason = "YAHOO_SYMBOL_NOT_FOUND"
+                elif not currency_ok:
+                    actual = sorted({str(q.currency or "?") for q in returned})
+                    reason = f"YAHOO_CURRENCY_MISMATCH:{','.join(actual)}"
+                elif not type_ok:
+                    actual = sorted({str(q.quote_type or "?") for q in currency_ok})
+                    reason = f"YAHOO_TYPE_MISMATCH:{','.join(actual)}"
+                else:
+                    venues = sorted({f"{q.exchange or '?'}|{q.full_exchange_name or '?'}" for q in type_ok})
+                    reason = f"YAHOO_VENUE_MISMATCH:{fh.mic or '?'}->{';'.join(venues)}"
+                rejected.append(self._reject(r, reason))
+                continue
+            verified.append(self._verified(r, fh=fh, of=None, y=admitted[0], mic=fh.mic))
+
+        return verified + rejected
+
+    def _resolve_non_us(self, rows: list[TvRow]) -> list[Binding]:
+        """Resolve non-US listings with OpenFIGI as the identity authority.
+
+        Direct venues use exact MIC + local symbol.  Cross-venue bridges (for
+        example TradingView TRADEGATE -> Yahoo/Xetra) are admitted only when
+        OpenFIGI proves that the source and target listings have the same
+        shareClassFIGI.  The source venue is preserved separately from the Yahoo
+        target venue; we never rewrite Tradegate as Xetra.
+        """
+        rejected: list[Binding] = []
+        pending: list[dict] = []
+
+        direct_rows: list[TvRow] = []
+        direct_jobs: list[dict] = []
+        bridge_rows: list[TvRow] = []
+        exchcode_bridge_rows: list[TvRow] = []
+
+        for r in rows:
+            if not r.currency:
+                rejected.append(self._reject(r, "CURRENCY_UNKNOWN"))
+                continue
+            if r.prefix in CROSS_VENUE_BRIDGES:
+                bridge_rows.append(r)
+                continue
+            if r.prefix in EXCHCODE_SHARE_CLASS_BRIDGES:
+                exchcode_bridge_rows.append(r)
+                continue
+            mic = TV_PREFIX_TO_MIC.get(r.prefix)
+            if not mic:
+                rejected.append(self._reject(r, "MIC_UNKNOWN"))
+                continue
+            direct_rows.append(r)
+            direct_jobs.append({
+                "idType": "ID_EXCH_SYMBOL",
+                "idValue": r.symbol,
+                "micCode": mic,
+                "currency": openfigi_currency(r.currency),
+                "securityType2": openfigi_security_type(r),
+            })
+
+        # Direct same-venue mappings. First use the strict provider taxonomy.
+        # If that produces no match, retry only those rows without securityType2
+        # and post-filter the response by exact ticker + compatible equity kind.
+        # This handles provider taxonomy differences such as REIT without making
+        # the primary mapping fuzzy.
+        if direct_jobs:
+            try:
+                mapped = self.openfigi.map_jobs(direct_jobs)
+                self.stats["openfigi_jobs"] += len(direct_jobs)
+                self.stats["openfigi_http_batches"] += (len(direct_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError as exc:
+                rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in direct_rows)
+                mapped = [[] for _ in direct_rows]
+
+            retry_rows: list[TvRow] = []
+            retry_jobs: list[dict] = []
+            isin_fallback_rows: list[tuple[TvRow, str]] = []
+            isin_fallback_jobs: list[dict] = []
+            isin_unscoped_rows: list[tuple[TvRow, str]] = []
+            isin_unscoped_jobs: list[dict] = []
+
+            def add_direct_pending(
+                r: TvRow,
+                of: OpenFigiIdentity,
+                collapsed: bool,
+                type_fallback: bool = False,
+                method_override: str | None = None,
+                mic_override: str | None = None,
+            ) -> None:
+                mic = mic_override or TV_PREFIX_TO_MIC[r.prefix]
+                suffix = MIC_TO_YAHOO_SUFFIX.get(mic)
+                if suffix is None:
+                    rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{mic}"))
+                    return
+                yahoo_symbol = yahoo_listing_symbol(of.ticker or r.symbol, mic, r.prefix, tv_type_kind(r))
+                if method_override:
+                    method = method_override
+                elif collapsed and type_fallback:
+                    method = "SAME_VENUE_TYPE_FALLBACK_SHARE_CLASS_COLLAPSE"
+                elif collapsed:
+                    method = "SAME_VENUE_SHARE_CLASS_COLLAPSE"
+                elif type_fallback:
+                    method = "SAME_VENUE_TYPE_FALLBACK"
+                else:
+                    method = "SAME_VENUE"
+                pending.append({
+                    "row": r,
+                    "identity": of,
+                    "source_identity": of,
+                    "target_identity": of,
+                    "source_mic": mic,
+                    "source_venue_code": None,
+                    "target_mic": mic,
+                    "yahoo_symbol": yahoo_symbol,
+                    "mapping_method": method,
+                })
+                if collapsed:
+                    self.stats["openfigi_share_class_collapses"] += 1
+                if type_fallback:
+                    self.stats["openfigi_type_fallback_matches"] += 1
+
+            def add_target_provider_strict_fallback(r: TvRow) -> bool:
+                """Queue a lower-evidence same-venue Yahoo proof after OpenFIGI no-match.
+
+                This is intentionally limited to reviewed provider namespaces. No FIGI
+                is invented or copied from another venue. Final admission later requires
+                Yahoo to explicitly confirm exact symbol, currency, type and venue.
+                """
+                if r.prefix not in TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES:
+                    return False
+                mic = TV_PREFIX_TO_MIC.get(r.prefix)
+                if not mic or MIC_TO_YAHOO_SUFFIX.get(mic) is None:
+                    return False
+                pending.append({
+                    "row": r,
+                    "identity": None,
+                    "source_identity": None,
+                    "target_identity": None,
+                    "source_mic": mic,
+                    "source_venue_code": None,
+                    "target_mic": mic,
+                    "yahoo_symbol": yahoo_listing_symbol(r.symbol, mic, r.prefix, tv_type_kind(r)),
+                    "mapping_method": "TARGET_PROVIDER_STRICT_FALLBACK",
+                })
+                self.stats["target_provider_strict_fallback_jobs"] += 1
+                return True
+
+            for r, identities in zip(direct_rows, mapped):
+                of, collapsed, reason = _select_openfigi_identity(r, identities)
+                if of is not None:
+                    add_direct_pending(r, of, collapsed)
+                    continue
+                if reason and reason.startswith("OPENFIGI_AMBIGUOUS"):
+                    reviewed = REVIEWED_ISIN_FALLBACKS.get(r.tv_id)
+                    if reviewed:
+                        mic = str(reviewed["mic"])
+                        isin_fallback_rows.append((r, mic))
+                        isin_fallback_jobs.append({
+                            "idType": "ID_ISIN",
+                            "idValue": str(reviewed["isin"]),
+                            "micCode": mic,
+                        })
+                        continue
+                    rejected.append(self._reject(r, reason))
+                    continue
+                mic = TV_PREFIX_TO_MIC[r.prefix]
+                retry_rows.append(r)
+                retry_jobs.append({
+                    "idType": "ID_EXCH_SYMBOL",
+                    "idValue": r.symbol,
+                    "micCode": mic,
+                    "currency": openfigi_currency(r.currency),
+                })
+
+            if isin_fallback_jobs:
+                try:
+                    isin_mapped = self.openfigi.map_jobs(isin_fallback_jobs)
+                    self.stats["openfigi_jobs"] += len(isin_fallback_jobs)
+                    self.stats["openfigi_isin_fallback_jobs"] += len(isin_fallback_jobs)
+                    self.stats["openfigi_http_batches"] += (len(isin_fallback_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                except ProviderError as exc:
+                    rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r, _ in isin_fallback_rows)
+                    isin_mapped = [[] for _ in isin_fallback_rows]
+
+                for (r, reviewed_mic), identities in zip(isin_fallback_rows, isin_mapped):
+                    of, collapsed, reason = _select_openfigi_identity(r, identities)
+                    if of is None:
+                        suffix = reason or "OPENFIGI_NO_MATCH"
+                        if suffix == "OPENFIGI_NO_MATCH":
+                            reviewed = REVIEWED_ISIN_FALLBACKS[r.tv_id]
+                            isin_unscoped_rows.append((r, reviewed_mic))
+                            isin_unscoped_jobs.append({
+                                "idType": "ID_ISIN",
+                                "idValue": str(reviewed["isin"]),
+                            })
+                            continue
+                        rejected.append(self._reject(r, f"REVIEWED_ISIN_{suffix}"))
+                        continue
+                    add_direct_pending(
+                        r, of, collapsed,
+                        method_override="REVIEWED_ISIN_FALLBACK",
+                        mic_override=reviewed_mic,
+                    )
+                    self.stats["openfigi_isin_fallback_matches"] += 1
+
+                if isin_unscoped_jobs:
+                    try:
+                        unscoped_mapped = self.openfigi.map_jobs(isin_unscoped_jobs)
+                        self.stats["openfigi_jobs"] += len(isin_unscoped_jobs)
+                        self.stats["openfigi_isin_unscoped_fallback_jobs"] += len(isin_unscoped_jobs)
+                        self.stats["openfigi_http_batches"] += (len(isin_unscoped_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r, _ in isin_unscoped_rows)
+                        unscoped_mapped = [[] for _ in isin_unscoped_rows]
+
+                    for (r, reviewed_mic), identities in zip(isin_unscoped_rows, unscoped_mapped):
+                        of, collapsed, reason = _select_openfigi_identity(r, identities)
+                        if of is None:
+                            suffix = reason or "OPENFIGI_NO_MATCH"
+                            rejected.append(self._reject(r, f"REVIEWED_ISIN_UNSCOPED_{suffix}"))
+                            continue
+                        # ID_ISIN without a MIC proves the reviewed security but
+                        # may return a FIGI/composite for another venue (for BVS,
+                        # typically the older ASX listing). Preserve only the
+                        # security-level shareClassFIGI; never relabel that venue
+                        # FIGI as AIMX/XLON. The reviewed MIC is authoritative
+                        # listing evidence and Yahoo must pass strict metadata.
+                        security_of = OpenFigiIdentity(
+                            figi=None,
+                            composite_figi=None,
+                            share_class_figi=of.share_class_figi,
+                            ticker=of.ticker or r.symbol,
+                            name=of.name,
+                            security_type=of.security_type,
+                            security_type2=of.security_type2,
+                            exch_code=None,
+                        )
+                        add_direct_pending(
+                            r, security_of, collapsed,
+                            method_override="REVIEWED_ISIN_SECURITY_FALLBACK",
+                            mic_override=reviewed_mic,
+                        )
+                        self.stats["openfigi_isin_unscoped_fallback_matches"] += 1
+
+            if retry_jobs:
+                try:
+                    retry_mapped = self.openfigi.map_jobs(retry_jobs)
+                    self.stats["openfigi_jobs"] += len(retry_jobs)
+                    self.stats["openfigi_type_fallback_jobs"] += len(retry_jobs)
+                    self.stats["openfigi_http_batches"] += (len(retry_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                except ProviderError as exc:
+                    rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in retry_rows)
+                    retry_mapped = [[] for _ in retry_rows]
+
+                currency_retry_rows: list[TvRow] = []
+                currency_retry_jobs: list[dict] = []
+                secondary_mic_layout: list[tuple[TvRow, tuple[str, ...], int]] = []
+                secondary_mic_jobs: list[dict] = []
+                for r, identities in zip(retry_rows, retry_mapped):
+                    of, collapsed, reason = _select_openfigi_identity(r, identities)
+                    if of is not None:
+                        add_direct_pending(r, of, collapsed, type_fallback=True)
+                        continue
+                    if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH":
+                        secondary_mics = tuple(SECONDARY_MIC_FALLBACKS.get(r.prefix, ()))
+                        if secondary_mics:
+                            offset = len(secondary_mic_jobs)
+                            for secondary_mic in secondary_mics:
+                                secondary_mic_jobs.append({
+                                    "idType": "ID_EXCH_SYMBOL",
+                                    "idValue": r.symbol,
+                                    "micCode": secondary_mic,
+                                    "currency": openfigi_currency(r.currency),
+                                })
+                            secondary_mic_layout.append((r, secondary_mics, offset))
+                            continue
+                    # Some XLON instruments are traded in GBX/GBp but OpenFIGI
+                    # models the listing currency at the major-unit GBP level.
+                    # Retry only this reviewed unit mismatch, while preserving
+                    # exact ticker + MIC and keeping Yahoo price validation in
+                    # GBX/GBp. This is not a generic currency fallback.
+                    if r.prefix in {"LSE", "LSIN"} and (r.currency or "").upper() == "GBX":
+                        mic = TV_PREFIX_TO_MIC[r.prefix]
+                        currency_retry_rows.append(r)
+                        currency_retry_jobs.append({
+                            "idType": "ID_EXCH_SYMBOL",
+                            "idValue": r.symbol,
+                            "micCode": mic,
+                            "currency": "GBP",
+                        })
+                        continue
+                    if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH" and add_target_provider_strict_fallback(r):
+                        continue
+                    rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
+
+                if secondary_mic_jobs:
+                    secondary_provider_failed = False
+                    try:
+                        secondary_mapped = self.openfigi.map_jobs(secondary_mic_jobs)
+                        self.stats["openfigi_jobs"] += len(secondary_mic_jobs)
+                        self.stats["openfigi_secondary_mic_jobs"] += len(secondary_mic_jobs)
+                        self.stats["openfigi_secondary_mic_matches"] += 0
+                        self.stats["openfigi_http_batches"] += (len(secondary_mic_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r, _, _ in secondary_mic_layout)
+                        secondary_mapped = [[] for _ in secondary_mic_jobs]
+                        secondary_provider_failed = True
+
+                    secondary_no_currency_layout: list[tuple[TvRow, tuple[str, ...], int]] = []
+                    secondary_no_currency_jobs: list[dict] = []
+                    if not secondary_provider_failed:
+                        for r, secondary_mics, offset in secondary_mic_layout:
+                            matches: list[tuple[str, OpenFigiIdentity, bool]] = []
+                            for idx, secondary_mic in enumerate(secondary_mics):
+                                identities = secondary_mapped[offset + idx] if offset + idx < len(secondary_mapped) else []
+                                of, collapsed, _reason = _select_openfigi_identity(r, identities)
+                                if of is not None:
+                                    matches.append((secondary_mic, of, collapsed))
+                            if len(matches) == 1:
+                                secondary_mic, of, collapsed = matches[0]
+                                add_direct_pending(
+                                    r, of, collapsed, type_fallback=True,
+                                    method_override="LSIN_SECONDARY_MIC_TYPE_FALLBACK",
+                                    mic_override=secondary_mic,
+                                )
+                                self.stats["openfigi_secondary_mic_matches"] += 1
+                                continue
+                            if len(matches) > 1:
+                                rejected.append(self._reject(r, f"OPENFIGI_SECONDARY_MIC_AMBIGUOUS:{len(matches)}"))
+                                continue
+
+                            # OpenFIGI can omit/model currency differently for thin
+                            # IOB/Professional Securities Market depositary receipts.
+                            # Keep this relaxation ADR-only: ordinary LSIN stocks do
+                            # not gain a new currency-agnostic path. Drop only the
+                            # currency filter while preserving exact ticker + exact
+                            # reviewed secondary MIC.
+                            if tv_type_kind(r) != "ADR":
+                                if not add_target_provider_strict_fallback(r):
+                                    rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
+                                continue
+                            no_currency_offset = len(secondary_no_currency_jobs)
+                            for secondary_mic in secondary_mics:
+                                secondary_no_currency_jobs.append({
+                                    "idType": "ID_EXCH_SYMBOL",
+                                    "idValue": r.symbol,
+                                    "micCode": secondary_mic,
+                                })
+                            secondary_no_currency_layout.append((r, secondary_mics, no_currency_offset))
+
+                    if secondary_no_currency_jobs:
+                        try:
+                            secondary_no_currency_mapped = self.openfigi.map_jobs(secondary_no_currency_jobs)
+                            self.stats["openfigi_jobs"] += len(secondary_no_currency_jobs)
+                            self.stats["openfigi_secondary_mic_currency_omitted_jobs"] += len(secondary_no_currency_jobs)
+                            self.stats["openfigi_secondary_mic_currency_omitted_matches"] += 0
+                            self.stats["openfigi_http_batches"] += (len(secondary_no_currency_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                        except ProviderError as exc:
+                            rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r, _, _ in secondary_no_currency_layout)
+                            secondary_no_currency_mapped = [[] for _ in secondary_no_currency_jobs]
+                            secondary_no_currency_layout = []
+
+                        for r, secondary_mics, offset in secondary_no_currency_layout:
+                            matches: list[tuple[str, OpenFigiIdentity, bool]] = []
+                            for idx, secondary_mic in enumerate(secondary_mics):
+                                identities = secondary_no_currency_mapped[offset + idx] if offset + idx < len(secondary_no_currency_mapped) else []
+                                of, collapsed, _reason = _select_openfigi_identity(r, identities)
+                                if of is not None:
+                                    matches.append((secondary_mic, of, collapsed))
+                            if len(matches) == 1:
+                                secondary_mic, of, collapsed = matches[0]
+                                add_direct_pending(
+                                    r, of, collapsed, type_fallback=True,
+                                    method_override="LSIN_SECONDARY_MIC_CURRENCY_OMITTED_FALLBACK",
+                                    mic_override=secondary_mic,
+                                )
+                                self.stats["openfigi_secondary_mic_currency_omitted_matches"] += 1
+                                continue
+                            if len(matches) > 1:
+                                rejected.append(self._reject(r, f"OPENFIGI_SECONDARY_MIC_AMBIGUOUS:{len(matches)}"))
+                                continue
+                            if not add_target_provider_strict_fallback(r):
+                                rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
+
+                if currency_retry_jobs:
+                    try:
+                        currency_retry_mapped = self.openfigi.map_jobs(currency_retry_jobs)
+                        self.stats["openfigi_jobs"] += len(currency_retry_jobs)
+                        self.stats["openfigi_currency_fallback_jobs"] += len(currency_retry_jobs)
+                        self.stats["openfigi_http_batches"] += (len(currency_retry_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in currency_retry_rows)
+                        currency_retry_mapped = [[] for _ in currency_retry_rows]
+
+                    no_currency_rows: list[TvRow] = []
+                    no_currency_jobs: list[dict] = []
+                    for r, identities in zip(currency_retry_rows, currency_retry_mapped):
+                        of, collapsed, reason = _select_openfigi_identity(r, identities)
+                        if of is None:
+                            # Final reviewed London fallback: OpenFIGI can omit or
+                            # inconsistently model the quote currency for an otherwise
+                            # exact XLON local symbol. Drop only the currency filter;
+                            # ticker + MIC remain exact, and Yahoo must later confirm
+                            # the .L symbol and GBX/GBp quote unit.
+                            no_currency_rows.append(r)
+                            no_currency_jobs.append({
+                                "idType": "ID_EXCH_SYMBOL",
+                                "idValue": r.symbol,
+                                "micCode": TV_PREFIX_TO_MIC[r.prefix],
+                            })
+                            continue
+                        add_direct_pending(r, of, collapsed, type_fallback=True)
+                        self.stats["openfigi_currency_fallback_matches"] += 1
+
+                    if no_currency_jobs:
+                        try:
+                            no_currency_mapped = self.openfigi.map_jobs(no_currency_jobs)
+                            self.stats["openfigi_jobs"] += len(no_currency_jobs)
+                            self.stats["openfigi_currency_omitted_jobs"] += len(no_currency_jobs)
+                            self.stats["openfigi_http_batches"] += (len(no_currency_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                        except ProviderError as exc:
+                            rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in no_currency_rows)
+                            no_currency_mapped = [[] for _ in no_currency_rows]
+
+                        for r, identities in zip(no_currency_rows, no_currency_mapped):
+                            of, collapsed, reason = _select_openfigi_identity(r, identities)
+                            if of is None:
+                                # Last-resort *target-provider* proof for reviewed
+                                # London same-venue symbols. OpenFIGI has returned
+                                # no candidate even after exact ticker+XLON retries.
+                                # Do not invent FIGIs: ask Yahoo for the bounded .L
+                                # symbol and later require complete, explicit Yahoo
+                                # currency + type + venue agreement.
+                                if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH" and add_target_provider_strict_fallback(r):
+                                    continue
+                                rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
+                                continue
+                            add_direct_pending(r, of, collapsed, type_fallback=True)
+                            self.stats["openfigi_currency_omitted_matches"] += 1
+
+        # Cross-venue share-class bridges.  Jobs are still batched across all
+        # bridge rows so one screen does not become N HTTP requests.
+        bridge_jobs: list[dict] = []
+        bridge_layout: list[tuple[TvRow, tuple[str, ...], str, int, int]] = []
+        for r in bridge_rows:
+            cfg = CROSS_VENUE_BRIDGES[r.prefix]
+            source_mics = tuple(cfg["source_mics"])
+            target_mic = str(cfg["target_mic"])
+            offset = len(bridge_jobs)
+            for mic in (*source_mics, target_mic):
+                bridge_jobs.append({
+                    "idType": "ID_EXCH_SYMBOL",
+                    "idValue": r.symbol,
+                    "micCode": mic,
+                    "currency": openfigi_currency(r.currency),
+                    "securityType2": openfigi_security_type(r),
+                })
+            bridge_layout.append((r, source_mics, target_mic, offset, len(source_mics) + 1))
+
+        bridge_mapped: list[list[OpenFigiIdentity]] = []
+        if bridge_jobs:
+            try:
+                bridge_mapped = self.openfigi.map_jobs(bridge_jobs)
+                self.stats["openfigi_jobs"] += len(bridge_jobs)
+                self.stats["openfigi_cross_venue_jobs"] += len(bridge_jobs)
+                self.stats["openfigi_http_batches"] += (len(bridge_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError as exc:
+                rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in bridge_rows)
+                bridge_mapped = [[] for _ in bridge_jobs]
+
+        for r, source_mics, target_mic, offset, count in bridge_layout:
+            chunks = bridge_mapped[offset:offset + count]
+            if len(chunks) != count:
+                rejected.append(self._reject(r, "OPENFIGI_BRIDGE_RESPONSE_MISMATCH"))
+                continue
+
+            source_matches: list[tuple[str, OpenFigiIdentity]] = []
+            for mic, identities in zip(source_mics, chunks[:-1]):
+                for x in identities:
+                    if punctuation_key(x.ticker or "") == punctuation_key(r.symbol) and openfigi_type_compatible(r, x):
+                        source_matches.append((mic, x))
+
+            target_matches = [
+                x for x in chunks[-1]
+                if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                and openfigi_type_compatible(r, x)
+            ]
+
+            if not source_matches:
+                rejected.append(self._reject(r, "OPENFIGI_SOURCE_NO_MATCH"))
+                continue
+            if not target_matches:
+                rejected.append(self._reject(r, "OPENFIGI_TARGET_NO_MATCH"))
+                continue
+
+            source_share_classes = {x.share_class_figi for _, x in source_matches if x.share_class_figi}
+            target_by_share = {x.share_class_figi: x for x in target_matches if x.share_class_figi}
+            overlap = source_share_classes & set(target_by_share)
+            if len(overlap) != 1:
+                reason = "OPENFIGI_SHARE_CLASS_NO_MATCH" if not overlap else f"OPENFIGI_SHARE_CLASS_AMBIGUOUS:{len(overlap)}"
+                rejected.append(self._reject(r, reason))
+                continue
+
+            share_class = next(iter(overlap))
+            source_for_share = [(mic, x) for mic, x in source_matches if x.share_class_figi == share_class]
+            target_for_share = [x for x in target_matches if x.share_class_figi == share_class]
+            if len(source_for_share) != 1:
+                rejected.append(self._reject(r, f"OPENFIGI_SOURCE_VENUE_AMBIGUOUS:{len(source_for_share)}"))
+                continue
+            if len(target_for_share) != 1:
+                rejected.append(self._reject(r, f"OPENFIGI_TARGET_AMBIGUOUS:{len(target_for_share)}"))
+                continue
+
+            source_mic, source_of = source_for_share[0]
+            target_of = target_for_share[0]
+            suffix = MIC_TO_YAHOO_SUFFIX.get(target_mic)
+            if suffix is None:
+                rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{target_mic}"))
+                continue
+            yahoo_symbol = yahoo_listing_symbol(target_of.ticker or r.symbol, target_mic, r.prefix, tv_type_kind(r))
+            pending.append({
+                "row": r,
+                "identity": source_of,
+                "source_identity": source_of,
+                "target_identity": target_of,
+                "source_mic": source_mic,
+                "source_venue_code": None,
+                "target_mic": target_mic,
+                "yahoo_symbol": yahoo_symbol,
+                "mapping_method": "SHARE_CLASS_BRIDGE",
+            })
+            self.stats["cross_venue_share_class_matches"] += 1
+
+        # OpenFIGI exchange-code -> MIC share-class bridges.  LSIN is TradingView's
+        # London International namespace.  OpenFIGI models that source as exchCode
+        # LI rather than a distinct ISO MIC, so require the source LI identity and
+        # the XLON target listing to share exactly one shareClassFIGI.
+        exch_jobs: list[dict] = []
+        exch_layout: list[tuple[TvRow, str, str, int]] = []
+        for r in exchcode_bridge_rows:
+            cfg = EXCHCODE_SHARE_CLASS_BRIDGES[r.prefix]
+            source_code = str(cfg["source_exch_code"])
+            target_mic = str(cfg["target_mic"])
+            offset = len(exch_jobs)
+            exch_jobs.extend([
+                {
+                    "idType": "ID_EXCH_SYMBOL",
+                    "idValue": r.symbol,
+                    "exchCode": source_code,
+                    "currency": openfigi_currency(r.currency),
+                    "securityType2": openfigi_security_type(r),
+                },
+                {
+                    "idType": "ID_EXCH_SYMBOL",
+                    "idValue": r.symbol,
+                    "micCode": target_mic,
+                    "currency": openfigi_currency(r.currency),
+                    "securityType2": openfigi_security_type(r),
+                },
+            ])
+            exch_layout.append((r, source_code, target_mic, offset))
+
+        exch_mapped: list[list[OpenFigiIdentity]] = []
+        if exch_jobs:
+            try:
+                exch_mapped = self.openfigi.map_jobs(exch_jobs)
+                self.stats["openfigi_jobs"] += len(exch_jobs)
+                self.stats["openfigi_exchcode_bridge_jobs"] += len(exch_jobs)
+                self.stats["openfigi_http_batches"] += (len(exch_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+            except ProviderError as exc:
+                rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in exchcode_bridge_rows)
+                exch_mapped = [[] for _ in exch_jobs]
+
+        for r, source_code, target_mic, offset in exch_layout:
+            if offset + 1 >= len(exch_mapped):
+                rejected.append(self._reject(r, "OPENFIGI_EXCHCODE_BRIDGE_RESPONSE_MISMATCH"))
+                continue
+            source_matches = [
+                x for x in exch_mapped[offset]
+                if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                and openfigi_type_compatible(r, x)
+            ]
+            target_matches = [
+                x for x in exch_mapped[offset + 1]
+                if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                and openfigi_type_compatible(r, x)
+            ]
+            if not source_matches:
+                rejected.append(self._reject(r, "OPENFIGI_SOURCE_NO_MATCH"))
+                continue
+            if not target_matches:
+                rejected.append(self._reject(r, "OPENFIGI_TARGET_NO_MATCH"))
+                continue
+
+            source_by_share: dict[str, list[OpenFigiIdentity]] = defaultdict(list)
+            target_by_share: dict[str, list[OpenFigiIdentity]] = defaultdict(list)
+            for x in source_matches:
+                if x.share_class_figi:
+                    source_by_share[x.share_class_figi].append(x)
+            for x in target_matches:
+                if x.share_class_figi:
+                    target_by_share[x.share_class_figi].append(x)
+            overlap = set(source_by_share) & set(target_by_share)
+            if len(overlap) != 1:
+                reason = "OPENFIGI_SHARE_CLASS_NO_MATCH" if not overlap else f"OPENFIGI_SHARE_CLASS_AMBIGUOUS:{len(overlap)}"
+                rejected.append(self._reject(r, reason))
+                continue
+            share_class = next(iter(overlap))
+            if len(source_by_share[share_class]) != 1:
+                rejected.append(self._reject(r, f"OPENFIGI_SOURCE_AMBIGUOUS:{len(source_by_share[share_class])}"))
+                continue
+            if len(target_by_share[share_class]) != 1:
+                rejected.append(self._reject(r, f"OPENFIGI_TARGET_AMBIGUOUS:{len(target_by_share[share_class])}"))
+                continue
+            source_of = source_by_share[share_class][0]
+            target_of = target_by_share[share_class][0]
+            suffix = MIC_TO_YAHOO_SUFFIX.get(target_mic)
+            if suffix is None:
+                rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{target_mic}"))
+                continue
+            yahoo_symbol = yahoo_listing_symbol(target_of.ticker or r.symbol, target_mic, r.prefix, tv_type_kind(r))
+            pending.append({
+                "row": r,
+                "identity": source_of,
+                "source_identity": source_of,
+                "target_identity": target_of,
+                "source_mic": None,
+                "source_venue_code": source_code,
+                "target_mic": target_mic,
+                "yahoo_symbol": yahoo_symbol,
+                "mapping_method": "EXCHCODE_SHARE_CLASS_BRIDGE",
+            })
+            self.stats["exchcode_share_class_matches"] += 1
+
+        ysymbols = sorted({x["yahoo_symbol"] for x in pending})
+        try:
+            yahoo_quotes = self.yahoo.quotes(ysymbols)
+            self.stats["yahoo_http_batches"] += (len(ysymbols) + self.yahoo.batch_size - 1) // self.yahoo.batch_size
+        except ProviderError as exc:
+            rejected.extend(self._reject(x["row"], f"YAHOO_UNAVAILABLE: {exc}") for x in pending)
+            return rejected
+
+        chart_needed: set[str] = set()
+        for item in pending:
+            r = item["row"]
+            ys = item["yahoo_symbol"]
+            q0 = yahoo_quotes.get(ys)
+            if not _non_us_quote_compatible(
+                r, item["target_mic"], ys, q0,
+                _strict_yahoo_mapping(item["mapping_method"]),
+            ):
+                chart_needed.add(ys)
+        chart_quotes: dict[str, YahooQuote] = {}
+        if chart_needed and hasattr(self.yahoo, "chart_quotes"):
+            chart_quotes = self.yahoo.chart_quotes(sorted(chart_needed))
+            self.stats["yahoo_chart_fallback_jobs"] += len(chart_needed)
+            self.stats["yahoo_chart_fallback_rows"] += len(chart_quotes)
+
+        # Bounded Yahoo alternatives. LSIN may use .IL or .L, but an ADR may
+        # try .L only when OpenFIGI already supplied independent identity/venue
+        # evidence; Yahoo-only fallback cannot distinguish XLON from XLOM. A
+        # small reviewed registry also covers fresh exchange ticker transitions
+        # where Yahoo can lag the official TIDM change.
+        alternate_by_tv_id: dict[str, str] = {}
+        alternate_kind_by_tv_id: dict[str, str] = {}
+        alternate_needed: set[str] = set()
+        for item in pending:
+            r = item["row"]
+            ys = item["yahoo_symbol"]
+            target_only = _strict_yahoo_mapping(item["mapping_method"])
+            q0 = yahoo_quotes.get(ys)
+            cq0 = chart_quotes.get(ys)
+            primary_ok = _non_us_quote_compatible(r, item["target_mic"], ys, q0, target_only) \
+                or _non_us_quote_compatible(r, item["target_mic"], ys, cq0, target_only)
+            if primary_ok:
+                continue
+
+            reviewed_alias = REVIEWED_YAHOO_SYMBOL_ALIASES.get(r.tv_id)
+            if reviewed_alias and item.get("identity") is not None and not target_only:
+                alt = str(reviewed_alias["symbol"])
+                if alt and alt != ys:
+                    alternate_by_tv_id[r.tv_id] = alt
+                    alternate_kind_by_tv_id[r.tv_id] = "REVIEWED_YAHOO_SYMBOL_ALIAS"
+                    alternate_needed.add(alt)
+                    continue
+
+            alt = yahoo_listing_alternative_symbol(r.symbol, item["target_mic"], r.prefix, tv_type_kind(r))
+            if alt and alt != ys:
+                if tv_type_kind(r) == "ADR" and target_only:
+                    continue
+                alternate_by_tv_id[r.tv_id] = alt
+                alternate_kind_by_tv_id[r.tv_id] = "LSIN_ALT"
+                alternate_needed.add(alt)
+
+        alternate_quotes: dict[str, YahooQuote] = {}
+        alternate_chart_quotes: dict[str, YahooQuote] = {}
+        if alternate_needed:
+            alias_symbols = {
+                alt for tv_id, alt in alternate_by_tv_id.items()
+                if alternate_kind_by_tv_id.get(tv_id) == "REVIEWED_YAHOO_SYMBOL_ALIAS"
+            }
+            lsin_alt_symbols = {
+                alt for tv_id, alt in alternate_by_tv_id.items()
+                if alternate_kind_by_tv_id.get(tv_id) == "LSIN_ALT"
+            }
+            self.stats["reviewed_yahoo_symbol_alias_jobs"] += len(alias_symbols)
+            self.stats["yahoo_lsin_alt_fallback_jobs"] += len(lsin_alt_symbols)
+            self.stats["yahoo_lsin_dr_alt_fallback_jobs"] += sum(
+                1 for item in pending
+                if alternate_kind_by_tv_id.get(item["row"].tv_id) == "LSIN_ALT"
+                and tv_type_kind(item["row"]) == "ADR"
+            )
+            self.stats["yahoo_lsin_dr_mutualfund_taxonomy_matches"] += 0
+            try:
+                alternate_quotes = self.yahoo.quotes(sorted(alternate_needed))
+                self.stats["reviewed_yahoo_symbol_alias_rows"] += sum(
+                    1 for symbol in alias_symbols if symbol in alternate_quotes
+                )
+                self.stats["yahoo_lsin_alt_fallback_rows"] += sum(
+                    1 for symbol in lsin_alt_symbols if symbol in alternate_quotes
+                )
+                self.stats["yahoo_lsin_dr_mutualfund_taxonomy_candidates"] += sum(
+                    1 for item in pending
+                    if alternate_kind_by_tv_id.get(item["row"].tv_id) == "LSIN_ALT"
+                    and tv_type_kind(item["row"]) == "ADR"
+                    and (alternate_quotes.get(alternate_by_tv_id.get(item["row"].tv_id, "")) is not None)
+                    and ((alternate_quotes[alternate_by_tv_id[item["row"].tv_id]].quote_type or "").upper() == "MUTUALFUND")
+                )
+                self.stats["yahoo_http_batches"] += (len(alternate_needed) + self.yahoo.batch_size - 1) // self.yahoo.batch_size
+            except ProviderError:
+                alternate_quotes = {}
+            alt_chart_needed: set[str] = set()
+            for item in pending:
+                r = item["row"]
+                alt = alternate_by_tv_id.get(r.tv_id)
+                if not alt:
+                    continue
+                target_only = _strict_yahoo_mapping(item["mapping_method"])
+                if not _non_us_quote_compatible(r, item["target_mic"], alt, alternate_quotes.get(alt), target_only):
+                    alt_chart_needed.add(alt)
+            if alt_chart_needed and hasattr(self.yahoo, "chart_quotes"):
+                alternate_chart_quotes = self.yahoo.chart_quotes(sorted(alt_chart_needed))
+                self.stats["yahoo_chart_fallback_jobs"] += len(alt_chart_needed)
+                self.stats["yahoo_chart_fallback_rows"] += len(alternate_chart_quotes)
+
+        verified: list[Binding] = []
+        reviewed_mutualfund_candidate_ids: set[str] = set()
+        reviewed_mutualfund_match_ids: set[str] = set()
+        reviewed_mutualfund_block_by_id: dict[str, str] = {}
+        reviewed_mutualfund_venue_observation_by_id: dict[str, tuple[str | None, str | None, str | None]] = {}
+        for item in pending:
+            r = item["row"]
+            ys = item["yahoo_symbol"]
+            q = yahoo_quotes.get(ys)
+            target_only = _strict_yahoo_mapping(item["mapping_method"])
+            cq = chart_quotes.get(ys)
+            if not _non_us_quote_compatible(r, item["target_mic"], ys, q, target_only) \
+                    and _non_us_quote_compatible(r, item["target_mic"], ys, cq, target_only):
+                q = cq
+                self.stats["yahoo_chart_fallback_matches"] += 1
+
+            primary_regular_ok = _non_us_quote_compatible(
+                r, item["target_mic"], ys, q, target_only
+            )
+            primary_reviewed_taxonomy_ok = _reviewed_yahoo_mutualfund_taxonomy_anomaly_compatible(
+                r, item["target_mic"], ys, q, item.get("identity"), item.get("mapping_method")
+            )
+            if (q is not None and (q.quote_type or "").upper() == "MUTUALFUND"
+                    and r.tv_id in REVIEWED_YAHOO_MUTUALFUND_TAXONOMY):
+                reviewed_mutualfund_candidate_ids.add(r.tv_id)
+                reviewed_mutualfund_venue_observation_by_id[r.tv_id] = (
+                    q.exchange, q.full_exchange_name, q.market
+                )
+                block = _reviewed_yahoo_mutualfund_taxonomy_block_reason(
+                    r, item["target_mic"], ys, q, item.get("identity"), item.get("mapping_method")
+                )
+                if block is not None:
+                    reviewed_mutualfund_block_by_id[r.tv_id] = block
+            if primary_reviewed_taxonomy_ok:
+                item["yahoo_type_anomaly"] = "REVIEWED_MUTUALFUND"
+                reviewed_mutualfund_match_ids.add(r.tv_id)
+                if q is not None and q.currency is None:
+                    self.stats["reviewed_yahoo_mutualfund_currency_unreported_matches"] += 1
+                if _reviewed_yahoo_synthetic_yhd_venue(q):
+                    item["yahoo_venue_anomaly"] = "REVIEWED_MUTUALFUND_YHD"
+                    self.stats["reviewed_yahoo_mutualfund_yhd_venue_matches"] += 1
+
+            # If the reviewed LSIN primary (.IL) is not compatible, try exactly
+            # one pre-defined .L alternative. The same metadata contract applies.
+            if not (primary_regular_ok or primary_reviewed_taxonomy_ok):
+                alt = alternate_by_tv_id.get(r.tv_id)
+                if alt:
+                    aq = alternate_quotes.get(alt)
+                    acq = alternate_chart_quotes.get(alt)
+                    aq_regular_ok = _non_us_quote_compatible(
+                        r, item["target_mic"], alt, aq, target_only
+                    )
+                    aq_lsin_dr_taxonomy_ok = _lsin_dr_mutualfund_taxonomy_anomaly_compatible(
+                        r, item["target_mic"], alt, aq, item.get("identity"), item.get("mapping_method")
+                    )
+                    aq_reviewed_taxonomy_ok = _reviewed_yahoo_mutualfund_taxonomy_anomaly_compatible(
+                        r, item["target_mic"], alt, aq, item.get("identity"), item.get("mapping_method")
+                    )
+                    if (aq is not None and (aq.quote_type or "").upper() == "MUTUALFUND"
+                            and r.tv_id in REVIEWED_YAHOO_MUTUALFUND_TAXONOMY):
+                        reviewed_mutualfund_candidate_ids.add(r.tv_id)
+                        reviewed_mutualfund_venue_observation_by_id[r.tv_id] = (
+                            aq.exchange, aq.full_exchange_name, aq.market
+                        )
+                        block = _reviewed_yahoo_mutualfund_taxonomy_block_reason(
+                            r, item["target_mic"], alt, aq, item.get("identity"), item.get("mapping_method")
+                        )
+                        if block is not None:
+                            # For LSIN rows the alternate is the final reviewed
+                            # candidate, so let it replace any primary-path reason.
+                            reviewed_mutualfund_block_by_id[r.tv_id] = block
+                    if not (aq_regular_ok or aq_lsin_dr_taxonomy_ok or aq_reviewed_taxonomy_ok) \
+                            and _non_us_quote_compatible(r, item["target_mic"], alt, acq, target_only):
+                        aq = acq
+                        aq_regular_ok = True
+                        aq_lsin_dr_taxonomy_ok = False
+                        aq_reviewed_taxonomy_ok = False
+                        self.stats["yahoo_chart_fallback_matches"] += 1
+                    if aq_regular_ok or aq_lsin_dr_taxonomy_ok or aq_reviewed_taxonomy_ok:
+                        alt_kind = alternate_kind_by_tv_id.get(r.tv_id)
+                        if alt_kind == "REVIEWED_YAHOO_SYMBOL_ALIAS":
+                            rule = REVIEWED_YAHOO_SYMBOL_ALIASES.get(r.tv_id) or {}
+                            tokens = tuple(str(x).upper() for x in rule.get("name_tokens", ()))
+                            yahoo_name = " ".join(x for x in (aq.short_name, aq.long_name) if x).upper()
+                            if tokens and not any(token in yahoo_name for token in tokens):
+                                aq = None
+                        if aq is not None:
+                            ys = alt
+                            q = aq
+                            item["yahoo_symbol"] = alt
+                            if alt_kind == "REVIEWED_YAHOO_SYMBOL_ALIAS":
+                                item["mapping_method"] = "REVIEWED_YAHOO_TRANSITION_ALIAS"
+                                self.stats["reviewed_yahoo_symbol_alias_matches"] += 1
+                            else:
+                                self.stats["yahoo_lsin_alt_fallback_matches"] += 1
+                                if tv_type_kind(r) == "ADR":
+                                    self.stats["yahoo_lsin_dr_alt_fallback_matches"] += 1
+                                    if aq_lsin_dr_taxonomy_ok:
+                                        item["yahoo_type_anomaly"] = "LSIN_DR_MUTUALFUND"
+                                        self.stats["yahoo_lsin_dr_mutualfund_taxonomy_matches"] += 1
+                                    elif aq_reviewed_taxonomy_ok:
+                                        item["yahoo_type_anomaly"] = "REVIEWED_MUTUALFUND"
+                                        reviewed_mutualfund_match_ids.add(r.tv_id)
+                                        if aq.currency is None:
+                                            self.stats["reviewed_yahoo_mutualfund_currency_unreported_matches"] += 1
+                                        if _reviewed_yahoo_synthetic_yhd_venue(aq):
+                                            item["yahoo_venue_anomaly"] = "REVIEWED_MUTUALFUND_YHD"
+                                            self.stats["reviewed_yahoo_mutualfund_yhd_venue_matches"] += 1
+            if q is None:
+                # A Yahoo chart row can exist for the exact requested symbol yet
+                # fail the same compatibility contract. Preserve that explicit
+                # contradiction instead of flattening it into YAHOO_NO_MATCH.
+                # This is diagnostics only: it does not broaden admission.
+                diagnostic_reason = _non_us_quote_rejection_reason(
+                    r, item["target_mic"], ys, cq, target_only, source="CHART"
+                )
+                if diagnostic_reason is None:
+                    alt = alternate_by_tv_id.get(r.tv_id)
+                    if alt:
+                        diagnostic_reason = _non_us_quote_rejection_reason(
+                            r, item["target_mic"], alt, alternate_quotes.get(alt),
+                            target_only, source="ALT"
+                        )
+                        if diagnostic_reason is None:
+                            diagnostic_reason = _non_us_quote_rejection_reason(
+                                r, item["target_mic"], alt, alternate_chart_quotes.get(alt),
+                                target_only, source="ALT_CHART"
+                            )
+                if diagnostic_reason is not None:
+                    self.stats["yahoo_incompatible_evidence_rows"] += 1
+                    if "CURRENCY_" in diagnostic_reason:
+                        self.stats["yahoo_incompatible_currency_rows"] += 1
+                    elif "TYPE_" in diagnostic_reason:
+                        self.stats["yahoo_incompatible_type_rows"] += 1
+                    elif "VENUE_" in diagnostic_reason or "MARKET_" in diagnostic_reason:
+                        self.stats["yahoo_incompatible_venue_rows"] += 1
+                    elif "SYMBOL_" in diagnostic_reason:
+                        self.stats["yahoo_incompatible_symbol_rows"] += 1
+                    rejected.append(self._reject(r, diagnostic_reason))
+                else:
+                    rejected.append(self._reject(r, "YAHOO_NO_MATCH"))
+                continue
+            # Normal non-US mappings already have independent OpenFIGI proof, so
+            # missing Yahoo metadata is absence of corroboration, not conflict.
+            # TARGET_PROVIDER_STRICT_FALLBACK is deliberately different: because
+            # OpenFIGI supplied no identity at all, Yahoo must report every key
+            # field explicitly and compatibly.
+            yahoo_currency_unreported = q.currency is None
+            if target_only and q.currency is None:
+                rejected.append(self._reject(r, "YAHOO_CURRENCY_UNREPORTED_TARGET_ONLY"))
+                continue
+            if q.currency is not None and not currency_compatible(r.currency, q.currency):
+                rejected.append(self._reject(r, f"YAHOO_CURRENCY_MISMATCH:{q.currency}"))
+                continue
+
+            yahoo_type_unreported = q.quote_type is None
+            if target_only and q.quote_type is None:
+                rejected.append(self._reject(r, "YAHOO_TYPE_UNREPORTED_TARGET_ONLY"))
+                continue
+            if q.quote_type is not None and not yahoo_type_compatible(r, q.quote_type):
+                if item.get("yahoo_type_anomaly") not in {"LSIN_DR_MUTUALFUND", "REVIEWED_MUTUALFUND"}:
+                    rejected.append(self._reject(r, f"YAHOO_TYPE_MISMATCH:{q.quote_type}"))
+                    continue
+
+            target_mic = item["target_mic"]
+            yahoo_venue_unreported = q.exchange is None and q.full_exchange_name is None
+            if target_only:
+                venue_ok = (not yahoo_venue_unreported) and yahoo_venue_compatible(target_mic, q)
+            else:
+                venue_ok = yahoo_venue_compatible(target_mic, q)
+                if yahoo_venue_unreported:
+                    # Yahoo returned a result row for the exact requested symbol.
+                    # Identity does not require a live price; price availability is
+                    # tracked separately in quote_status. If market is present it
+                    # must still agree with the independently proven target MIC.
+                    venue_ok = (
+                        q.symbol == ys
+                        and (q.market is None or yahoo_market_compatible(target_mic, q.market))
+                    )
+            if (not venue_ok
+                    and item.get("yahoo_venue_anomaly") == "REVIEWED_MUTUALFUND_YHD"
+                    and _reviewed_yahoo_synthetic_yhd_venue(q)):
+                venue_ok = True
+            if not venue_ok:
+                rejected.append(self._reject(r, f"YAHOO_VENUE_MISMATCH:{target_mic}->{q.exchange}/{q.full_exchange_name}/{q.market}"))
+                continue
+            binding = self._verified(
+                r,
+                fh=None,
+                of=item["identity"],
+                y=q,
+                mic=target_mic,
+                source_mic=item["source_mic"],
+                target_mic=target_mic,
+                source_venue_code=item.get("source_venue_code"),
+                mapping_method=item["mapping_method"],
+                source_of=item["source_identity"],
+                target_of=item["target_identity"],
+            )
+            if item["mapping_method"] == "TARGET_PROVIDER_STRICT_FALLBACK":
+                self.stats["target_provider_strict_fallback_matches"] += 1
+            elif item["mapping_method"] == "REVIEWED_ISIN_SECURITY_FALLBACK":
+                self.stats["reviewed_isin_security_fallback_matches"] += 1
+            missing_meta = sum((yahoo_currency_unreported, yahoo_type_unreported, yahoo_venue_unreported))
+            if q.price is None:
+                binding.quote_status = "UNAVAILABLE"
+            elif missing_meta >= 2:
+                binding.quote_status = "FRESH_METADATA_UNREPORTED"
+            elif yahoo_currency_unreported:
+                binding.quote_status = "FRESH_CURRENCY_UNREPORTED"
+            elif yahoo_type_unreported:
+                binding.quote_status = "FRESH_TYPE_UNREPORTED"
+            elif yahoo_venue_unreported:
+                binding.quote_status = "FRESH_VENUE_UNREPORTED"
+            verified.append(binding)
+        self.stats["reviewed_yahoo_mutualfund_taxonomy_candidates"] += len(reviewed_mutualfund_candidate_ids)
+        self.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] += len(reviewed_mutualfund_match_ids)
+        for tv_id in sorted(reviewed_mutualfund_candidate_ids - reviewed_mutualfund_match_ids):
+            reason = reviewed_mutualfund_block_by_id.get(tv_id, "UNKNOWN")
+            self.stats[f"reviewed_yahoo_mutualfund_block_{reason.lower()}"] += 1
+            safe_id = tv_id.replace(":", "_").replace("/", "_")
+            self.stats[f"reviewed_yahoo_mutualfund_block_{safe_id}_{reason.lower()}"] += 1
+            observed = reviewed_mutualfund_venue_observation_by_id.get(tv_id)
+            if observed is not None:
+                exchange, full_name, market = observed
+                for field, value in (
+                    ("exchange", exchange),
+                    ("full_exchange", full_name),
+                    ("market", market),
+                ):
+                    token = _telemetry_token(value)
+                    self.stats[f"reviewed_yahoo_mutualfund_venue_{safe_id}_{field}_{token}"] += 1
+        return verified + rejected
+
+
+    def refresh_cached_quotes(self, bindings: dict[str, Binding]) -> None:
+        """Refresh current Yahoo quote data for cached VERIFIED bindings only.
+
+        Identity stays persistent; price is runtime data and is never trusted from
+        an old cache entry. A metadata contradiction invalidates the binding.
+        Provider unavailability leaves identity VERIFIED but quote_status=UNAVAILABLE.
+        """
+        targets = sorted({
+            b.yahoo_symbol for b in bindings.values()
+            if b.status == "VERIFIED" and b.cache_hit and b.yahoo_symbol
+        })
+        if not targets:
+            return
+        try:
+            quotes = self.yahoo.quotes(targets)
+            self.stats["yahoo_quote_refresh_batches"] += (len(targets) + self.yahoo.batch_size - 1) // self.yahoo.batch_size
+        except ProviderError:
+            for b in bindings.values():
+                if b.status == "VERIFIED" and b.cache_hit:
+                    b.quote_status = "UNAVAILABLE"
+                    b.yahoo_price = None
+            return
+
+        rows_by_id = {b.tv_id: b for b in bindings.values()}
+        chart_needed: set[str] = set()
+        for b in rows_by_id.values():
+            if b.status != "VERIFIED" or not b.cache_hit or not b.yahoo_symbol or b.finnhub_symbol is not None:
+                continue
+            if not _cached_non_us_quote_compatible(b, quotes.get(b.yahoo_symbol)):
+                chart_needed.add(b.yahoo_symbol)
+        chart_quotes: dict[str, YahooQuote] = {}
+        if chart_needed and hasattr(self.yahoo, "chart_quotes"):
+            chart_quotes = self.yahoo.chart_quotes(sorted(chart_needed))
+            self.stats["yahoo_chart_refresh_jobs"] += len(chart_needed)
+            self.stats["yahoo_chart_refresh_rows"] += len(chart_quotes)
+
+        invalidated: list[Binding] = []
+        for b in rows_by_id.values():
+            if b.status != "VERIFIED" or not b.cache_hit or not b.yahoo_symbol:
+                continue
+            q = quotes.get(b.yahoo_symbol)
+            if b.finnhub_symbol is None:
+                cq = chart_quotes.get(b.yahoo_symbol)
+                if not _cached_non_us_quote_compatible(b, q) and _cached_non_us_quote_compatible(b, cq):
+                    q = cq
+                    self.stats["yahoo_chart_refresh_matches"] += 1
+            if q is None:
+                b.quote_status = "UNAVAILABLE"
+                b.yahoo_price = None
+                continue
+            # Cached identity has no TvRow object, so validate against the exact
+            # cached currency/type/MIC contract rather than re-running discovery.
+            quote_type = (q.quote_type or "").upper()
+            if q.quote_type is None and b.finnhub_symbol is None:
+                type_ok = True
+            elif (
+                b.finnhub_symbol is None
+                and b.yahoo_quote_type
+                and quote_type == (b.yahoo_quote_type or "").upper()
+            ):
+                # Preserve the exact Yahoo type admitted during full non-US
+                # discovery.  This includes the bounded LSIN DR/MUTUALFUND
+                # taxonomy anomaly, whose stronger OpenFIGI proof was checked
+                # before the binding entered the cache.
+                type_ok = True
+            else:
+                type_ok = ((b.tv_type or "").lower() == "fund" and quote_type in {"ETF", "MUTUALFUND"}) or \
+                          ((b.tv_type or "").lower() != "fund" and quote_type == "EQUITY")
+            yahoo_venue_unreported = q.exchange is None and q.full_exchange_name is None
+            target_only = _strict_yahoo_mapping(b.mapping_method)
+            venue_ok = yahoo_venue_compatible(b.resolved_mic, q)
+            if target_only:
+                type_ok = q.quote_type is not None and type_ok
+                currency_ok_pre = q.currency is not None and currency_compatible(b.tv_currency, q.currency)
+                venue_ok = (not yahoo_venue_unreported) and venue_ok
+            else:
+                currency_ok_pre = None
+            if (not venue_ok and b.finnhub_symbol is None and not target_only
+                    and _cached_reviewed_yahoo_mutualfund_yhd_compatible(b, q)):
+                venue_ok = True
+            if yahoo_venue_unreported and b.finnhub_symbol is None and not target_only:
+                # Mirror cold-path admission for cached non-US identities:
+                # OpenFIGI already proved the listing. Yahoo may omit all venue
+                # metadata, but must still return the exact cached symbol and a
+                # quote value; if market is present it must be compatible.
+                venue_ok = (
+                    q.symbol == b.yahoo_symbol
+                    and (q.market is None or yahoo_market_compatible(b.resolved_mic, q.market))
+                )
+            # A cached non-US binding may have been admitted when Yahoo did
+            # not publish currency, because OpenFIGI had already proven the
+            # currency-constrained listing. US/Finnhub bindings still require
+            # Yahoo currency to be present and equal.
+            currency_ok = (
+                currency_ok_pre
+                if target_only
+                else (currency_compatible(b.tv_currency, q.currency)
+                      if q.currency is not None
+                      else b.finnhub_symbol is None)
+            )
+            if not (type_ok and venue_ok and currency_ok):
+                b.status = "REJECTED"
+                b.rejection_reason = f"YAHOO_RUNTIME_MISMATCH:{q.exchange}/{q.currency}/{q.quote_type}"
+                b.quote_status = "MISMATCH"
+                b.yahoo_price = None
+                now = int(time.time())
+                b.validated_at = now
+                b.expires_at = now + self.rejected_ttl
+                b.cache_hit = False
+                invalidated.append(b)
+                continue
+            b.yahoo_exchange = q.exchange
+            b.yahoo_market = q.market
+            b.yahoo_quote_type = q.quote_type
+            b.yahoo_currency = q.currency
+            b.yahoo_price = q.price
+            b.yahoo_delayed_by = q.delayed_by
+            missing_meta = sum((q.currency is None, q.quote_type is None, yahoo_venue_unreported))
+            if q.price is None:
+                b.quote_status = "UNAVAILABLE"
+            elif missing_meta >= 2:
+                b.quote_status = "FRESH_METADATA_UNREPORTED"
+            elif q.currency is None:
+                b.quote_status = "FRESH_CURRENCY_UNREPORTED"
+            elif q.quote_type is None:
+                b.quote_status = "FRESH_TYPE_UNREPORTED"
+            elif yahoo_venue_unreported:
+                b.quote_status = "FRESH_VENUE_UNREPORTED"
+            else:
+                b.quote_status = "FRESH"
+        if invalidated:
+            self.cache.put_bindings(invalidated)
+
+    def _verified(
+        self,
+        r: TvRow,
+        fh: FinnhubIdentity | None,
+        of: OpenFigiIdentity | None,
+        y: YahooQuote,
+        mic: str | None,
+        source_mic: str | None = None,
+        target_mic: str | None = None,
+        source_venue_code: str | None = None,
+        mapping_method: str = "SAME_VENUE",
+        source_of: OpenFigiIdentity | None = None,
+        target_of: OpenFigiIdentity | None = None,
+    ) -> Binding:
+        now = int(time.time())
+        if source_mic is None and source_venue_code is None:
+            source_mic = mic
+        target_mic = target_mic or mic
+        source_of = source_of or of
+        target_of = target_of or of
+        payload = {
+            "tv_id": r.tv_id,
+            "currency": r.currency,
+            "type": tv_type_kind(r),
+            "mic": mic,
+            "source_mic": source_mic,
+            "target_mic": target_mic,
+            "source_venue_code": source_venue_code,
+            "mapping_method": mapping_method,
+            "finnhub_symbol": fh.symbol if fh else None,
+            "composite_figi": (fh.composite_figi if fh else of.composite_figi if of else None),
+            "share_class_figi": (fh.share_class_figi if fh else of.share_class_figi if of else None),
+            "venue_figi": source_of.figi if source_of else None,
+            "source_venue_figi": source_of.figi if source_of else None,
+            "target_venue_figi": target_of.figi if target_of else None,
+            "yahoo_symbol": y.symbol,
+            "yahoo_exchange": y.exchange,
+            "yahoo_market": y.market,
+            "yahoo_currency": y.currency,
+            "policy": RESOLVER_VERSION,
+        }
+        fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return Binding(
+            tv_id=r.tv_id,
+            tv_symbol=r.symbol,
+            tv_prefix=r.prefix,
+            tv_currency=r.currency,
+            tv_type=r.tv_type,
+            status="VERIFIED",
+            yahoo_symbol=y.symbol,
+            yahoo_exchange=y.exchange,
+            yahoo_market=y.market,
+            yahoo_quote_type=y.quote_type,
+            yahoo_currency=y.currency,
+            yahoo_price=y.price,
+            yahoo_delayed_by=y.delayed_by,
+            quote_status="FRESH",
+            resolved_mic=target_mic,
+            source_mic=source_mic,
+            target_mic=target_mic,
+            source_venue_code=source_venue_code,
+            mapping_method=mapping_method,
+            source_venue_figi=source_of.figi if source_of else None,
+            target_venue_figi=target_of.figi if target_of else None,
+            finnhub_symbol=fh.symbol if fh else None,
+            finnhub_type=fh.security_type if fh else None,
+            composite_figi=fh.composite_figi if fh else of.composite_figi if of else None,
+            share_class_figi=fh.share_class_figi if fh else of.share_class_figi if of else None,
+            venue_figi=source_of.figi if source_of else None,
+            fingerprint=fingerprint,
+            resolver_version=RESOLVER_VERSION,
+            validated_at=now,
+            expires_at=now + self.verified_ttl,
+        )
+
+    def _reject(self, r: TvRow, reason: str) -> Binding:
+        now = int(time.time())
+        return Binding(
+            tv_id=r.tv_id,
+            tv_symbol=r.symbol,
+            tv_prefix=r.prefix,
+            tv_currency=r.currency,
+            tv_type=r.tv_type,
+            status="REJECTED",
+            rejection_reason=reason,
+            resolver_version=RESOLVER_VERSION,
+            validated_at=now,
+            expires_at=now + self.rejected_ttl,
+        )

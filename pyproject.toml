@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tv-market-identity"
+version = "0.3.34"
+description = "Batch TradingView -> Finnhub/OpenFIGI -> Yahoo identity resolver with persistent SQLite cache"
+requires-python = ">=3.11"
+dependencies = [
+  "tradingview-screener==3.2.1",
+  "finnhub-python==2.4.29",
+  "yfinance>=1.7.0,<1.8",
+  "requests>=2.32,<3",
+  "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+tv-market-id = "tv_market_identity.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
