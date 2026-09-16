@@ -1,3 +1,7 @@
+## v0.4.19 functional — OOTC stock/common Royalty Trst exact-ISIN rescue
+
+Adds `US_OOTC_STOCK_COMMON_FINNHUB_ROYALTY_TRST_EXACT_ISIN` for the v0.4.18-audited OOTC `FINNHUB_TYPE_MISMATCH:Royalty Trst` cohort. Admission requires OTC stock/common, exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `Royalty Trst / Common Stock` with non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. This is not a global `Royalty Trst -> EQUITY` compatibility rule. Resolver policy is `0.4.19-policy419`.
+
 ## v0.4.18 diagnostic-only — residual Finnhub taxonomy audit
 
 Adds `--us-finnhub-residual-taxonomy-audit` for the ten remaining reviewed `FINNHUB_TYPE_MISMATCH` cohorts: Closed-End Fund, Ltd Part, CDI, Royalty Trst, Stapled Security, Preference, GDR, Common Stock, NVDR, and SDR. The audit is full-cohort (including missing ISIN) and records source MIC provenance, scoped/unscoped exact-ISIN OpenFIGI evidence, shareClassFIGI, Yahoo exact-ISIN candidates, and strict same-source EQUITY evidence. Admission policy remains `0.4.15-policy415`.
