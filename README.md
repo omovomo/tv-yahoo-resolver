@@ -1461,3 +1461,8 @@ quote/chart currency metadata, exact-ISIN discovery, exact-symbol correlation,
 and explicit classifications. Missing ISIN is emitted as `MISSING_TV_ISIN` and
 never queried by OpenFIGI/Yahoo ISIN endpoints. Admission is unchanged; resolver
 policy remains `0.4.15-policy415`.
+
+
+### v0.4.17 — Yahoo MUTUALFUND full-cohort diagnostic
+
+Diagnostic-only US release. Expands `--us-yahoo-mutualfund-audit` into a full-cohort decomposition of every `YAHOO_TYPE_MISMATCH:MUTUALFUND` rejection, including missing-ISIN rows. Records TV venue/taxonomy, source-scoped and unscoped exact-ISIN OpenFIGI evidence, source-proof strength, Yahoo direct quote/chart metadata, exact-ISIN discovery, and strict same-source EQUITY observations. No admission logic changes; resolver policy remains `0.4.15-policy415`.

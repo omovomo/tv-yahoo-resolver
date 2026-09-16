@@ -1224,7 +1224,7 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
             and str(c.get("quote_type") or "").upper() == "EQUITY"
             for c in candidates
         ):
-            classification = "SOURCE_SCOPED_AND_YAHOO_STRICT"
+            classification = "UNIQUE_SHARE_CLASS_AND_ONE_SAME_SOURCE_EQUITY_CANDIDATE"
         elif len(source_figis) == 1:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         else:
@@ -2760,106 +2760,152 @@ def _write_us_xnas_source_binding_audit(path: Path, rows, bindings: dict, resolv
 
 
 def _write_us_yahoo_mutualfund_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """Diagnostic-only exact-ISIN evidence audit for US Yahoo MUTUALFUND rejects."""
+    """v0.4.17 diagnostic-only full-cohort decomposition of US Yahoo MUTUALFUND rejects.
+
+    Keeps missing-ISIN rows, separates source identity proof from Yahoo provider
+    evidence, and records venue / TV taxonomy / exact-ISIN outcomes. Nothing in
+    this audit participates in resolver admission or cache policy.
+    """
     cohort = [
         r for r in rows
-        if r.isin
-        and (b := bindings.get(r.tv_id)) is not None
+        if (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED"
         and b.rejection_reason == "YAHOO_TYPE_MISMATCH:MUTUALFUND"
     ]
-    unscoped_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in cohort]
-    scoped_jobs = [
-        {"idType": "ID_ISIN", "idValue": r.isin, "micCode": TV_PREFIX_TO_MIC[r.prefix]}
-        if TV_PREFIX_TO_MIC.get(r.prefix) else None
-        for r in cohort
-    ]
-    try:
-        unscoped_mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
-    except ProviderError:
-        unscoped_mapped = [[] for _ in unscoped_jobs]
+
+    unscoped_mapped = [[] for _ in cohort]
     scoped_mapped = [[] for _ in cohort]
-    real_scoped = [(i, job) for i, job in enumerate(scoped_jobs) if job]
-    if real_scoped:
-        try:
-            mapped = resolver.openfigi.map_jobs([job for _, job in real_scoped])
-            for (i, _), result in zip(real_scoped, mapped): scoped_mapped[i] = result
-        except ProviderError:
-            pass
+    unscoped_jobs, unscoped_idx = [], []
+    scoped_jobs, scoped_idx = [], []
+    for i, r in enumerate(cohort):
+        if not r.isin:
+            continue
+        unscoped_idx.append(i)
+        unscoped_jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+        mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        if mic:
+            scoped_idx.append(i)
+            scoped_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
+    try:
+        mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
+        for i, xs in zip(unscoped_idx, mapped): unscoped_mapped[i] = list(xs)
+    except ProviderError:
+        pass
+    try:
+        mapped = resolver.openfigi.map_jobs(scoped_jobs) if scoped_jobs else []
+        for i, xs in zip(scoped_idx, mapped): scoped_mapped[i] = list(xs)
+    except ProviderError:
+        pass
 
     search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
     searches = {}
     if callable(search_fn):
         for r in cohort:
+            if not r.isin: continue
             token = str(r.isin).upper().strip()
-            if token not in searches:
+            if token and token not in searches:
                 try: searches[token] = list(search_fn(token))
                 except ProviderError: searches[token] = []
-    symbols = list(dict.fromkeys(
-        [b.yahoo_symbol for r in cohort if (b := bindings[r.tv_id]).yahoo_symbol]
-        + [c.symbol for cs in searches.values() for c in cs if c.symbol]
+
+    direct_symbols = list(dict.fromkeys(
+        b.yahoo_symbol for r in cohort if (b := bindings[r.tv_id]).yahoo_symbol
     ))
+    discovered_symbols = [c.symbol for cs in searches.values() for c in cs if c.symbol]
+    symbols = list(dict.fromkeys(direct_symbols + discovered_symbols))
     try: quotes = resolver.yahoo.quotes(symbols) if symbols else {}
     except ProviderError: quotes = {}
+    try: charts = resolver.yahoo.chart_quotes(symbols) if symbols and hasattr(resolver.yahoo, "chart_quotes") else {}
+    except ProviderError: charts = {}
 
     def of_record(x):
         return {"figi": x.figi, "composite_figi": x.composite_figi,
                 "share_class_figi": x.share_class_figi, "ticker": x.ticker,
                 "name": x.name, "security_type": x.security_type,
                 "security_type2": x.security_type2, "exch_code": x.exch_code}
+
+    def q_record(q, r, source_mic):
+        if q is None: return None
+        return {"symbol": q.symbol, "exchange": q.exchange,
+                "full_exchange_name": q.full_exchange_name, "market": q.market,
+                "currency": q.currency, "quote_type": q.quote_type,
+                "source_venue_compatible": bool(source_mic and yahoo_venue_compatible(source_mic, q)),
+                "currency_compatible": bool(not r.currency or not q.currency or currency_compatible(r.currency, q.currency)),
+                "equity_quote": (q.quote_type or "").upper() == "EQUITY"}
+
     records = []
-    for r, unscoped, scoped in zip(cohort, unscoped_mapped, scoped_mapped):
+    for i, r in enumerate(cohort):
         b = bindings[r.tv_id]
         source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
-        shares = sorted({x.share_class_figi for x in unscoped if x.share_class_figi})
+        unscoped, scoped = unscoped_mapped[i], scoped_mapped[i]
         scoped_figis = sorted({x.figi for x in scoped if x.figi})
-        cs = searches.get(str(r.isin).upper().strip(), [])
+        scoped_shares = sorted({x.share_class_figi for x in scoped if x.share_class_figi})
+        unscoped_shares = sorted({x.share_class_figi for x in unscoped if x.share_class_figi})
+        token = str(r.isin or "").upper().strip()
+        cs = searches.get(token, []) if token else []
         candidates = []
+        strict = []
         for c in cs:
-            q = quotes.get(c.symbol)
-            venue_ok = bool(q and source_mic and yahoo_venue_compatible(source_mic, q))
-            currency_ok = bool(q and (not r.currency or not q.currency or currency_compatible(r.currency, q.currency)))
-            candidates.append({
-                "symbol": c.symbol, "search_exchange": c.exchange,
-                "search_quote_type": c.quote_type, "quote_returned": q is not None,
-                "quote_exchange": q.exchange if q else None,
-                "quote_full_exchange_name": q.full_exchange_name if q else None,
-                "quote_market": q.market if q else None,
-                "quote_currency": q.currency if q else None,
-                "quote_type": q.quote_type if q else None,
-                "same_tv_ticker": punctuation_key(c.symbol.split('.')[0]) == punctuation_key(r.symbol),
-                "source_venue_compatible": venue_ok,
-                "currency_compatible": currency_ok,
-                "equity_quote": bool(q and (q.quote_type or '').upper() == 'EQUITY'),
-            })
-        strict = [c for c in candidates if c["same_tv_ticker"] and c["source_venue_compatible"] and c["currency_compatible"] and c["equity_quote"]]
+            q = quotes.get(c.symbol); ch = charts.get(c.symbol)
+            qr = q_record(q, r, source_mic); chr_ = q_record(ch, r, source_mic)
+            same = punctuation_key(c.symbol.split('.')[0]) == punctuation_key(r.symbol)
+            rec = {"symbol": c.symbol, "search_exchange": c.exchange,
+                   "search_quote_type": c.quote_type, "same_tv_ticker": same,
+                   "quote": qr, "chart": chr_}
+            candidates.append(rec)
+            for provider_kind, meta in (("quote", qr), ("chart", chr_)):
+                if same and meta and meta["source_venue_compatible"] and meta["currency_compatible"] and meta["equity_quote"]:
+                    strict.append((c.symbol, provider_kind))
+        strict = sorted(set(strict))
+        strict_symbols = sorted({x[0] for x in strict})
         current_q = quotes.get(b.yahoo_symbol) if b.yahoo_symbol else None
-        if len(strict) == 1 and len(shares) == 1:
-            classification = "UNIQUE_SHARE_CLASS_AND_ONE_SAME_SOURCE_EQUITY_CANDIDATE"
-        elif len(strict) > 1:
-            classification = "MULTIPLE_SAME_SOURCE_EQUITY_CANDIDATES"
-        elif not shares:
-            classification = "SHARE_CLASS_MISSING"
-        elif len(shares) > 1:
-            classification = "SHARE_CLASS_AMBIGUOUS"
+        current_ch = charts.get(b.yahoo_symbol) if b.yahoo_symbol else None
+
+        if not r.isin:
+            source_proof = "MISSING_TV_ISIN"
+        elif len(scoped_figis) == 1:
+            source_proof = "SCOPED_UNIQUE_FIGI"
+        elif len(scoped_figis) > 1:
+            source_proof = "SCOPED_AMBIGUOUS"
+        elif len(unscoped_shares) == 1:
+            source_proof = "UNSCOPED_UNIQUE_SHARE_CLASS_ONLY"
+        elif len(unscoped_shares) > 1:
+            source_proof = "UNSCOPED_SHARE_CLASS_AMBIGUOUS"
         else:
-            classification = "NO_SAME_SOURCE_EQUITY_CANDIDATE"
+            source_proof = "SOURCE_UNPROVEN"
+
+        if not r.isin:
+            classification = "MISSING_TV_ISIN"
+        elif len(scoped_figis) == 1 and len(strict_symbols) == 1:
+            classification = "UNIQUE_SHARE_CLASS_AND_ONE_SAME_SOURCE_EQUITY_CANDIDATE"
+        elif len(strict_symbols) > 1:
+            classification = "MULTIPLE_YAHOO_STRICT_CANDIDATES"
+        elif len(scoped_figis) != 1:
+            classification = "SOURCE_IDENTITY_EVIDENCE_INCOMPLETE"
+        elif not cs:
+            classification = "SOURCE_PROVEN_EXACT_ISIN_NOT_DISCOVERED"
+        else:
+            classification = "SOURCE_PROVEN_YAHOO_CONTRACT_UNCONFIRMED"
+
         records.append({
-            "diagnostic_only": True, "tv_id": r.tv_id, "tv_symbol": r.symbol,
+            "diagnostic_only": True, "diagnostic_release": "0.4.17",
+            "tv_id": r.tv_id, "tv_prefix": r.prefix, "tv_symbol": r.symbol,
             "tv_isin": r.isin, "tv_currency": r.currency, "tv_type": r.tv_type,
-            "tv_type_specs": list(r.type_specs), "source_mic": source_mic,
+            "tv_type_specs": list(r.type_specs), "taxonomy_key": f"{r.tv_type}/{'|'.join(r.type_specs)}",
+            "source_mic": source_mic, "source_proof": source_proof,
             "rejection_reason": b.rejection_reason, "resolver_yahoo_symbol": b.yahoo_symbol,
             "resolver_yahoo_exchange": b.yahoo_exchange, "resolver_yahoo_currency": b.yahoo_currency,
             "resolver_yahoo_quote_type": b.yahoo_quote_type,
-            "current_yahoo_quote": ({"symbol": current_q.symbol, "exchange": current_q.exchange,
-                "full_exchange_name": current_q.full_exchange_name, "market": current_q.market,
-                "currency": current_q.currency, "quote_type": current_q.quote_type} if current_q else None),
-            "unscoped_share_class_figis": shares,
-            "unscoped_openfigi": [of_record(x) for x in unscoped],
+            "current_yahoo_quote": q_record(current_q, r, source_mic),
+            "current_yahoo_chart": q_record(current_ch, r, source_mic),
+            "unscoped_share_class_figis": unscoped_shares,
+            "unscoped_openfigi_count": len(unscoped), "unscoped_openfigi": [of_record(x) for x in unscoped],
             "source_scoped_openfigi_status": "NO_MATCH" if not scoped else ("UNIQUE_FIGI" if len(scoped_figis) == 1 else "AMBIGUOUS"),
-            "source_scoped_openfigi": [of_record(x) for x in scoped],
+            "source_scoped_openfigi_count": len(scoped), "source_scoped_openfigi": [of_record(x) for x in scoped],
+            "source_scoped_share_class_figis": scoped_shares,
             "yahoo_exact_isin_candidate_count": len(cs),
-            "yahoo_same_source_equity_candidate_count": len(strict),
+            "yahoo_same_source_equity_candidate_count": len(strict_symbols),
+            "yahoo_strict_same_source_observation_count": len(strict),
+            "yahoo_strict_same_source_observations": [{"symbol": x[0], "provider": x[1]} for x in strict],
             "yahoo_exact_isin_candidates": candidates, "classification": classification,
         })
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2977,7 +3023,7 @@ def _write_us_finnhub_public_audit(path: Path, rows, bindings: dict, resolver: B
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": __version__,
+            "diagnostic_only": True, "diagnostic_release": "0.4.16",
             "tv_id": r.tv_id, "tv_symbol": r.symbol,
             "tv_isin": r.isin, "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -3196,7 +3242,7 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": __version__,
+            "diagnostic_only": True, "diagnostic_release": "0.4.16",
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "tv_type_kind": tv_type_kind(r), "source_mic": source_mic,
@@ -3998,7 +4044,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-yahoo-mutualfund-audit",
         default=None,
-        help="Write diagnostic-only exact-ISIN JSONL for US YAHOO_TYPE_MISMATCH:MUTUALFUND rejects",
+        help="Write v0.4.17 diagnostic-only full-cohort decomposition JSONL for US YAHOO_TYPE_MISMATCH:MUTUALFUND rejects",
     )
     r.add_argument(
         "--us-finnhub-public-audit",

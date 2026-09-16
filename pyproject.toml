@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tv-market-identity"
-version = "0.4.16"
+version = "0.4.17"
 description = "Batch TradingView -> Finnhub/OpenFIGI -> Yahoo identity resolver with persistent SQLite cache"
 requires-python = ">=3.11"
 dependencies = [
