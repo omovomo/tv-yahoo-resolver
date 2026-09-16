@@ -1126,21 +1126,24 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
     source MIC, plus Yahoo exact-ISIN discovery/quote metadata.  This function
     never changes resolver admission or cache state.
     """
+    # v0.4.14: the audit is a true full residual cohort.  Keep rows without
+    # TradingView ISIN in the JSONL as explicit fail-closed controls instead
+    # of silently dropping them from the diagnostic denominator.
     cohort = [
         r for r in rows
-        if r.isin
-        and (b := bindings.get(r.tv_id)) is not None
+        if (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED"
         and b.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
     ]
+    evidence_rows = [r for r in cohort if r.isin]
 
-    unscoped_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in cohort]
+    unscoped_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in evidence_rows]
     try:
         unscoped_mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
     except ProviderError:
         unscoped_mapped = [[] for _ in unscoped_jobs]
 
-    source_rows = [r for r in cohort if TV_PREFIX_TO_MIC.get(r.prefix)]
+    source_rows = [r for r in evidence_rows if TV_PREFIX_TO_MIC.get(r.prefix)]
     source_jobs = [
         {"idType": "ID_ISIN", "idValue": r.isin, "micCode": TV_PREFIX_TO_MIC[r.prefix]}
         for r in source_rows
@@ -1154,7 +1157,7 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
     search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
     searches = {}
     if callable(search_fn):
-        for r in cohort:
+        for r in evidence_rows:
             token = str(r.isin).upper().strip()
             if token in searches:
                 continue
@@ -1179,15 +1182,17 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
         }
 
     records = []
-    for r, unscoped in zip(cohort, unscoped_mapped):
+    unscoped_by_tv = {r.tv_id: list(xs) for r, xs in zip(evidence_rows, unscoped_mapped)}
+    for r in cohort:
+        unscoped = unscoped_by_tv.get(r.tv_id, [])
         b = bindings[r.tv_id]
         source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
         source = source_by_tv.get(r.tv_id, [])
         unscoped_shares = sorted({x.share_class_figi for x in unscoped if x.share_class_figi})
         source_figis = sorted({x.figi for x in source if x.figi})
         source_shares = sorted({x.share_class_figi for x in source if x.share_class_figi})
-        token = str(r.isin).upper().strip()
-        cs = searches.get(token, [])
+        token = str(r.isin).upper().strip() if r.isin else ""
+        cs = searches.get(token, []) if token else []
         candidates = []
         for c in cs:
             q = quotes.get(c.symbol)
@@ -1210,8 +1215,24 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
             unscoped_status = "SHARE_CLASS_MISSING"
         else:
             unscoped_status = "AMBIGUOUS_SHARE_CLASS"
+        if not r.isin:
+            classification = "MISSING_TV_ISIN"
+        elif len(source_figis) == 1 and len(cs) == 1 and any(
+            str(c.get("symbol") or "").upper().strip() == str(r.symbol or "").upper().strip()
+            and c.get("source_venue_compatible")
+            and c.get("currency_compatible")
+            and str(c.get("quote_type") or "").upper() == "EQUITY"
+            for c in candidates
+        ):
+            classification = "SOURCE_SCOPED_AND_YAHOO_STRICT"
+        elif len(source_figis) == 1:
+            classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
+        else:
+            classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
             "diagnostic_only": True,
+            "diagnostic_release": "0.4.14",
+            "classification": classification,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs),

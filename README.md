@@ -1,3 +1,7 @@
+# tv-market-identity-prototype v0.4.14
+
+Diagnostic-only v0.4.14 audits the complete current `FINNHUB_TYPE_MISMATCH:Unit` residual cohort with `--us-finnhub-unit-audit`. Rows without a TradingView ISIN are retained as explicit `MISSING_TV_ISIN` fail-closed controls; ISIN-bearing rows collect scoped/unscoped OpenFIGI and Yahoo exact-ISIN evidence and receive diagnostic classifications. Admission is unchanged and resolver policy remains `0.4.11-policy411`.
+
 # tv-market-identity-prototype v0.4.0
 
 Diagnostic-only v0.4.0 adds a full-cohort `FINNHUB_TYPE_MISMATCH:CDI` evidence audit via `--us-finnhub-cdi-audit`. It does not change admission; resolver policy remains `0.3.99-policy99`.

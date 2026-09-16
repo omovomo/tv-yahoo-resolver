@@ -727,3 +727,33 @@ def test_v080_xnas_source_binding_audit_excludes_non_xnas(tmp_path):
     out = tmp_path / "xnas.jsonl"
     cli._write_us_xnas_source_binding_audit(out, [row], {row.tv_id: binding}, SimpleNamespace(openfigi=OF(), yahoo=Y()))
     assert out.read_text() == ""
+
+
+def test_v0414_unit_audit_keeps_missing_isin_in_full_cohort(tmp_path, monkeypatch):
+    import json, sys, types
+    fake_tv = types.ModuleType("tradingview_screener")
+    fake_tv.Column = type("Column", (), {"__init__": lambda self, *a, **k: None})
+    fake_tv.Query = type("Query", (), {"__init__": lambda self, *a, **k: setattr(self, "query", {})})
+    monkeypatch.setitem(sys.modules, "tradingview_screener", fake_tv)
+    from types import SimpleNamespace
+    import tv_market_identity.cli as cli
+    from tv_market_identity.models import Binding, TvRow
+
+    row = TvRow("AMEX:NOISIN", "AMEX", "NOISIN", "No Isin Unit", "USD", "fund", ("unit",), None, None, None, None)
+    binding = Binding(row.tv_id, row.symbol, row.prefix, row.currency, row.tv_type, "REJECTED",
+                      finnhub_type="Unit", rejection_reason="FINNHUB_TYPE_MISMATCH:Unit")
+    class OF:
+        def map_jobs(self, jobs):
+            assert jobs == []
+            return []
+    class Y:
+        def search_exact_isin(self, isin):
+            raise AssertionError("missing ISIN must not be searched")
+        def quotes(self, symbols): return {}
+    out = tmp_path / "unit-missing.jsonl"
+    cli._write_us_finnhub_unit_audit(out, [row], {row.tv_id: binding}, SimpleNamespace(openfigi=OF(), yahoo=Y()))
+    rec = json.loads(out.read_text().strip())
+    assert rec["diagnostic_release"] == "0.4.14"
+    assert rec["classification"] == "MISSING_TV_ISIN"
+    assert rec["tv_isin"] is None
+    assert binding.status == "REJECTED"

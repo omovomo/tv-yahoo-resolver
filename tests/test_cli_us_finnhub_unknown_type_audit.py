@@ -27,7 +27,7 @@ def test_unknown_type_audit_parser_and_evidence(tmp_path):
     _write_us_finnhub_unknown_type_audit(out,[row],{row.tv_id:binding},SimpleNamespace(cache=Cache(),openfigi=OF(),yahoo=Y()))
     rec=json.loads(out.read_text().strip())
     assert rec['diagnostic_only'] is True
-    assert rec['diagnostic_release'] == '0.4.13'
+    assert rec['diagnostic_release'] == '0.4.14'
     assert rec['rejection_reason'] == 'FINNHUB_TYPE_MISMATCH:?'
     assert rec['source_mic'] == 'XNAS'
     assert rec['finnhub_matching_symbol_rows'][0]['type'] is None
