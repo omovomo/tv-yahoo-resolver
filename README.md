@@ -1429,3 +1429,17 @@ Admission policy remains `0.3.87-policy87`. The `run` command adds `--us-finnhub
 ## v0.4.4 diagnostic
 
 Adds `--us-finnhub-gdr-audit PATH` for diagnostic-only evidence collection of US `FINNHUB_TYPE_MISMATCH:GDR` rejects. Admission policy remains `0.3.99-policy99`.
+
+
+## v0.4.10 diagnostic-only
+Adds `--us-finnhub-public-xnas-segment-audit PATH` for the XNAS preferred subset of `FINNHUB_TYPE_MISMATCH:PUBLIC`. It compares the unscoped OpenFIGI Nasdaq segment (`NASDAQ/NGS`, `NASDAQ/NGM`, `NASDAQ/NCM`) with the independently discovered Yahoo exact-ISIN quote exchange (`NMS`, `NGM`, `NCM`). This is evidence-only; admission policy remains `0.4.8-policy48`.
+
+## v0.4.11 functional
+Adds `US_XNAS_FINNHUB_PUBLIC_PREFERRED_EXACT_ISIN_SEGMENT` for the v0.4.10-audited XNAS preferred `FINNHUB_TYPE_MISMATCH:PUBLIC` cohort. Admission requires exact TV ISIN, scoped `ID_ISIN + XNAS` NO_MATCH, exactly one unscoped `PUBLIC / Preferred Stock` FIGI on `NASDAQ/NGS|NGM|NCM`, one exact-ISIN Yahoo EQUITY/USD candidate correlated to the exact TV ticker, and exact segment correspondence `NASDAQ/NGS -> NMS/NasdaqGS`, `NASDAQ/NGM -> NGM/NasdaqGM`, or `NASDAQ/NCM -> NCM/NasdaqCM`. `NASDAQ/NGS -> NGM/NasdaqGM` remains rejected (the NFEGP negative-control shape). Fund/unit rows are excluded. No generic Nasdaq fallback, ticker guessing, or cross-segment alias is introduced. Policy is `0.4.11-policy411`; compatible VERIFIED cache from `0.4.8-policy48` is retained while old REJECTED rows are reprocessed.
+
+
+## v0.4.12 diagnostic-only
+Adds/refreshes the full-cohort `FINNHUB_TYPE_MISMATCH:?` evidence audit via `--us-finnhub-unknown-type-audit`. The audit records exact TV ISIN/type, exact-symbol Finnhub rows, reviewed or uniquely inferred source MIC, scoped and unscoped OpenFIGI evidence, Yahoo exact-ISIN candidates and strict same-source EQUITY contract classification. Admission is unchanged; resolver policy remains `0.4.11-policy411`.
+
+## v0.4.13
+Diagnostic-only correction for the US `FINNHUB_TYPE_MISMATCH:?` full-cohort audit. `--us-finnhub-unknown-type-audit` no longer drops rejected rows merely because TradingView ISIN is missing. Such rows are emitted with `classification=MISSING_TV_ISIN`; OpenFIGI/Yahoo exact-ISIN calls are skipped for them. Admission is unchanged and resolver policy remains `0.4.11-policy411`.

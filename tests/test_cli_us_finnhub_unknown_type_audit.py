@@ -27,6 +27,7 @@ def test_unknown_type_audit_parser_and_evidence(tmp_path):
     _write_us_finnhub_unknown_type_audit(out,[row],{row.tv_id:binding},SimpleNamespace(cache=Cache(),openfigi=OF(),yahoo=Y()))
     rec=json.loads(out.read_text().strip())
     assert rec['diagnostic_only'] is True
+    assert rec['diagnostic_release'] == '0.4.13'
     assert rec['rejection_reason'] == 'FINNHUB_TYPE_MISMATCH:?'
     assert rec['source_mic'] == 'XNAS'
     assert rec['finnhub_matching_symbol_rows'][0]['type'] is None
@@ -57,3 +58,24 @@ def test_unknown_type_audit_otc_uses_unique_finnhub_mic_for_source_binding(tmp_p
     assert rec['source_scoped_openfigi_status'] == 'UNIQUE_FIGI'
     assert rec['yahoo_strict_same_source_equity_candidate_count'] == 1
     assert rec['classification'] == 'SOURCE_SCOPED_AND_YAHOO_STRICT'
+
+def test_unknown_type_audit_keeps_missing_isin_in_full_cohort(tmp_path):
+    out=tmp_path/'unknown-missing-isin.jsonl'
+    row=TvRow(tv_id='OTC:NOISIN',prefix='OTC',symbol='NOISIN',name='No ISIN',currency='USD',tv_type='stock',type_specs=('common',),sector=None,market_cap=None,close=None,isin=None)
+    binding=Binding(tv_id=row.tv_id,tv_symbol=row.symbol,tv_prefix=row.prefix,tv_currency=row.currency,tv_type=row.tv_type,status='REJECTED',finnhub_type=None,rejection_reason='FINNHUB_TYPE_MISMATCH:?')
+    class Cache:
+        def load_finnhub_universe(self): return [{'symbol':'NOISIN','mic':'OOTC','currency':'USD','type':'','description':'No ISIN'}]
+    class OF:
+        def map_jobs(self,jobs): raise AssertionError('OpenFIGI must not be called without ISIN')
+    class Y:
+        def search_exact_isin(self,isin): raise AssertionError('Yahoo ISIN search must not be called without ISIN')
+        def quotes(self,symbols): return {}
+    _write_us_finnhub_unknown_type_audit(out,[row],{row.tv_id:binding},SimpleNamespace(cache=Cache(),openfigi=OF(),yahoo=Y()))
+    rec=json.loads(out.read_text().strip())
+    assert rec['tv_id'] == 'OTC:NOISIN'
+    assert rec['tv_isin'] is None
+    assert rec['classification'] == 'MISSING_TV_ISIN'
+    assert rec['source_mic'] == 'OOTC'
+    assert rec['unscoped_openfigi'] == []
+    assert rec['source_scoped_openfigi'] == []
+    assert rec['yahoo_exact_isin_candidate_count'] == 0

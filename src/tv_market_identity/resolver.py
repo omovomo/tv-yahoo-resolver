@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -649,6 +649,7 @@ class BatchResolver:
             us_bindings = self._us_same_venue_preferred_rescue(us, us_bindings)
             us_bindings = self._us_xnys_fund_unit_rescue(us, us_bindings)
             us_bindings = self._us_xnys_fund_unit_public_rescue(us, us_bindings)
+            us_bindings = self._us_xnas_finnhub_public_preferred_segment_rescue(us, us_bindings)
             us_bindings = self._us_xnys_stock_common_royalty_trust_rescue(us, us_bindings)
             us_bindings = self._us_xnys_stock_common_ltd_part_rescue(us, us_bindings)
             us_bindings = self._us_xnys_stock_common_closed_end_fund_rescue(us, us_bindings)
@@ -1168,6 +1169,118 @@ class BatchResolver:
                 mapping_method="US_XNYS_FUND_UNIT_PUBLIC_EXACT_ISIN", source_of=of, target_of=of,
             )
             self.stats["us_xnys_fund_unit_public_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnas_finnhub_public_preferred_segment_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue audited XNAS preferred PUBLIC mismatches with exact segment proof.
+
+        OpenFIGI currently fails scoped ``ID_ISIN + XNAS`` for this cohort while
+        its unscoped exact-ISIN record reports a concrete Nasdaq listing segment.
+        Admission is therefore limited to a single unscoped PUBLIC / Preferred
+        Stock FIGI and an independently discovered Yahoo exact-ISIN candidate on
+        the *same* Nasdaq segment.  This is same-source evidence; it is not a
+        cross-venue bridge and does not require shareClassFIGI.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:PUBLIC":
+                continue
+            if r.prefix != "NASDAQ" or tv_type_kind(r) != "PREFERRED" or not r.isin:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = []
+        for r in eligible:
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNAS"})
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnas_public_preferred_segment_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnas_public_preferred_segment_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        segment_pairs = {
+            "NASDAQ/NGS": ("NMS", "NASDAQGS"),
+            "NASDAQ/NGM": ("NGM", "NASDAQGM"),
+            "NASDAQ/NCM": ("NCM", "NASDAQCM"),
+        }
+        proven: dict[str, tuple[OpenFigiIdentity, tuple[str, str]]] = {}
+        for i, r in enumerate(eligible):
+            unscoped = mapped[2 * i]
+            scoped = mapped[2 * i + 1]
+            qualifying = [x for x in unscoped if (
+                x.figi
+                and (x.security_type or "").strip().lower() == "public"
+                and (x.security_type2 or "").strip().lower() == "preferred stock"
+                and (x.exch_code or "").upper() in segment_pairs
+            )]
+            # The audited pathology is specifically scoped XNAS NO_MATCH.  Any
+            # scoped result changes the evidence shape and must use another rule.
+            if scoped or len(qualifying) != 1 or len(unscoped) != 1:
+                self.stats["us_xnas_public_preferred_segment_identity_unconfirmed"] += 1
+                continue
+            of = qualifying[0]
+            proven[r.tv_id] = (of, segment_pairs[(of.exch_code or "").upper()])
+            self.stats["us_xnas_public_preferred_segment_identity_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            proof = proven.get(r.tv_id)
+            if proof is None:
+                continue
+            of, (expected_code, expected_name) = proof
+            qualifying = []
+            for c in searches.get(r.tv_id, []):
+                q = quotes.get(c.symbol)
+                ticker_ok = punctuation_key(c.symbol.split('.')[0]) == punctuation_key(r.symbol)
+                if not ticker_ok or (c.quote_type or "").upper() != "EQUITY" or q is None:
+                    continue
+                if (q.quote_type or "").upper() != "EQUITY":
+                    continue
+                if not q.currency or not r.currency or not currency_compatible(r.currency, q.currency):
+                    continue
+                if (q.exchange or "").upper() != expected_code:
+                    continue
+                if (q.full_exchange_name or "").upper() != expected_name:
+                    continue
+                qualifying.append((c, q))
+            if len(qualifying) != 1:
+                self.stats["us_xnas_public_preferred_segment_yahoo_unconfirmed"] += 1
+                continue
+            _, q = qualifying[0]
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNAS", source_mic="XNAS", target_mic="XNAS",
+                mapping_method="US_XNAS_FINNHUB_PUBLIC_PREFERRED_EXACT_ISIN_SEGMENT",
+                source_of=of, target_of=of,
+            )
+            self.stats["us_xnas_public_preferred_segment_rescue_matches"] += 1
 
         return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
 

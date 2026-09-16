@@ -27,6 +27,7 @@ def test_us_finnhub_public_audit_parser_and_evidence(tmp_path):
     _write_us_finnhub_public_audit(out,[row],{row.tv_id:binding},SimpleNamespace(openfigi=OF(),yahoo=Y(),stats=defaultdict(int)))
     rec=json.loads(out.read_text().strip())
     assert rec['diagnostic_only'] is True
+    assert rec['diagnostic_release'] == '0.4.13'
     assert rec['finnhub_type'] == 'PUBLIC'
     assert rec['source_mic'] == 'XNAS'
     assert rec['source_scoped_openfigi_status'] == 'UNIQUE_FIGI'

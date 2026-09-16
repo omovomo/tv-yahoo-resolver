@@ -2911,7 +2911,8 @@ def _write_us_finnhub_public_audit(path: Path, rows, bindings: dict, resolver: B
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "tv_id": r.tv_id, "tv_symbol": r.symbol,
+            "diagnostic_only": True, "diagnostic_release": __version__,
+            "tv_id": r.tv_id, "tv_symbol": r.symbol,
             "tv_isin": r.isin, "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
             "source_mic": source_mic, "finnhub_type": b.finnhub_type,
@@ -2933,12 +2934,62 @@ def _write_us_finnhub_public_audit(path: Path, rows, bindings: dict, resolver: B
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+
+def _write_us_finnhub_public_xnas_segment_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """Diagnostic-only XNAS segment proof audit for Finnhub PUBLIC preferred rejects."""
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        _write_us_finnhub_public_audit(tmp_path, rows, bindings, resolver)
+        base = [json.loads(line) for line in tmp_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    segment_map = {"NASDAQ/NGS": "NMS", "NASDAQ/NGM": "NGM", "NASDAQ/NCM": "NCM"}
+    records = []
+    for rec in base:
+        if rec.get("source_mic") != "XNAS" or rec.get("tv_type_kind") != "PREFERRED":
+            continue
+        unscoped = rec.get("unscoped_openfigi") or []
+        strict = [c for c in rec.get("yahoo_exact_isin_candidates", []) if c.get("strict_same_source_equity")]
+        of = unscoped[0] if len(unscoped) == 1 else None
+        exch = of.get("exch_code") if of else None
+        expected = segment_map.get(exch)
+        yahoo_exchange = strict[0].get("quote_exchange") if len(strict) == 1 else None
+        segment_consistent = bool(expected and yahoo_exchange == expected)
+        identity_contract = bool(
+            rec.get("source_scoped_openfigi_status") == "NO_MATCH"
+            and of
+            and of.get("security_type") == "PUBLIC"
+            and of.get("security_type2") == "Preferred Stock"
+            and expected
+            and len(strict) == 1
+        )
+        rec.update({
+            "diagnostic_release": __version__,
+            "xnas_segment_expected_yahoo_exchange": expected,
+            "xnas_segment_actual_yahoo_exchange": yahoo_exchange,
+            "xnas_segment_consistent": segment_consistent,
+            "xnas_segment_identity_contract": identity_contract,
+            "xnas_segment_strict_contract": bool(identity_contract and segment_consistent),
+            "classification": ("XNAS_SEGMENT_STRICT" if identity_contract and segment_consistent
+                               else "XNAS_SEGMENT_MISMATCH" if identity_contract
+                               else "XNAS_SEGMENT_EVIDENCE_INCOMPLETE"),
+        })
+        records.append(rec)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
 def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only evidence audit for US FINNHUB_TYPE_MISMATCH:? rejects."""
+    # Full rejection cohort: missing ISIN is diagnostic evidence and must not
+    # silently remove a rejected row from this audit.
     cohort = [
         r for r in rows
-        if r.isin
-        and (b := bindings.get(r.tv_id)) is not None
+        if (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED"
         and b.rejection_reason == "FINNHUB_TYPE_MISMATCH:?"
     ]
@@ -2980,16 +3031,24 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
                 source_mics.append(None)
                 source_mic_origins.append("UNRESOLVED")
 
-    unscoped_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in cohort]
+    unscoped_jobs = [
+        {"idType": "ID_ISIN", "idValue": r.isin} if r.isin else None
+        for r in cohort
+    ]
     scoped_jobs = [
         {"idType": "ID_ISIN", "idValue": r.isin, "micCode": source_mic}
-        if source_mic else None
+        if r.isin and source_mic else None
         for r, source_mic in zip(cohort, source_mics)
     ]
-    try:
-        unscoped_mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
-    except ProviderError:
-        unscoped_mapped = [[] for _ in unscoped_jobs]
+    unscoped_mapped = [[] for _ in cohort]
+    real_unscoped = [(i, job) for i, job in enumerate(unscoped_jobs) if job]
+    if real_unscoped:
+        try:
+            mapped = resolver.openfigi.map_jobs([job for _, job in real_unscoped])
+            for (i, _), result in zip(real_unscoped, mapped):
+                unscoped_mapped[i] = result
+        except ProviderError:
+            pass
     scoped_mapped = [[] for _ in cohort]
     real_scoped = [(i, job) for i, job in enumerate(scoped_jobs) if job]
     if real_scoped:
@@ -3004,7 +3063,9 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
     searches = {}
     if callable(search_fn):
         for r in cohort:
-            token = str(r.isin).upper().strip()
+            token = str(r.isin or "").upper().strip()
+            if not token:
+                continue
             if token not in searches:
                 try:
                     searches[token] = list(search_fn(token))
@@ -3034,7 +3095,7 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
         scoped_figis = sorted({x.figi for x in scoped if x.figi})
         scoped_shares = sorted({x.share_class_figi for x in scoped if x.share_class_figi})
         raw_rows = matching_rows_by_tv_id[r.tv_id]
-        cs = searches.get(str(r.isin).upper().strip(), [])
+        cs = searches.get(str(r.isin or "").upper().strip(), [])
         candidates = []
         for c in cs:
             q = quotes.get(c.symbol)
@@ -3056,7 +3117,9 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
         strict = [c for c in candidates if c["strict_same_source_equity"]]
         scoped_status = "UNIQUE_FIGI" if len(scoped_figis) == 1 else ("NO_MATCH" if not scoped else "AMBIGUOUS")
         unscoped_status = "UNKNOWN" if not unscoped else ("UNIQUE_SHARE_CLASS" if len(shares) == 1 else ("SHARE_CLASS_MISSING" if not shares else "AMBIGUOUS_SHARE_CLASS"))
-        if scoped_status == "UNIQUE_FIGI" and len(strict) == 1:
+        if not r.isin:
+            classification = "MISSING_TV_ISIN"
+        elif scoped_status == "UNIQUE_FIGI" and len(strict) == 1:
             classification = "SOURCE_SCOPED_AND_YAHOO_STRICT"
         elif scoped_status == "NO_MATCH" and unscoped_status == "UNIQUE_SHARE_CLASS" and len(strict) == 1:
             classification = "SOURCE_SCOPED_NO_MATCH_BUT_UNSCOPED_AND_YAHOO_STRICT"
@@ -3067,7 +3130,8 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
+            "diagnostic_only": True, "diagnostic_release": __version__,
+            "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "tv_type_kind": tv_type_kind(r), "source_mic": source_mic,
             "source_mic_origin": source_mic_origin, "finnhub_type": b.finnhub_type,
@@ -3509,6 +3573,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_public_audit)
             _write_us_finnhub_public_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub PUBLIC audit: {audit_path.resolve()}")
+        if args.us_finnhub_public_xnas_segment_audit:
+            audit_path = Path(args.us_finnhub_public_xnas_segment_audit)
+            _write_us_finnhub_public_xnas_segment_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub PUBLIC XNAS segment audit: {audit_path.resolve()}")
         if args.us_finnhub_unknown_type_audit:
             audit_path = Path(args.us_finnhub_unknown_type_audit)
             _write_us_finnhub_unknown_type_audit(audit_path, rows, bindings, resolver)
@@ -3869,7 +3937,12 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-finnhub-public-audit",
         default=None,
-        help="Write diagnostic-only exact-ISIN/source-binding JSONL for US FINNHUB_TYPE_MISMATCH:PUBLIC rejects",
+        help="Write v0.4.9 diagnostic-only full-cohort exact-ISIN/source-binding JSONL for US FINNHUB_TYPE_MISMATCH:PUBLIC rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-public-xnas-segment-audit",
+        default=None,
+        help="Write v0.4.10 diagnostic-only XNAS preferred OpenFIGI/Yahoo segment-consistency JSONL",
     )
     r.add_argument(
         "--us-finnhub-unknown-type-audit",

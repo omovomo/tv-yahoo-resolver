@@ -2741,3 +2741,76 @@ def test_v048_xnys_no_symbol_preferred_does_not_apply_to_xase(tmp_path):
 def test_v048_xnys_no_symbol_preferred_rejects_noncorrelated_yahoo_symbol(tmp_path):
     got=_run_v048_no_symbol_rescue(tmp_path, yahoo=YHNYSESlashPreferred(candidate="OTHER-P"))
     assert got.status == "REJECTED"
+
+# v0.4.11: XNAS preferred PUBLIC rescue requires exact OpenFIGI/Yahoo segment proof.
+class FHPublicXnasV0411:
+    batch_size = 100
+    def us_symbols(self):
+        return [{"symbol":"XPREF","displaySymbol":"XPREF","description":"XNAS PREF","currency":"USD","type":"PUBLIC","mic":"XNAS","figi":"FH_XPREF"}]
+
+class OFPublicXnasV0411:
+    batch_size = 100
+    def __init__(self, exch="NASDAQ/NGS", scoped=False):
+        self.exch, self.scoped = exch, scoped
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            if job.get("idValue") != "US0000004111": out.append([]); continue
+            if job.get("micCode") == "XNAS":
+                out.append([OpenFigiIdentity("SCOPED","C",None,"XPREF","PREF","PUBLIC","Preferred Stock","NASDAQ/NGS")]) if self.scoped else out.append([])
+            else:
+                out.append([OpenFigiIdentity("OF_XPREF","C",None,"XPREF","PREF","PUBLIC","Preferred Stock",self.exch)])
+        return out
+
+class YHPublicXnasV0411:
+    batch_size = 75
+    def __init__(self, exchange="NMS", full="NasdaqGS"):
+        self.exchange, self.full = exchange, full
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        return [YahooSearchCandidate("XPREF",self.exchange,"EQUITY",None,None)] if isin == "US0000004111" else []
+    def quotes(self, symbols):
+        return {s: YahooQuote(s,self.exchange,self.full,"USD","EQUITY","us_market",None,None,10.0,0) for s in symbols}
+
+def _v0411_row(tv_type="stock", specs=("preferred",)):
+    return TvRow("NASDAQ:XPREF","NASDAQ","XPREF",None,"USD",tv_type,specs,None,None,10.0,"US0000004111")
+
+def test_v0411_xnas_public_preferred_exact_segment_admission(tmp_path):
+    db=CacheDB(tmp_path / "v0411-ok.sqlite")
+    r=BatchResolver(db,FHPublicXnasV0411(),OFPublicXnasV0411(),YHPublicXnasV0411())
+    got=r.resolve([_v0411_row()])["NASDAQ:XPREF"]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNAS_FINNHUB_PUBLIC_PREFERRED_EXACT_ISIN_SEGMENT"
+    assert got.source_mic == got.target_mic == "XNAS"
+    assert got.share_class_figi is None
+    assert r.stats["us_xnas_public_preferred_segment_rescue_matches"] == 1
+    db.close()
+
+def test_v0411_nasdaq_ngs_to_ngm_is_negative_control(tmp_path):
+    db=CacheDB(tmp_path / "v0411-segment-mismatch.sqlite")
+    r=BatchResolver(db,FHPublicXnasV0411(),OFPublicXnasV0411("NASDAQ/NGS"),YHPublicXnasV0411("NGM","NasdaqGM"))
+    got=r.resolve([_v0411_row()])["NASDAQ:XPREF"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:PUBLIC"
+    assert r.stats["us_xnas_public_preferred_segment_rescue_matches"] == 0
+    db.close()
+
+def test_v0411_xnas_public_segment_rule_excludes_fund_unit(tmp_path):
+    db=CacheDB(tmp_path / "v0411-fund-unit.sqlite")
+    r=BatchResolver(db,FHPublicXnasV0411(),OFPublicXnasV0411(),YHPublicXnasV0411())
+    got=r.resolve([_v0411_row("fund",("unit",))])["NASDAQ:XPREF"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:PUBLIC"
+    assert r.stats["us_xnas_public_preferred_segment_rescue_matches"] == 0
+    db.close()
+
+def test_v0411_xnas_public_segment_requires_scoped_xnas_no_match(tmp_path):
+    db=CacheDB(tmp_path / "v0411-scoped.sqlite")
+    r=BatchResolver(db,FHPublicXnasV0411(),OFPublicXnasV0411(scoped=True),YHPublicXnasV0411())
+    got=r.resolve([_v0411_row()])["NASDAQ:XPREF"]
+    # Existing direct same-venue preferred proof may admit this row; v0.4.11
+    # must not claim it because its audited contract requires scoped NO_MATCH.
+    assert got.mapping_method != "US_XNAS_FINNHUB_PUBLIC_PREFERRED_EXACT_ISIN_SEGMENT"
+    assert r.stats["us_xnas_public_preferred_segment_rescue_matches"] == 0
+    db.close()
