@@ -10,4 +10,4 @@ def test_ltd_part_audit_flag_available_under_current_policy():
 
 
 def test_current_package_version_after_ltd_part_audit_release():
-    assert __version__ == "0.3.99"
+    assert __version__ == "0.4.0"

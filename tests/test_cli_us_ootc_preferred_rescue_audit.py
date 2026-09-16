@@ -9,5 +9,5 @@ def test_v088_parser_exposes_rescue_provenance_audit():
 
 
 def test_current_versions():
-    assert tv_market_identity.__version__ == "0.3.99"
+    assert tv_market_identity.__version__ == "0.4.0"
     assert RESOLVER_VERSION == "0.3.99-policy99"

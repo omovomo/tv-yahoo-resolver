@@ -1,4 +1,6 @@
-# tv-market-identity-prototype v0.3.99
+# tv-market-identity-prototype v0.4.0
+
+Diagnostic-only v0.4.0 adds a full-cohort `FINNHUB_TYPE_MISMATCH:CDI` evidence audit via `--us-finnhub-cdi-audit`. It does not change admission; resolver policy remains `0.3.99-policy99`.
 
 Functional v0.3.99 adds the v0.3.98-audited XNYS-only stock/common `Closed-End Fund / Mutual Fund` exact-ISIN rescue. Admission requires exact TV ISIN, exactly one `ID_ISIN + XNYS` OpenFIGI FIGI with exact TV ticker, non-empty shareClassFIGI, `securityType=Closed-End Fund`, `securityType2=Mutual Fund`, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV symbol and whose quote is NYSE-compatible, currency-compatible, and `EQUITY`. XNAS/OTC source gaps, fuzzy/name matching, ticker construction, and generic taxonomy overrides remain excluded. Policy is `0.3.99-policy99`.
 

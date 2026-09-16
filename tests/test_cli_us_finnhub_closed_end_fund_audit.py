@@ -10,4 +10,4 @@ def test_v098_closed_end_fund_audit_flag_and_policy_unchanged():
 
 
 def test_v099_package_version_after_functional_release():
-    assert __version__ == "0.3.99"
+    assert __version__ == "0.4.0"
