@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.3.49-policy49"
+RESOLVER_VERSION = "0.3.62-policy62"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -64,6 +64,18 @@ CROSS_VENUE_BRIDGES = {
 # ordering only chooses a deterministic quote venue when the same security is
 # valid on several regional exchanges. It never substitutes for identity proof.
 GERMANY_REGIONAL_TARGET_MICS = ("XFRA", "XSTU", "XMUN", "XHAN", "XDUS", "XHAM")
+
+# Reviewed Yahoo exchange-code -> ISO MIC bridge used only by the exact-ISIN
+# home-market rescue when the unscoped OpenFIGI response does not expose the
+# Yahoo local ticker.  These entries came from the v0.3.60 rejection audit and
+# are venue semantics, not security allowlists.  Admission still requires a
+# second OpenFIGI ID_EXCH_SYMBOL + micCode mapping whose shareClassFIGI equals
+# the one independently proven from the TradingView exact ISIN.
+YAHOO_HOME_EXCHANGE_TO_MIC = {
+    "TOR": "XTSE",   # Yahoo Toronto -> Toronto Stock Exchange
+    "ASE": "XASE",   # Yahoo NYSE American -> NYSE American
+    "MIL": "XMIL",   # Yahoo Milan -> Borsa Italiana
+}
 
 ISIN_SHARE_CLASS_BRIDGES = {
     # gettex is the Börse München market-maker model: regulated MUNC / open MUND.
@@ -543,6 +555,86 @@ def yahoo_market_compatible(mic: str | None, market: str | None) -> bool:
         "XHAN": {"DE_MARKET"},
     }
     return market.upper() in allowed.get(mic, set())
+
+
+
+# Exact-ISIN-only Germany stock taxonomy bridge.  These OpenFIGI labels are
+# reviewed exchange-traded equity-like forms that TradingView exposes under
+# its broad stock/common taxonomy.  They are intentionally *not* added to the
+# generic OpenFIGI compatibility contract: admission requires exact TV ISIN,
+# a bounded German regional MIC, one non-null shareClassFIGI, and Yahoo's
+# ordinary EQUITY/EUR/venue confirmation.  Fund taxonomies remain excluded.
+GERMANY_EXACT_ISIN_STOCK_TAXONOMY_PAIRS = {
+    ("unit", "unit"),
+    ("stapled security", "unit"),
+    ("dutch cert", "depositary receipt"),
+    ("savings share", "common stock"),
+}
+
+
+def germany_exact_isin_stock_type_compatible(row: TvRow, identity) -> bool:
+    """Reviewed exact-ISIN taxonomy extension for German regional rescue only."""
+    if not row.isin or tv_type_kind(row) != "STOCK":
+        return False
+    specs = {str(x).lower() for x in row.type_specs if x}
+    if "common" not in specs:
+        return False
+    pair = (
+        (getattr(identity, "security_type", None) or "").strip().lower(),
+        (getattr(identity, "security_type2", None) or "").strip().lower(),
+    )
+    return pair in GERMANY_EXACT_ISIN_STOCK_TAXONOMY_PAIRS
+
+# Exact-ISIN subtype reconciliation for German listed equities.  This is an
+# identity-only exception: the ISIN and one shareClassFIGI already fix the
+# security, while providers may label participation/preference/savings-share
+# forms differently.  It is deliberately kept out of generic ticker/MIC
+# matching and does not include fund taxonomies.
+GERMANY_EXACT_ISIN_SHARE_SUBTYPE_PAIRS = {
+    # TradingView preferred / participation certificate -> OpenFIGI equity
+    ("PREFERRED", "common stock", "common stock"),
+    ("PREFERRED", "savings share", "common stock"),
+    # TradingView broad stock/common -> OpenFIGI preference
+    ("STOCK", "preference", "preference"),
+}
+
+
+def germany_exact_isin_share_subtype_compatible(row: TvRow, identity) -> bool:
+    """Allow reviewed share-subtype naming differences under exact ISIN only."""
+    if not row.isin:
+        return False
+    kind = tv_type_kind(row)
+    specs = {str(x).lower() for x in row.type_specs if x}
+    if kind == "STOCK" and "common" not in specs:
+        return False
+    if kind == "PREFERRED" and "preferred" not in specs:
+        return False
+    t1 = (getattr(identity, "security_type", None) or "").strip().lower()
+    t2 = (getattr(identity, "security_type2", None) or "").strip().lower()
+    return (kind, t1, t2) in GERMANY_EXACT_ISIN_SHARE_SUBTYPE_PAIRS
+
+# Exact-ISIN listed-fund identity reconciliation for German quote routing.
+# TradingView exposes some exchange-listed investment companies under its broad
+# stock/common taxonomy while OpenFIGI classifies the same ISIN/share class as
+# Closed-End Fund / Mutual Fund. This exception is identity-only; downstream
+# investment eligibility (for example GARP) remains a separate policy concern.
+GERMANY_EXACT_ISIN_LISTED_FUND_PAIRS = {
+    ("closed-end fund", "mutual fund"),
+}
+
+
+def germany_exact_isin_listed_fund_compatible(row: TvRow, identity) -> bool:
+    """Allow a reviewed listed closed-end fund under exact ISIN only."""
+    if not row.isin or tv_type_kind(row) != "STOCK":
+        return False
+    specs = {str(x).lower() for x in row.type_specs if x}
+    if "common" not in specs:
+        return False
+    pair = (
+        (getattr(identity, "security_type", None) or "").strip().lower(),
+        (getattr(identity, "security_type2", None) or "").strip().lower(),
+    )
+    return pair in GERMANY_EXACT_ISIN_LISTED_FUND_PAIRS
 
 
 def openfigi_security_type(row: TvRow) -> str:

@@ -302,3 +302,64 @@ def test_single_shot_complete_universe_fails_on_duplicate_ticker(monkeypatch):
     monkeypatch.setattr(tv, "Query", FakeQuery)
     with pytest.raises(tv.PaginationStabilityError, match="duplicate ticker rows"):
         tv.fetch_screen(cfg(limit=100000, require_complete_universe=True))
+
+
+def test_active_symbol_column_requested_for_stale_listing_diagnostics():
+    assert "active_symbol" in tv.TV_COLUMNS
+
+
+def test_dataframe_to_tv_rows_preserves_active_symbol():
+    frame = pd.DataFrame([{ 
+        "ticker": "GETTEX:OLD", "name": "OLD", "description": "Old Listing",
+        "currency": "EUR", "type": "stock", "typespecs": ["common"],
+        "sector": None, "market_cap_basic": None, "close": 1.0,
+        "isin": "US0000000001", "active_symbol": False,
+    }])
+    row = tv.dataframe_to_tv_rows(frame)[0]
+    assert row.active_symbol is False
+    assert row.isin == "US0000000001"
+
+
+def test_identifier_probe_is_exact_ticker_and_optional_fields_fail_soft(monkeypatch):
+    seen = []
+
+    class FakeQuery:
+        def __init__(self):
+            self.query = {"filter": [{"left": "is_primary", "operation": "equal", "right": True}]}
+            self.columns = ()
+            self.tickers = ()
+        def select(self, *columns):
+            self.columns = columns
+            return self
+        def set_tickers(self, *tickers):
+            self.tickers = tickers
+            return self
+        def limit(self, value):
+            self.limit_value = value
+            return self
+        def get_scanner_data(self):
+            seen.append((self.columns, self.tickers, list(self.query.get("filter", []))))
+            if "cusip" in self.columns:
+                raise RuntimeError("lowercase CUSIP unsupported")
+            if "CUSIP" in self.columns:
+                return 1, pd.DataFrame({"ticker": ["GETTEX:OLD"], "name": ["OLD"], "CUSIP": ["123456789"]})
+            if "figi" in self.columns:
+                return 1, pd.DataFrame({"ticker": ["GETTEX:OLD"], "name": ["OLD"], "figi": ["BBG000TEST01"]})
+            return 1, pd.DataFrame({
+                "ticker": ["GETTEX:OLD"], "name": ["OLD"], "description": ["Old Listing"],
+                "exchange": ["GETTEX"], "market": ["germany"], "country": ["United States"],
+                "currency": ["EUR"], "type": ["stock"], "typespecs": [["common"]],
+                "is_primary": [False], "active_symbol": [False], "isin": ["US0000000001"],
+            })
+
+    monkeypatch.setattr(tv, "Query", FakeQuery)
+    got = tv.probe_identifier_metadata(["gettex:old", "GETTEX:OLD"])
+    item = got["GETTEX:OLD"]
+    assert item["found"] is True
+    assert item["active_symbol"] is False
+    assert item["isin"] == "US0000000001"
+    assert item["cusip"] == "123456789"
+    assert item["figi"] == "BBG000TEST01"
+    assert item["field_sources"] == {"cusip": "CUSIP", "figi": "figi"}
+    assert all(filters == [] for _, _, filters in seen)
+    assert all(tickers == ("GETTEX:OLD",) for _, tickers, _ in seen)

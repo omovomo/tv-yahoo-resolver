@@ -18,15 +18,20 @@ from .policy import (
     GERMANY_REGIONAL_TARGET_MICS,
     ISIN_SHARE_CLASS_BRIDGES,
     TV_PREFIX_TO_MIC,
+    YAHOO_HOME_EXCHANGE_TO_MIC,
     currency_compatible,
     openfigi_currency,
+    openfigi_type_compatible,
+    punctuation_key,
     tv_type_kind,
     yahoo_listing_symbol,
     yahoo_type_compatible,
     yahoo_venue_compatible,
 )
 from .resolver import BatchResolver
-from .tradingview import PaginationStabilityError, dataframe_to_tv_rows, fetch_screen
+from .tradingview import (
+    PaginationStabilityError, dataframe_to_tv_rows, fetch_screen, probe_identifier_metadata,
+)
 
 
 def _load_environment() -> str | None:
@@ -111,6 +116,40 @@ def _write_csv(path: Path, df, bindings: dict) -> None:
 
 
 
+def _audit_yahoo_symbol_identity_keys(symbol: str | None) -> set[str]:
+    """Mirror the bounded home-market ticker normalization for diagnostics only."""
+    value = str(symbol or "").upper().strip()
+    if not value:
+        return set()
+    keys = {punctuation_key(value)}
+    if "." in value:
+        root, suffix = value.rsplit(".", 1)
+        if root and 1 <= len(suffix) <= 4 and suffix.isalnum():
+            keys.add(punctuation_key(root))
+    return {x for x in keys if x}
+
+
+def _audit_home_quote_contract(candidate, quote) -> tuple[bool, list[str]]:
+    """Explain the strict v0.3.59 home-market Yahoo quote contract."""
+    blocks: list[str] = []
+    if (candidate.quote_type or "").upper() != "EQUITY":
+        blocks.append(f"SEARCH_TYPE_MISMATCH:{candidate.quote_type}")
+    if quote is None:
+        blocks.append("QUOTE_NOT_RETURNED")
+        return False, blocks
+    if quote.symbol != candidate.symbol:
+        blocks.append(f"SYMBOL_MISMATCH:{quote.symbol}")
+    if (quote.quote_type or "").upper() != "EQUITY":
+        blocks.append(f"QUOTE_TYPE_MISMATCH:{quote.quote_type}")
+    if not quote.currency:
+        blocks.append("CURRENCY_UNREPORTED")
+    if not quote.exchange:
+        blocks.append("EXCHANGE_UNREPORTED")
+    if candidate.exchange and quote.exchange and candidate.exchange.upper() != quote.exchange.upper():
+        blocks.append(f"EXCHANGE_MISMATCH:{candidate.exchange}/{quote.exchange}")
+    return not blocks, blocks
+
+
 def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Write evidence-only JSONL for rejected German rows.
 
@@ -122,6 +161,117 @@ def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchReso
         r for r in rows
         if (b := bindings.get(r.tv_id)) is not None and b.status == "REJECTED"
     ]
+
+    # v0.3.63 diagnostic-only TradingView reference-data probe.  This is kept
+    # outside resolver admission so unsupported/lagging CUSIP/FIGI fields can
+    # never turn a reject into a verified binding or break the main universe
+    # acquisition.  `active_symbol` comes from the normal snapshot as well.
+    tv_identifier_probe = probe_identifier_metadata([r.tv_id for r in rejected_rows])
+
+    # Diagnostic-only exact-ISIN lookup without a MIC.  This does not affect
+    # admission.  It exposes the global/home-market OpenFIGI identities needed
+    # to design a future deterministic Yahoo home-listing fallback.  Batch the
+    # jobs so an authenticated provider can fetch the whole residual set in one
+    # request, and let OpenFigiProvider's run memo eliminate jobs the resolver
+    # already issued earlier in the same run.
+    unscoped_by_tv = {}
+    unscoped_rows = [r for r in rejected_rows if r.isin]
+    if unscoped_rows:
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in unscoped_rows]
+        try:
+            mapped = resolver.openfigi.map_jobs(jobs)
+        except ProviderError:
+            mapped = [[] for _ in jobs]
+        unscoped_by_tv = {r.tv_id: identities for r, identities in zip(unscoped_rows, mapped)}
+
+    # Diagnostic-only mirror of the exact-ISIN Yahoo home-market discovery.
+    # The resolver already attempted this path before rejection; the audit now
+    # records the exact search candidates and why each candidate could not be
+    # admitted.  This remains evidence-only and cannot change a Binding.
+    home_search_by_isin = {}
+    home_quotes = {}
+    home_charts = {}
+    search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
+    searchable_isins = set()
+    for r in rejected_rows:
+        if not r.isin:
+            continue
+        unscoped = list(unscoped_by_tv.get(r.tv_id, ()))
+        compatible = [x for x in unscoped if openfigi_type_compatible(r, x)]
+        observed_shares = {x.share_class_figi for x in compatible if x.share_class_figi}
+        if compatible and len(observed_shares) == 1:
+            searchable_isins.add(str(r.isin).upper().strip())
+    if callable(search_fn):
+        for isin in sorted(searchable_isins):
+            try:
+                home_search_by_isin[isin] = list(search_fn(isin))
+            except ProviderError:
+                home_search_by_isin[isin] = []
+        home_symbols = list(dict.fromkeys(
+            candidate.symbol
+            for candidates in home_search_by_isin.values()
+            for candidate in candidates
+            if candidate.symbol
+        ))
+        try:
+            home_quotes = resolver.yahoo.quotes(home_symbols) if home_symbols else {}
+        except ProviderError:
+            home_quotes = {}
+        chart_fn = getattr(resolver.yahoo, "chart_quotes", None)
+        if callable(chart_fn) and home_symbols:
+            chart_needed = []
+            by_symbol = {
+                candidate.symbol: candidate
+                for candidates in home_search_by_isin.values()
+                for candidate in candidates
+            }
+            for symbol in home_symbols:
+                candidate = by_symbol[symbol]
+                quote = home_quotes.get(symbol)
+                valid, blocks = _audit_home_quote_contract(candidate, quote)
+                explicit = any(
+                    block.startswith("SEARCH_TYPE_MISMATCH:")
+                    or block.startswith("QUOTE_TYPE_MISMATCH:")
+                    or block.startswith("EXCHANGE_MISMATCH:")
+                    for block in blocks
+                )
+                if not valid and not explicit:
+                    chart_needed.append(symbol)
+            if chart_needed:
+                try:
+                    home_charts = chart_fn(list(dict.fromkeys(chart_needed)))
+                except ProviderError:
+                    home_charts = {}
+
+    # v0.3.62 diagnostic mirror of targeted exact-ISIN + home-MIC proof.
+    # This is evidence-only: it records whether OpenFIGI can prove that the
+    # exact TradingView ISIN exists on the reviewed Yahoo home venue and which
+    # shareClassFIGI values are returned there.
+    home_isin_mic_by_key = {}
+    home_isin_mic_keys = []
+    seen_home_isin_mic_keys = set()
+    for isin, candidates in home_search_by_isin.items():
+        for candidate in candidates:
+            home_mic = YAHOO_HOME_EXCHANGE_TO_MIC.get((candidate.exchange or "").upper())
+            if not home_mic:
+                continue
+            key = (isin, home_mic)
+            if key not in seen_home_isin_mic_keys:
+                seen_home_isin_mic_keys.add(key)
+                home_isin_mic_keys.append(key)
+    if home_isin_mic_keys:
+        jobs = [
+            {"idType": "ID_ISIN", "idValue": isin, "micCode": mic}
+            for isin, mic in home_isin_mic_keys
+        ]
+        try:
+            mapped = resolver.openfigi.map_jobs(jobs)
+        except ProviderError:
+            mapped = [[] for _ in jobs]
+        home_isin_mic_by_key = {
+            key: list(identities) for key, identities in zip(home_isin_mic_keys, mapped)
+        }
+
     records = []
     for r in rejected_rows:
         b = bindings[r.tv_id]
@@ -197,6 +347,131 @@ def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchReso
                     "ordinary_contract_blocks": ordinary_blocks,
                 })
 
+        unscoped = list(unscoped_by_tv.get(r.tv_id, ()))
+        unscoped_shares = sorted({x.share_class_figi for x in unscoped if x.share_class_figi})
+        if not unscoped:
+            unscoped_status = "UNKNOWN"
+        elif not unscoped_shares:
+            unscoped_status = "SHARE_CLASS_MISSING"
+        elif len(unscoped_shares) > 1:
+            unscoped_status = "AMBIGUOUS_SHARE_CLASS"
+        elif any(not x.share_class_figi for x in unscoped):
+            unscoped_status = "PARTIAL_SHARE_CLASS"
+        else:
+            unscoped_status = "UNIQUE_SHARE_CLASS"
+
+        home_market_search_candidates = []
+        home_market_audit_status = "NOT_ATTEMPTED"
+        if r.isin and callable(search_fn):
+            isin_key = str(r.isin).upper().strip()
+            compatible_unscoped = [x for x in unscoped if openfigi_type_compatible(r, x)]
+            observed_shares = {x.share_class_figi for x in compatible_unscoped if x.share_class_figi}
+            if not compatible_unscoped:
+                home_market_audit_status = "NO_COMPATIBLE_OPENFIGI_IDENTITY"
+            elif not observed_shares:
+                home_market_audit_status = "SHARE_CLASS_MISSING"
+            elif len(observed_shares) != 1:
+                home_market_audit_status = "SHARE_CLASS_AMBIGUOUS"
+            else:
+                share = next(iter(observed_shares))
+                candidates = home_search_by_isin.get(isin_key, ())
+                home_market_audit_status = "NO_YAHOO_SEARCH_CANDIDATES" if not candidates else "CANDIDATES_RECORDED"
+                for candidate in candidates:
+                    keys = _audit_yahoo_symbol_identity_keys(candidate.symbol)
+                    matched = [
+                        x for x in compatible_unscoped
+                        if x.share_class_figi == share and x.ticker and punctuation_key(x.ticker) in keys
+                    ]
+                    home_mic = YAHOO_HOME_EXCHANGE_TO_MIC.get((candidate.exchange or "").upper())
+                    targeted_identities = list(
+                        home_isin_mic_by_key.get((isin_key, home_mic), ()) if home_mic else ()
+                    )
+                    targeted_compatible = [
+                        x for x in targeted_identities if openfigi_type_compatible(r, x)
+                    ]
+                    targeted_share_matches = [
+                        x for x in targeted_compatible if x.share_class_figi == share
+                    ]
+                    targeted_conflicting_shares = sorted({
+                        x.share_class_figi for x in targeted_compatible
+                        if x.share_class_figi and x.share_class_figi != share
+                    })
+                    identity_confirmed = bool(matched) or (
+                        bool(targeted_share_matches) and not targeted_conflicting_shares
+                    )
+                    quote = home_quotes.get(candidate.symbol)
+                    quote_valid, quote_blocks = _audit_home_quote_contract(candidate, quote)
+                    chart = home_charts.get(candidate.symbol)
+                    chart_valid, chart_blocks = _audit_home_quote_contract(candidate, chart)
+                    explicit_quote_contradiction = any(
+                        block.startswith("SEARCH_TYPE_MISMATCH:")
+                        or block.startswith("QUOTE_TYPE_MISMATCH:")
+                        or block.startswith("EXCHANGE_MISMATCH:")
+                        for block in quote_blocks
+                    )
+                    effective_quote_valid = quote_valid or (not explicit_quote_contradiction and chart_valid)
+                    effective_quote_source = (
+                        "quote" if quote_valid else "chart" if (not explicit_quote_contradiction and chart_valid) else None
+                    )
+                    candidate_blocks = []
+                    if (candidate.quote_type or "").upper() != "EQUITY":
+                        candidate_blocks.append(f"SEARCH_TYPE_MISMATCH:{candidate.quote_type}")
+                    if not identity_confirmed:
+                        if targeted_conflicting_shares:
+                            candidate_blocks.append("OPENFIGI_HOME_MIC_SHARE_CONFLICT")
+                        else:
+                            candidate_blocks.append("OPENFIGI_HOME_LISTING_UNCONFIRMED")
+                    if not effective_quote_valid:
+                        candidate_blocks.extend(quote_blocks)
+                        if chart is not None and not explicit_quote_contradiction:
+                            candidate_blocks.extend(f"CHART_{block}" for block in chart_blocks)
+                    candidate_blocks = list(dict.fromkeys(candidate_blocks))
+                    home_market_search_candidates.append({
+                        "symbol": candidate.symbol,
+                        "exchange": candidate.exchange,
+                        "quote_type": candidate.quote_type,
+                        "short_name": candidate.short_name,
+                        "long_name": candidate.long_name,
+                        "identity_keys": sorted(keys),
+                        "expected_share_class_figi": share,
+                        "openfigi_ticker_confirmed": bool(matched),
+                        "matched_openfigi_tickers": sorted({x.ticker for x in matched if x.ticker}),
+                        "home_mic": home_mic,
+                        "targeted_isin_mic_share_confirmed": bool(targeted_share_matches) and not targeted_conflicting_shares,
+                        "targeted_isin_mic_conflicting_share_class_figis": targeted_conflicting_shares,
+                        "targeted_isin_mic_openfigi": [
+                            {
+                                "figi": x.figi,
+                                "composite_figi": x.composite_figi,
+                                "share_class_figi": x.share_class_figi,
+                                "ticker": x.ticker,
+                                "name": x.name,
+                                "security_type": x.security_type,
+                                "security_type2": x.security_type2,
+                                "exch_code": x.exch_code,
+                            }
+                            for x in targeted_identities
+                        ],
+                        "quote_returned": quote is not None,
+                        "quote_exchange": quote.exchange if quote else None,
+                        "quote_full_exchange_name": quote.full_exchange_name if quote else None,
+                        "quote_market": quote.market if quote else None,
+                        "quote_type_returned": quote.quote_type if quote else None,
+                        "quote_currency": quote.currency if quote else None,
+                        "quote_price": quote.price if quote else None,
+                        "quote_contract_valid": quote_valid,
+                        "quote_contract_blocks": quote_blocks,
+                        "chart_returned": chart is not None,
+                        "chart_exchange": chart.exchange if chart else None,
+                        "chart_quote_type": chart.quote_type if chart else None,
+                        "chart_currency": chart.currency if chart else None,
+                        "chart_contract_valid": chart_valid,
+                        "chart_contract_blocks": chart_blocks,
+                        "effective_quote_source": effective_quote_source,
+                        "resolver_candidate_valid": identity_confirmed and effective_quote_valid and (candidate.quote_type or "").upper() == "EQUITY",
+                        "admission_blocks": candidate_blocks,
+                    })
+
         records.append({
             "tv_id": r.tv_id,
             "ticker": r.symbol,
@@ -205,6 +480,8 @@ def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchReso
             "type": r.tv_type,
             "typespecs": list(r.type_specs),
             "isin": r.isin,
+            "active_symbol": r.active_symbol,
+            "tradingview_identifier_probe": tv_identifier_probe.get(r.tv_id, {}),
             "rejection_reason": b.rejection_reason,
             "resolved_mic": b.resolved_mic,
             "source_mic": b.source_mic,
@@ -213,6 +490,23 @@ def _write_rejection_audit(path: Path, rows, bindings: dict, resolver: BatchReso
             "yahoo_symbol": b.yahoo_symbol,
             "source_probe_mics": source_mics,
             "evidence": evidence,
+            "unscoped_openfigi_status": unscoped_status,
+            "unscoped_share_class_figis": unscoped_shares,
+            "home_market_audit_status": home_market_audit_status,
+            "home_market_search_candidates": home_market_search_candidates,
+            "unscoped_openfigi": [
+                {
+                    "figi": x.figi,
+                    "composite_figi": x.composite_figi,
+                    "share_class_figi": x.share_class_figi,
+                    "ticker": x.ticker,
+                    "name": x.name,
+                    "security_type": x.security_type,
+                    "security_type2": x.security_type2,
+                    "exch_code": x.exch_code,
+                }
+                for x in unscoped
+            ],
         })
 
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -17,6 +17,7 @@ class TvRow:
     market_cap: float | None
     close: float | None
     isin: str | None = None
+    active_symbol: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,15 @@ class OpenFigiIdentity:
     security_type: str | None
     security_type2: str | None
     exch_code: str | None
+
+
+@dataclass(frozen=True)
+class YahooSearchCandidate:
+    symbol: str
+    exchange: str | None
+    quote_type: str | None
+    short_name: str | None
+    long_name: str | None
 
 
 @dataclass(frozen=True)

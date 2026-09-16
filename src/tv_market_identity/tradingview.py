@@ -23,6 +23,7 @@ TV_COLUMNS = (
     "price_earnings_ttm",
     "close",
     "is_primary",
+    "active_symbol",
     "isin",
 )
 
@@ -276,9 +277,137 @@ def dataframe_to_tv_rows(df) -> list[TvRow]:
             market_cap=_float(record.get("market_cap_basic")),
             close=_float(record.get("close")),
             isin=(str(record.get("isin")).upper().strip() if record.get("isin") else None),
+            active_symbol=_bool_or_none(record.get("active_symbol")),
         ))
     return rows
 
+
+
+def probe_identifier_metadata(tickers: list[str]) -> dict[str, dict]:
+    """Evidence-only TradingView probe for exact ticker identifiers.
+
+    The normal universe query intentionally relies only on stable, already used
+    columns.  CUSIP/FIGI are probed separately because TradingView exposes them
+    in the Screener UI but they are not currently listed in the public field
+    catalog used by ``tradingview-screener``.  Any unsupported field or network
+    failure is returned as diagnostic metadata and can never affect admission.
+    """
+    requested = list(dict.fromkeys(
+        str(x or "").strip().upper() for x in tickers if str(x or "").strip()
+    ))
+    result = {
+        ticker: {
+            "requested_ticker": ticker,
+            "found": False,
+            "active_symbol": None,
+            "isin": None,
+            "cusip": None,
+            "figi": None,
+            "field_sources": {},
+            "errors": {},
+        }
+        for ticker in requested
+    }
+    if not requested:
+        return result
+
+    def fetch(columns: tuple[str, ...]):
+        query = Query().select(*columns).set_tickers(*requested)
+        # Exact ticker diagnostics must not inherit Query()'s is_primary=true
+        # default, otherwise secondary German listings can disappear.
+        query.query["filter"] = []
+        return query.limit(max(50, len(requested))).get_scanner_data()
+
+    core_columns = (
+        "name", "description", "exchange", "market", "country", "currency",
+        "type", "typespecs", "is_primary", "active_symbol", "isin",
+    )
+    try:
+        _, frame = fetch(core_columns)
+    except Exception as exc:  # diagnostic path must never break a production run
+        error = f"{type(exc).__name__}: {exc}"
+        for item in result.values():
+            item["errors"]["core"] = error
+        return result
+
+    for record in frame.to_dict(orient="records"):
+        ticker = str(record.get("ticker") or "").strip().upper()
+        if ticker not in result:
+            continue
+        item = result[ticker]
+        item.update({
+            "found": True,
+            "name": record.get("description") or record.get("name"),
+            "exchange": record.get("exchange"),
+            "market": record.get("market"),
+            "country": record.get("country"),
+            "currency": record.get("currency"),
+            "type": record.get("type"),
+            "typespecs": record.get("typespecs"),
+            "is_primary": _bool_or_none(record.get("is_primary")),
+            "active_symbol": _bool_or_none(record.get("active_symbol")),
+            "isin": _text_or_none(record.get("isin")),
+        })
+
+    # Hidden/authorization-dependent identifier fields are intentionally probed
+    # one at a time.  Lowercase matches the existing `isin` field convention;
+    # uppercase is a bounded compatibility fallback if the first spelling is
+    # rejected by the endpoint.
+    for logical, aliases in {"cusip": ("cusip", "CUSIP"), "figi": ("figi", "FIGI")}.items():
+        errors = []
+        success = False
+        for alias in aliases:
+            try:
+                _, extra = fetch(("name", alias))
+            except Exception as exc:
+                errors.append(f"{alias}: {type(exc).__name__}: {exc}")
+                continue
+            success = True
+            for record in extra.to_dict(orient="records"):
+                ticker = str(record.get("ticker") or "").strip().upper()
+                if ticker not in result:
+                    continue
+                value = _text_or_none(record.get(alias))
+                if value:
+                    result[ticker][logical] = value
+                    result[ticker]["field_sources"][logical] = alias
+            break
+        if not success and errors:
+            for item in result.values():
+                item["errors"][logical] = " | ".join(errors)
+    return result
+
+
+def _text_or_none(v):
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    text = str(v).strip()
+    return text.upper() if text else None
+
+
+def _bool_or_none(v):
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    text = str(v).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
 
 def _float(v):
     try:

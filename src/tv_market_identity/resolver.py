@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 
 from .cache import CacheDB
-from .models import Binding, FinnhubIdentity, OpenFigiIdentity, TvRow, YahooQuote
+from .models import Binding, FinnhubIdentity, OpenFigiIdentity, TvRow, YahooQuote, YahooSearchCandidate
 from .policy import (
     CROSS_VENUE_BRIDGES,
     EXCHCODE_SHARE_CLASS_BRIDGES,
@@ -22,10 +22,14 @@ from .policy import (
     TV_PREFIX_ALLOWED_MICS,
     TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES,
     TV_PREFIX_TO_MIC,
+    YAHOO_HOME_EXCHANGE_TO_MIC,
     bounded_symbol_variants,
     currency_compatible,
     finnhub_identity_from_row,
     finnhub_type_compatible,
+    germany_exact_isin_listed_fund_compatible,
+    germany_exact_isin_share_subtype_compatible,
+    germany_exact_isin_stock_type_compatible,
     is_us_tv,
     openfigi_currency,
     openfigi_security_type,
@@ -41,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.44-policy44",)
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -50,6 +54,66 @@ def _telemetry_token(value: str | None) -> str:
         return "UNREPORTED"
     token = re.sub(r"[^A-Z0-9]+", "_", str(value).upper()).strip("_")
     return (token or "EMPTY")[:48]
+
+
+def _yahoo_symbol_identity_keys(symbol: str | None) -> set[str]:
+    """Return bounded ticker keys for a Yahoo search symbol.
+
+    Yahoo home-market symbols usually append one venue suffix (``ORNAV.HE``,
+    ``ALTRA.PA``).  The exact ISIN search supplies the full Yahoo symbol while
+    OpenFIGI normally reports the local ticker without that suffix.  We compare
+    only the full symbol and one rightmost-dot-stripped root after punctuation
+    normalization; no name matching or suffix guessing is performed.
+    """
+    value = str(symbol or "").upper().strip()
+    if not value:
+        return set()
+    keys = {punctuation_key(value)}
+    if "." in value:
+        root, suffix = value.rsplit(".", 1)
+        if root and 1 <= len(suffix) <= 4 and suffix.isalnum():
+            keys.add(punctuation_key(root))
+    return {x for x in keys if x}
+
+
+def _home_market_local_symbol(symbol: str | None, mic: str | None) -> str | None:
+    """Return the exact local exchange symbol for one reviewed Yahoo MIC.
+
+    This is not suffix guessing.  The MIC is first established from the
+    reviewed Yahoo exchange-code map.  If that MIC has a configured Yahoo
+    suffix, the exact suffix must already be present and is stripped once; for
+    suffixless venues the Yahoo symbol itself must contain no dot suffix.
+    """
+    value = str(symbol or "").upper().strip()
+    if not value or not mic:
+        return None
+    suffix = MIC_TO_YAHOO_SUFFIX.get(mic)
+    if suffix:
+        suffix = suffix.upper()
+        if not value.endswith(suffix) or len(value) <= len(suffix):
+            return None
+        return value[:-len(suffix)]
+    if "." in value:
+        return None
+    return value
+
+
+def _home_market_quote_compatible(
+    candidate: YahooSearchCandidate,
+    q: YahooQuote | None,
+) -> bool:
+    """Strict Yahoo contract for exact-ISIN home-market quote routing."""
+    if q is None or q.symbol != candidate.symbol:
+        return False
+    if (candidate.quote_type or "").upper() != "EQUITY":
+        return False
+    if (q.quote_type or "").upper() != "EQUITY":
+        return False
+    if not q.currency or not q.exchange:
+        return False
+    if candidate.exchange and candidate.exchange.upper() != q.exchange.upper():
+        return False
+    return True
 
 
 
@@ -359,6 +423,38 @@ def _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
     return openfigi_type_compatible(row, identity)
 
 
+def _germany_final_equity_like_yahoo_etf_taxonomy_compatible(
+    row: TvRow,
+    target_mic: str,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    identity: OpenFigiIdentity | None,
+) -> bool:
+    """Exact-ISIN-only Yahoo ETF taxonomy anomaly for reviewed equity-like forms.
+
+    This is deliberately narrower than the generic German Yahoo fund-taxonomy
+    exception.  It is used only by the final exact-ISIN rescue after OpenFIGI
+    has already identified a reviewed Unit/Stapled/Dutch-certificate/savings
+    share under one non-null shareClassFIGI.  Yahoo may then disagree only on
+    the *classification* (ETF), while symbol, EUR currency and German venue must
+    explicitly corroborate the target listing.  MUTUALFUND, synthetic YHD,
+    missing venue/currency and any other contradiction remain fail-closed.
+    """
+    if q is None or identity is None:
+        return False
+    if not germany_exact_isin_stock_type_compatible(row, identity):
+        return False
+    if target_mic not in GERMANY_REGIONAL_TARGET_MICS:
+        return False
+    if q.symbol != expected_symbol or (q.quote_type or "").upper() != "ETF":
+        return False
+    if q.currency is None or not currency_compatible(row.currency, q.currency):
+        return False
+    if q.exchange is None and q.full_exchange_name is None:
+        return False
+    return yahoo_venue_compatible(target_mic, q)
+
+
 def _non_us_quote_compatible(row: TvRow, target_mic: str, expected_symbol: str, q: YahooQuote | None, target_only: bool) -> bool:
     """Return whether a Yahoo row satisfies the current non-US evidence contract.
 
@@ -428,6 +524,21 @@ def _non_us_quote_rejection_reason(
         return f"{prefix}VENUE_MISMATCH:{target_mic}->{q.exchange}/{q.full_exchange_name}/{q.market}"
 
     return None
+
+
+def _cached_home_market_quote_compatible(binding: Binding, q: YahooQuote | None) -> bool:
+    """Refresh contract for a persisted exact-ISIN home-market binding."""
+    if q is None or q.symbol != binding.yahoo_symbol:
+        return False
+    if (q.quote_type or "").upper() != "EQUITY":
+        return False
+    if not q.exchange or not q.currency:
+        return False
+    if not binding.yahoo_exchange or q.exchange.upper() != binding.yahoo_exchange.upper():
+        return False
+    if not binding.yahoo_currency or q.currency.upper() != binding.yahoo_currency.upper():
+        return False
+    return True
 
 
 def _cached_non_us_quote_compatible(binding: Binding, q: YahooQuote | None) -> bool:
@@ -2503,6 +2614,18 @@ class BatchResolver:
             if yahoo_failure_rescued_ids:
                 rejected = [b for b in rejected if b.tv_id not in yahoo_failure_rescued_ids]
 
+        final_rescued = self._germany_final_exact_isin_rescue(rows, rejected)
+        if final_rescued:
+            final_ids = {b.tv_id for b in final_rescued}
+            verified.extend(final_rescued)
+            rejected = [b for b in rejected if b.tv_id not in final_ids]
+
+        home_rescued = self._germany_exact_isin_yahoo_home_market_rescue(rows, rejected)
+        if home_rescued:
+            home_ids = {b.tv_id for b in home_rescued}
+            verified.extend(home_rescued)
+            rejected = [b for b in rejected if b.tv_id not in home_ids]
+
         self.stats["reviewed_yahoo_mutualfund_taxonomy_candidates"] += len(reviewed_mutualfund_candidate_ids)
         self.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] += len(reviewed_mutualfund_match_ids)
         for tv_id in sorted(reviewed_mutualfund_candidate_ids - reviewed_mutualfund_match_ids):
@@ -2521,6 +2644,670 @@ class BatchResolver:
                     token = _telemetry_token(value)
                     self.stats[f"reviewed_yahoo_mutualfund_venue_{safe_id}_{field}_{token}"] += 1
         return verified + rejected
+
+
+
+    def _germany_final_exact_isin_rescue(
+        self,
+        rows: list[TvRow],
+        rejected: list[Binding],
+    ) -> list[Binding]:
+        """Last bounded Germany rescue using exact-ISIN regional evidence.
+
+        This pass exists for provider-shape gaps discovered by the full-universe
+        audit, not as a generic relaxation.  It runs only for already-rejected
+        German ``stock/common`` rows with an exact TradingView ISIN and only for
+        the small set of rejection classes where extra exact-ISIN evidence can
+        be decisive.
+
+        OpenFIGI may return several ticker aliases for one exact ISIN + MIC.  A
+        differing alias is a quote-routing ambiguity, not a security ambiguity,
+        when every admissible alias has the same non-null shareClassFIGI.  Yahoo
+        is therefore allowed to select the usable alias after identity has been
+        fixed at the share-class level. Reviewed Unit/Stapled/Dutch-certificate
+        forms and pure listed Closed-End Fund / Mutual Fund identities are accepted
+        only here and only when Yahoo independently confirms a normal EQUITY/EUR
+        German listing. Mixed/private-equity fund taxonomies remain fail-closed.
+        """
+        eligible_reasons = {
+            "OPENFIGI_SOURCE_NO_MATCH",
+            "OPENFIGI_TARGET_NO_MATCH",
+            "YAHOO_NO_MATCH",
+            "YAHOO_TYPE_MISMATCH:ETF",
+            "YAHOO_TYPE_MISMATCH:MUTUALFUND",
+        }
+        eligible_prefixes = {
+            "GETTEX", "LS", "LSX", "TRADEGATE",
+            "FWB", "DUS", "HAM", "SWB", "MUN", "HAN",
+        }
+        rejected_by_id = {b.tv_id: b for b in rejected}
+        candidate_rows = []
+        for r in rows:
+            b = rejected_by_id.get(r.tv_id)
+            if b is None or b.rejection_reason not in eligible_reasons:
+                continue
+            kind = tv_type_kind(r)
+            if r.prefix not in eligible_prefixes or not r.isin or kind not in {"STOCK", "PREFERRED"}:
+                continue
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if kind == "STOCK" and "common" not in specs:
+                continue
+            if kind == "PREFERRED" and "preferred" not in specs:
+                continue
+            candidate_rows.append(r)
+
+        if not candidate_rows:
+            return []
+
+        self.stats["germany_final_exact_isin_rescue_rows"] += len(candidate_rows)
+
+        source_mics_by_id: dict[str, tuple[str, ...]] = {}
+        probe_keys: list[tuple[str, str]] = []
+        seen_probe_keys: set[tuple[str, str]] = set()
+        for r in candidate_rows:
+            source_mics: list[str] = []
+            direct = TV_PREFIX_TO_MIC.get(r.prefix)
+            if direct:
+                source_mics.append(direct)
+            bridge = ISIN_SHARE_CLASS_BRIDGES.get(r.prefix)
+            if bridge:
+                source_mics.extend(str(x) for x in bridge.get("source_mics", ()))
+            cross = CROSS_VENUE_BRIDGES.get(r.prefix)
+            if cross:
+                source_mics.extend(str(x) for x in cross.get("source_mics", ()))
+            source_mics = list(dict.fromkeys(x for x in source_mics if x))
+            source_mics_by_id[r.tv_id] = tuple(source_mics)
+            for mic in [*source_mics, *GERMANY_REGIONAL_TARGET_MICS]:
+                key = ((r.isin or "").upper().strip(), mic)
+                if key in seen_probe_keys:
+                    continue
+                seen_probe_keys.add(key)
+                probe_keys.append(key)
+
+        jobs = [
+            {"idType": "ID_ISIN", "idValue": isin, "micCode": mic}
+            for isin, mic in probe_keys
+        ]
+        try:
+            mapped = self.openfigi.map_jobs(jobs) if jobs else []
+            self.stats["openfigi_jobs"] += len(jobs)
+            self.stats["openfigi_germany_final_rescue_jobs"] += len(jobs)
+            self.stats["openfigi_http_batches"] += (
+                (len(jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                if jobs else 0
+            )
+        except ProviderError:
+            mapped = [[] for _ in jobs]
+            self.stats["openfigi_germany_final_rescue_unavailable"] += len(jobs)
+
+        raw_by_key: dict[tuple[str, str], list[OpenFigiIdentity]] = {
+            key: identities for key, identities in zip(probe_keys, mapped)
+        }
+
+        def identity_allowed(r: TvRow, x: OpenFigiIdentity) -> tuple[bool, str | None]:
+            if openfigi_type_compatible(r, x):
+                return True, None
+            if germany_exact_isin_stock_type_compatible(r, x):
+                return True, "EQUITY_LIKE"
+            if germany_exact_isin_share_subtype_compatible(r, x):
+                return True, "SHARE_SUBTYPE"
+            if germany_exact_isin_listed_fund_compatible(r, x):
+                return True, "LISTED_FUND"
+            return False, None
+
+        # Stage every regional alias that has exact ISIN + non-null share class.
+        staged_by_row: dict[str, list[tuple[str, str, OpenFigiIdentity, str | None]]] = defaultdict(list)
+        symbols: list[str] = []
+        for r in candidate_rows:
+            isin_key = (r.isin or "").upper().strip()
+            for mic in GERMANY_REGIONAL_TARGET_MICS:
+                identities = raw_by_key.get((isin_key, mic), ())
+                for x in identities:
+                    allowed, reviewed_kind = identity_allowed(r, x)
+                    if not allowed or not x.share_class_figi or not x.ticker:
+                        continue
+                    symbol = yahoo_listing_symbol(x.ticker, mic, r.prefix, tv_type_kind(r))
+                    staged_by_row[r.tv_id].append((mic, symbol, x, reviewed_kind))
+                    symbols.append(symbol)
+                    if reviewed_kind == "EQUITY_LIKE":
+                        self.stats["openfigi_germany_final_rescue_taxonomy_candidates"] += 1
+                    elif reviewed_kind == "SHARE_SUBTYPE":
+                        self.stats["openfigi_germany_final_rescue_share_subtype_candidates"] += 1
+                    elif reviewed_kind == "LISTED_FUND":
+                        self.stats["openfigi_germany_final_rescue_listed_fund_candidates"] += 1
+
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+            if symbols:
+                batch_size = max(1, int(getattr(self.yahoo, "batch_size", 75)))
+                self.stats["yahoo_germany_final_rescue_candidates"] += len(symbols)
+                self.stats["yahoo_germany_final_rescue_batches"] += (
+                    len(dict.fromkeys(symbols)) + batch_size - 1
+                ) // batch_size
+        except ProviderError:
+            quotes = {}
+            self.stats["yahoo_germany_final_rescue_unavailable"] += len(symbols)
+
+        priority = {mic: i for i, mic in enumerate(GERMANY_REGIONAL_TARGET_MICS)}
+        rescued: list[Binding] = []
+        for r in candidate_rows:
+            target_valid: list[tuple[str, str, OpenFigiIdentity, YahooQuote, str | None, bool]] = []
+            for mic, symbol, x, reviewed_kind in staged_by_row.get(r.tv_id, ()):
+                q = quotes.get(symbol)
+                regular_ok = _non_us_quote_compatible(r, mic, symbol, q, False)
+                yahoo_taxonomy_ok = _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
+                    r, mic, symbol, q, x, "GERMANY_FINAL_EXACT_ISIN_RESCUE"
+                )
+                equity_like_yahoo_etf_ok = (
+                    reviewed_kind == "EQUITY_LIKE"
+                    and _germany_final_equity_like_yahoo_etf_taxonomy_compatible(
+                        r, mic, symbol, q, x
+                    )
+                )
+                if (reviewed_kind == "EQUITY_LIKE" and q is not None
+                        and (q.quote_type or "").upper() == "ETF"):
+                    self.stats["germany_final_exact_isin_rescue_yahoo_etf_taxonomy_candidates"] += 1
+                # Reviewed OpenFIGI taxonomy normally requires Yahoo's ordinary
+                # EQUITY contract.  The only stacked exception is the exact-ISIN
+                # equity-like + explicit EUR/German-venue + Yahoo ETF anomaly
+                # above; MUTUALFUND/YHD/missing metadata remain fail-closed.
+                if reviewed_kind and not (regular_ok or equity_like_yahoo_etf_ok):
+                    continue
+                if regular_ok or yahoo_taxonomy_ok or equity_like_yahoo_etf_ok:
+                    target_valid.append((
+                        mic, symbol, x, q, reviewed_kind,
+                        yahoo_taxonomy_ok and not regular_ok,
+                        equity_like_yahoo_etf_ok and not regular_ok,
+                    ))
+
+            if not target_valid:
+                self.stats["germany_final_exact_isin_rescue_no_yahoo_target"] += 1
+                continue
+
+            target_shares = {x.share_class_figi for _, _, x, _, _, _, _ in target_valid if x.share_class_figi}
+            if len(target_shares) != 1:
+                self.stats["germany_final_exact_isin_rescue_target_share_ambiguous"] += 1
+                continue
+            share = next(iter(target_shares))
+
+            # Listed-fund rescue is intentionally limited to a pure reviewed
+            # Closed-End Fund / Mutual Fund taxonomy for this exact share class.
+            # If OpenFIGI also labels the same ISIN/share class as another fund
+            # family (for example Pvt Eqty Fund), keep the row fail-closed.
+            if any(reviewed_kind == "LISTED_FUND" for _, _, _, _, reviewed_kind, _, _ in target_valid):
+                conflicting_fund_taxonomy = False
+                rescue_isin = (r.isin or "").upper().strip()
+                for mic in [*source_mics_by_id.get(r.tv_id, ()), *GERMANY_REGIONAL_TARGET_MICS]:
+                    for x in raw_by_key.get((rescue_isin, mic), ()):
+                        if x.share_class_figi != share:
+                            continue
+                        t2 = (x.security_type2 or "").strip().lower()
+                        if t2 == "mutual fund" and not germany_exact_isin_listed_fund_compatible(r, x):
+                            conflicting_fund_taxonomy = True
+                            break
+                    if conflicting_fund_taxonomy:
+                        break
+                if conflicting_fund_taxonomy:
+                    self.stats["germany_final_exact_isin_rescue_listed_fund_taxonomy_conflict"] += 1
+                    continue
+
+            # If exact-ISIN source evidence exists, it must corroborate the same
+            # single share class.  Absence is allowed by the existing one-sided
+            # German exact-ISIN contract; conflicting evidence is not.
+            isin_key = (r.isin or "").upper().strip()
+            source_entries: list[tuple[str, OpenFigiIdentity, str | None]] = []
+            for mic in source_mics_by_id.get(r.tv_id, ()):
+                for x in raw_by_key.get((isin_key, mic), ()):
+                    allowed, reviewed_kind = identity_allowed(r, x)
+                    if allowed and x.share_class_figi:
+                        source_entries.append((mic, x, reviewed_kind))
+            source_shares = {x.share_class_figi for _, x, _ in source_entries if x.share_class_figi}
+            if len(source_shares) > 1 or (source_shares and source_shares != {share}):
+                self.stats["germany_final_exact_isin_rescue_source_share_conflict"] += 1
+                continue
+
+            # Different OpenFIGI ticker aliases under one exact ISIN/MIC and the
+            # same shareClassFIGI are quote aliases, not distinct identities.
+            # Choose deterministically only after Yahoo has validated them.
+            chosen = min(
+                target_valid,
+                key=lambda t: (
+                    priority.get(t[0], len(priority)),
+                    t[1],
+                    punctuation_key(t[2].ticker or ""),
+                ),
+            )
+            target_mic, yahoo_symbol, target_of, q, reviewed_kind, yahoo_taxonomy, equity_like_yahoo_etf = chosen
+
+            matching_source = [entry for entry in source_entries if entry[1].share_class_figi == share]
+            source_mics = source_mics_by_id.get(r.tv_id, ())
+            source_mic: str | None = None
+            source_venue_code: str | None = None
+            if len(matching_source) == 1:
+                source_mic, source_of, _ = matching_source[0]
+            else:
+                if matching_source:
+                    source_mic_set = {mic for mic, _, _ in matching_source}
+                    source_mic = next(iter(source_mic_set)) if len(source_mic_set) == 1 else None
+                elif len(source_mics) == 1:
+                    source_mic = source_mics[0]
+                if source_mic is None:
+                    source_venue_code = r.prefix
+                source_of = OpenFigiIdentity(
+                    figi=None,
+                    composite_figi=None,
+                    share_class_figi=share,
+                    ticker=r.symbol,
+                    name=r.name or target_of.name,
+                    security_type=target_of.security_type,
+                    security_type2=target_of.security_type2,
+                    exch_code=None,
+                )
+
+            method = "GERMANY_FINAL_EXACT_ISIN_RESCUE"
+            if reviewed_kind:
+                method += f"_{reviewed_kind}"
+            if yahoo_taxonomy:
+                method += "_YAHOO_TAXONOMY"
+            if equity_like_yahoo_etf:
+                method += "_YAHOO_ETF_TAXONOMY"
+
+            binding = self._verified(
+                r,
+                None,
+                target_of,
+                q,
+                target_mic,
+                source_mic=source_mic,
+                target_mic=target_mic,
+                source_venue_code=source_venue_code,
+                mapping_method=method,
+                source_of=source_of,
+                target_of=target_of,
+            )
+            rescued.append(binding)
+            self.stats["germany_final_exact_isin_rescue_matches"] += 1
+            self.stats[f"germany_final_exact_isin_rescue_matches_{_telemetry_token(r.prefix)}"] += 1
+            self.stats[f"germany_final_exact_isin_rescue_matches_{_telemetry_token(target_mic)}"] += 1
+            if reviewed_kind == "EQUITY_LIKE":
+                self.stats["germany_final_exact_isin_rescue_taxonomy_matches"] += 1
+            elif reviewed_kind == "SHARE_SUBTYPE":
+                self.stats["germany_final_exact_isin_rescue_share_subtype_matches"] += 1
+            elif reviewed_kind == "LISTED_FUND":
+                self.stats["germany_final_exact_isin_rescue_listed_fund_matches"] += 1
+            if yahoo_taxonomy:
+                self.stats["germany_final_exact_isin_rescue_yahoo_taxonomy_matches"] += 1
+            if equity_like_yahoo_etf:
+                self.stats["germany_final_exact_isin_rescue_yahoo_etf_taxonomy_matches"] += 1
+
+        return rescued
+
+
+    def _germany_exact_isin_yahoo_home_market_rescue(
+        self,
+        rows: list[TvRow],
+        rejected: list[Binding],
+    ) -> list[Binding]:
+        """Resolve a rejected German source row to Yahoo's home-market listing.
+
+        This path deliberately changes quote routing, not security identity.
+        TradingView's exact ISIN is resolved unscoped at OpenFIGI; admission
+        requires exactly one observed non-null shareClassFIGI across compatible identities; rows where OpenFIGI omits that field are non-evidence rather than contradictions.
+        Yahoo is queried with that exact ISIN only.  A search candidate must be
+        an EQUITY. Its route must either occur directly in the unscoped exact-ISIN
+        evidence, or be independently re-proven by exact ID_ISIN + reviewed home
+        MIC with the same shareClassFIGI. ID_EXCH_SYMBOL + home MIC is retained only
+        as a secondary fallback when the targeted ISIN mapping is absent.
+        Quote/chart metadata must explicitly report the same Yahoo exchange plus
+        a currency and EQUITY type.  TradingView Germany EUR is intentionally not
+        compared with the home-market quote currency.
+
+        Multiple simultaneously-valid Yahoo symbols remain fail-closed because
+        choosing a preferred home listing would otherwise require a new routing
+        policy beyond the identity evidence available here.
+        """
+        eligible_reasons = {
+            "OPENFIGI_SOURCE_NO_MATCH",
+            "OPENFIGI_TARGET_NO_MATCH",
+            "YAHOO_NO_MATCH",
+            "YAHOO_TYPE_MISMATCH:MUTUALFUND",
+        }
+        eligible_prefixes = {
+            "XETR", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN",
+            "GETTEX", "LS", "LSX", "TRADEGATE",
+        }
+        rejected_by_id = {b.tv_id: b for b in rejected}
+        candidate_rows: list[TvRow] = []
+        for r in rows:
+            b = rejected_by_id.get(r.tv_id)
+            if b is None or b.rejection_reason not in eligible_reasons:
+                continue
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if (r.prefix not in eligible_prefixes or not r.isin
+                    or tv_type_kind(r) != "STOCK" or "common" not in specs):
+                continue
+            candidate_rows.append(r)
+        if not candidate_rows:
+            return []
+
+        self.stats["yahoo_home_market_rescue_rows"] += len(candidate_rows)
+
+        # v0.3.52-style security grouping: one unscoped OpenFIGI request per ISIN.
+        rows_by_isin: dict[str, list[TvRow]] = defaultdict(list)
+        isin_order: list[str] = []
+        for r in candidate_rows:
+            isin = (r.isin or "").upper().strip()
+            if isin not in rows_by_isin:
+                isin_order.append(isin)
+            rows_by_isin[isin].append(r)
+        jobs = [{"idType": "ID_ISIN", "idValue": isin} for isin in isin_order]
+        try:
+            mapped = self.openfigi.map_jobs(jobs) if jobs else []
+            self.stats["openfigi_jobs"] += len(jobs)
+            self.stats["openfigi_home_market_unscoped_jobs"] += len(jobs)
+            self.stats["openfigi_home_market_grouping_saved_jobs"] += len(candidate_rows) - len(jobs)
+            self.stats["openfigi_http_batches"] += (
+                (len(jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                if jobs else 0
+            )
+        except ProviderError:
+            mapped = [[] for _ in jobs]
+            self.stats["openfigi_home_market_unavailable"] += len(jobs)
+        identities_by_isin = {isin: identities for isin, identities in zip(isin_order, mapped)}
+
+        evidence_by_row: dict[str, tuple[str, list[OpenFigiIdentity]]] = {}
+        searchable_isins: set[str] = set()
+        for r in candidate_rows:
+            isin = (r.isin or "").upper().strip()
+            compatible = [x for x in identities_by_isin.get(isin, ()) if openfigi_type_compatible(r, x)]
+            if not compatible:
+                self.stats["openfigi_home_market_no_compatible_identity"] += 1
+                continue
+            # OpenFIGI often omits shareClassFIGI on some venue rows for the
+            # same exact ISIN. Missing provider metadata is not contradictory
+            # evidence: require exactly one *observed* non-null share class,
+            # then later require the Yahoo ticker to match an OpenFIGI row that
+            # explicitly carries that same shareClassFIGI. Rows with a missing
+            # share class can therefore neither prove nor select a candidate.
+            shares = {x.share_class_figi for x in compatible if x.share_class_figi}
+            if not shares:
+                self.stats["openfigi_home_market_share_class_missing"] += 1
+                continue
+            if len(shares) != 1:
+                self.stats["openfigi_home_market_share_class_ambiguous"] += 1
+                continue
+            if any(not x.share_class_figi for x in compatible):
+                self.stats["openfigi_home_market_partial_share_class_accepted"] += 1
+            share = next(iter(shares))
+            evidence_by_row[r.tv_id] = (share, compatible)
+            searchable_isins.add(isin)
+
+        if not searchable_isins:
+            return []
+
+        search_by_isin: dict[str, list[YahooSearchCandidate]] = {}
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not callable(search_fn):
+            self.stats["yahoo_home_market_search_unsupported"] += len(searchable_isins)
+            return []
+        for isin in sorted(searchable_isins):
+            try:
+                search_by_isin[isin] = list(search_fn(isin))
+                self.stats["yahoo_home_market_search_jobs"] += 1
+                self.stats["yahoo_home_market_search_candidates"] += len(search_by_isin[isin])
+            except ProviderError:
+                search_by_isin[isin] = []
+                self.stats["yahoo_home_market_search_unavailable"] += 1
+
+        staged_by_row: dict[str, list[tuple[YahooSearchCandidate, OpenFigiIdentity]]] = defaultdict(list)
+        symbols: list[str] = []
+        # Candidates absent from the unscoped ID_ISIN ticker rows are first
+        # confirmed at the *listing* layer using the strongest available
+        # primitive: the same exact ISIN filtered to the reviewed Yahoo home
+        # MIC.  The response must carry the independently established
+        # shareClassFIGI.  This avoids requiring provider ticker syntax to be
+        # identical across Yahoo and OpenFIGI.
+        #
+        # Only if OpenFIGI has no exact-ISIN+MIC row do we retain the v0.3.61
+        # exchange-symbol confirmation as a secondary proof path.
+        isin_mic_layout: list[tuple[TvRow, YahooSearchCandidate, str, str, str, int]] = []
+        isin_mic_jobs: list[dict] = []
+        isin_mic_job_index: dict[tuple[str, str], int] = {}
+        for r in candidate_rows:
+            evidence = evidence_by_row.get(r.tv_id)
+            if evidence is None:
+                continue
+            share, compatible = evidence
+            isin = (r.isin or "").upper().strip()
+            for candidate in search_by_isin.get(isin, ()):
+                if (candidate.quote_type or "").upper() != "EQUITY":
+                    self.stats["yahoo_home_market_search_non_equity"] += 1
+                    continue
+                keys = _yahoo_symbol_identity_keys(candidate.symbol)
+                matched = [
+                    x for x in compatible
+                    if x.share_class_figi == share
+                    and x.ticker
+                    and punctuation_key(x.ticker) in keys
+                ]
+                if matched:
+                    staged_by_row[r.tv_id].append((candidate, matched[0]))
+                    symbols.append(candidate.symbol)
+                    continue
+
+                home_mic = YAHOO_HOME_EXCHANGE_TO_MIC.get((candidate.exchange or "").upper())
+                local_symbol = _home_market_local_symbol(candidate.symbol, home_mic)
+                if not home_mic or not local_symbol:
+                    self.stats["yahoo_home_market_search_ticker_unconfirmed"] += 1
+                    continue
+                key = (isin, home_mic)
+                offset = isin_mic_job_index.get(key)
+                if offset is None:
+                    offset = len(isin_mic_jobs)
+                    isin_mic_job_index[key] = offset
+                    isin_mic_jobs.append({
+                        "idType": "ID_ISIN",
+                        "idValue": isin,
+                        "micCode": home_mic,
+                    })
+                isin_mic_layout.append((r, candidate, share, home_mic, local_symbol, offset))
+
+        isin_mic_mapped: list[list[OpenFigiIdentity]] = []
+        if isin_mic_jobs:
+            try:
+                isin_mic_mapped = self.openfigi.map_jobs(isin_mic_jobs)
+                self.stats["openfigi_jobs"] += len(isin_mic_jobs)
+                self.stats["openfigi_home_market_isin_mic_confirmation_jobs"] += len(isin_mic_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(isin_mic_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError:
+                isin_mic_mapped = [[] for _ in isin_mic_jobs]
+                self.stats["openfigi_home_market_isin_mic_confirmation_unavailable"] += len(isin_mic_jobs)
+
+        # Only candidates for which exact ISIN + home MIC did not return
+        # contradictory share-class evidence are eligible for the older
+        # exchange-symbol proof fallback.
+        symbol_fallback_layout: list[tuple[TvRow, YahooSearchCandidate, str, str, str]] = []
+        for r, candidate, share, home_mic, local_symbol, offset in isin_mic_layout:
+            identities = isin_mic_mapped[offset] if offset < len(isin_mic_mapped) else []
+            type_compatible = [x for x in identities if openfigi_type_compatible(r, x)]
+            conflicting_shares = {
+                x.share_class_figi for x in type_compatible
+                if x.share_class_figi and x.share_class_figi != share
+            }
+            if conflicting_shares:
+                self.stats["openfigi_home_market_isin_mic_confirmation_share_conflict"] += 1
+                self.stats["yahoo_home_market_search_ticker_unconfirmed"] += 1
+                continue
+            confirmed = [
+                x for x in type_compatible
+                if x.share_class_figi == share
+            ]
+            if confirmed:
+                staged_by_row[r.tv_id].append((candidate, confirmed[0]))
+                symbols.append(candidate.symbol)
+                self.stats["openfigi_home_market_isin_mic_confirmation_matches"] += 1
+                self.stats[f"openfigi_home_market_isin_mic_confirmation_matches_{_telemetry_token(home_mic)}"] += 1
+                continue
+            self.stats["openfigi_home_market_isin_mic_confirmation_no_match"] += 1
+            symbol_fallback_layout.append((r, candidate, share, home_mic, local_symbol))
+
+        venue_proof_layout: list[tuple[TvRow, YahooSearchCandidate, str, str, str, int]] = []
+        venue_proof_jobs: list[dict] = []
+        venue_proof_job_index: dict[tuple[str, str], int] = {}
+        for r, candidate, share, home_mic, local_symbol in symbol_fallback_layout:
+            key = (home_mic, local_symbol)
+            offset = venue_proof_job_index.get(key)
+            if offset is None:
+                offset = len(venue_proof_jobs)
+                venue_proof_job_index[key] = offset
+                venue_proof_jobs.append({
+                    "idType": "ID_EXCH_SYMBOL",
+                    "idValue": local_symbol,
+                    "micCode": home_mic,
+                })
+            venue_proof_layout.append((r, candidate, share, home_mic, local_symbol, offset))
+
+        venue_proof_mapped: list[list[OpenFigiIdentity]] = []
+        if venue_proof_jobs:
+            try:
+                venue_proof_mapped = self.openfigi.map_jobs(venue_proof_jobs)
+                self.stats["openfigi_jobs"] += len(venue_proof_jobs)
+                self.stats["openfigi_home_market_symbol_confirmation_jobs"] += len(venue_proof_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(venue_proof_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError:
+                venue_proof_mapped = [[] for _ in venue_proof_jobs]
+                self.stats["openfigi_home_market_symbol_confirmation_unavailable"] += len(venue_proof_jobs)
+
+        for r, candidate, share, home_mic, local_symbol, offset in venue_proof_layout:
+            identities = venue_proof_mapped[offset] if offset < len(venue_proof_mapped) else []
+            compatible = [
+                x for x in identities
+                if openfigi_type_compatible(r, x)
+                and x.share_class_figi == share
+                and x.ticker
+                and punctuation_key(x.ticker) == punctuation_key(local_symbol)
+            ]
+            conflicting_shares = {
+                x.share_class_figi for x in identities
+                if x.share_class_figi and x.share_class_figi != share
+                and x.ticker and punctuation_key(x.ticker) == punctuation_key(local_symbol)
+            }
+            if conflicting_shares:
+                self.stats["openfigi_home_market_symbol_confirmation_share_conflict"] += 1
+                self.stats["yahoo_home_market_search_ticker_unconfirmed"] += 1
+                continue
+            if not compatible:
+                self.stats["openfigi_home_market_symbol_confirmation_no_match"] += 1
+                self.stats["yahoo_home_market_search_ticker_unconfirmed"] += 1
+                continue
+            staged_by_row[r.tv_id].append((candidate, compatible[0]))
+            symbols.append(candidate.symbol)
+            self.stats["openfigi_home_market_symbol_confirmation_matches"] += 1
+            self.stats[f"openfigi_home_market_symbol_confirmation_matches_{_telemetry_token(home_mic)}"] += 1
+
+        symbols = list(dict.fromkeys(symbols))
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+            if symbols:
+                self.stats["yahoo_home_market_quote_candidates"] += len(symbols)
+                batch_size = max(1, int(getattr(self.yahoo, "batch_size", 75)))
+                self.stats["yahoo_home_market_quote_batches"] += (len(symbols) + batch_size - 1) // batch_size
+        except ProviderError:
+            quotes = {}
+            self.stats["yahoo_home_market_quote_unavailable"] += len(symbols)
+
+        chart_needed: list[str] = []
+        candidate_by_symbol: dict[str, YahooSearchCandidate] = {}
+        for records in staged_by_row.values():
+            for candidate, _ in records:
+                candidate_by_symbol.setdefault(candidate.symbol, candidate)
+                q = quotes.get(candidate.symbol)
+                # Explicit type/exchange contradictions are not overridable by
+                # chart metadata. Chart is only a missing/incomplete-row fallback.
+                contradiction = bool(
+                    q is not None and (
+                        (q.quote_type is not None and (q.quote_type or "").upper() != "EQUITY")
+                        or (candidate.exchange and q.exchange
+                            and candidate.exchange.upper() != q.exchange.upper())
+                    )
+                )
+                if not contradiction and not _home_market_quote_compatible(candidate, q):
+                    chart_needed.append(candidate.symbol)
+        chart_quotes: dict[str, YahooQuote] = {}
+        if chart_needed and hasattr(self.yahoo, "chart_quotes"):
+            unique_chart = list(dict.fromkeys(chart_needed))
+            chart_quotes = self.yahoo.chart_quotes(unique_chart)
+            self.stats["yahoo_home_market_chart_jobs"] += len(unique_chart)
+            self.stats["yahoo_home_market_chart_rows"] += len(chart_quotes)
+
+        rescued: list[Binding] = []
+        for r in candidate_rows:
+            evidence = evidence_by_row.get(r.tv_id)
+            if evidence is None:
+                continue
+            share, compatible = evidence
+            valid: list[tuple[YahooSearchCandidate, OpenFigiIdentity, YahooQuote]] = []
+            for candidate, identity in staged_by_row.get(r.tv_id, ()):
+                q = quotes.get(candidate.symbol)
+                explicit_contradiction = bool(
+                    q is not None and (
+                        (q.quote_type is not None and (q.quote_type or "").upper() != "EQUITY")
+                        or (candidate.exchange and q.exchange
+                            and candidate.exchange.upper() != q.exchange.upper())
+                    )
+                )
+                if not _home_market_quote_compatible(candidate, q) and not explicit_contradiction:
+                    cq = chart_quotes.get(candidate.symbol)
+                    if _home_market_quote_compatible(candidate, cq):
+                        q = cq
+                        self.stats["yahoo_home_market_chart_matches"] += 1
+                if _home_market_quote_compatible(candidate, q):
+                    valid.append((candidate, identity, q))
+            # Deduplicate repeated search rows but do not choose among distinct
+            # simultaneously-valid Yahoo routes without an explicit preference rule.
+            by_symbol = {candidate.symbol: (candidate, identity, q) for candidate, identity, q in valid}
+            if not by_symbol:
+                self.stats["yahoo_home_market_no_valid_quote"] += 1
+                continue
+            if len(by_symbol) != 1:
+                self.stats["yahoo_home_market_route_ambiguous"] += 1
+                continue
+            candidate, matched_identity, q = next(iter(by_symbol.values()))
+
+            security_of = OpenFigiIdentity(
+                figi=None,
+                composite_figi=None,
+                share_class_figi=share,
+                ticker=matched_identity.ticker,
+                name=matched_identity.name or r.name,
+                security_type=matched_identity.security_type,
+                security_type2=matched_identity.security_type2,
+                exch_code=None,
+            )
+            binding = self._verified(
+                r,
+                None,
+                security_of,
+                q,
+                None,
+                source_mic=None,
+                target_mic=None,
+                source_venue_code=r.prefix,
+                mapping_method="YAHOO_EXACT_ISIN_HOME_MARKET",
+                source_of=security_of,
+                target_of=security_of,
+            )
+            rescued.append(binding)
+            self.stats["yahoo_home_market_rescue_matches"] += 1
+            self.stats[f"yahoo_home_market_rescue_matches_{_telemetry_token(r.prefix)}"] += 1
+            self.stats[f"yahoo_home_market_rescue_exchange_{_telemetry_token(q.exchange)}"] += 1
+            self.stats[f"yahoo_home_market_rescue_currency_{_telemetry_token(q.currency)}"] += 1
+
+        return rescued
 
 
     def refresh_cached_quotes(self, bindings: dict[str, Binding]) -> None:
@@ -2551,7 +3338,21 @@ class BatchResolver:
         for b in rows_by_id.values():
             if b.status != "VERIFIED" or not b.cache_hit or not b.yahoo_symbol or b.finnhub_symbol is not None:
                 continue
-            if not _cached_non_us_quote_compatible(b, quotes.get(b.yahoo_symbol)):
+            q0 = quotes.get(b.yahoo_symbol)
+            if b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET":
+                if not _cached_home_market_quote_compatible(b, q0):
+                    # A changed explicit exchange/currency/type is a runtime
+                    # contradiction, not a chart-fallback case.
+                    contradiction = bool(q0 is not None and (
+                        (q0.quote_type is not None and (q0.quote_type or "").upper() != "EQUITY")
+                        or (q0.exchange and b.yahoo_exchange
+                            and q0.exchange.upper() != b.yahoo_exchange.upper())
+                        or (q0.currency and b.yahoo_currency
+                            and q0.currency.upper() != b.yahoo_currency.upper())
+                    ))
+                    if not contradiction:
+                        chart_needed.add(b.yahoo_symbol)
+            elif not _cached_non_us_quote_compatible(b, q0):
                 chart_needed.add(b.yahoo_symbol)
         chart_quotes: dict[str, YahooQuote] = {}
         if chart_needed and hasattr(self.yahoo, "chart_quotes"):
@@ -2566,12 +3367,36 @@ class BatchResolver:
             q = quotes.get(b.yahoo_symbol)
             if b.finnhub_symbol is None:
                 cq = chart_quotes.get(b.yahoo_symbol)
-                if not _cached_non_us_quote_compatible(b, q) and _cached_non_us_quote_compatible(b, cq):
+                if b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET":
+                    if not _cached_home_market_quote_compatible(b, q) and _cached_home_market_quote_compatible(b, cq):
+                        q = cq
+                        self.stats["yahoo_chart_refresh_matches"] += 1
+                elif not _cached_non_us_quote_compatible(b, q) and _cached_non_us_quote_compatible(b, cq):
                     q = cq
                     self.stats["yahoo_chart_refresh_matches"] += 1
             if q is None:
                 b.quote_status = "UNAVAILABLE"
                 b.yahoo_price = None
+                continue
+            if b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET":
+                if not _cached_home_market_quote_compatible(b, q):
+                    b.status = "REJECTED"
+                    b.rejection_reason = f"YAHOO_RUNTIME_HOME_MARKET_MISMATCH:{q.exchange}/{q.currency}/{q.quote_type}"
+                    b.quote_status = "MISMATCH"
+                    b.yahoo_price = None
+                    now = int(time.time())
+                    b.validated_at = now
+                    b.expires_at = now + self.rejected_ttl
+                    b.cache_hit = False
+                    invalidated.append(b)
+                    continue
+                b.yahoo_exchange = q.exchange
+                b.yahoo_market = q.market
+                b.yahoo_quote_type = q.quote_type
+                b.yahoo_currency = q.currency
+                b.yahoo_price = q.price
+                b.yahoo_delayed_by = q.delayed_by
+                b.quote_status = "UNAVAILABLE" if q.price is None else "FRESH"
                 continue
             # Cached identity has no TvRow object, so validate against the exact
             # cached currency/type/MIC contract rather than re-running discovery.

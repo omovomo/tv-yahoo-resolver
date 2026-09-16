@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import time
+import re
 from collections import defaultdict
 from typing import Iterable
 from urllib.parse import quote
 
 import requests
 
-from .models import OpenFigiIdentity, YahooQuote
+from .models import OpenFigiIdentity, YahooQuote, YahooSearchCandidate
 
 
 class ProviderError(RuntimeError):
@@ -161,6 +162,7 @@ class OpenFigiProvider:
 
 class YahooProvider:
     URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+    SEARCH_URL = "https://query2.finance.yahoo.com/v1/finance/search"
 
     def __init__(self, batch_size: int = 75):
         self.batch_size = batch_size
@@ -170,6 +172,7 @@ class YahooProvider:
             raise ProviderError("yfinance is not installed; run pip install -e .") from exc
         self.data = YfData()
         self._run_quote_memo: dict[str, YahooQuote] = {}
+        self._run_search_memo: dict[str, tuple[YahooSearchCandidate, ...]] = {}
         self.metrics = defaultdict(int)
 
     def reset_run_cache(self) -> None:
@@ -181,7 +184,70 @@ class YahooProvider:
         resolver.
         """
         self._run_quote_memo.clear()
+        if hasattr(self, "_run_search_memo"):
+            self._run_search_memo.clear()
+        else:
+            self._run_search_memo = {}
         self.metrics.clear()
+
+    def search_exact_isin(self, isin: str, max_results: int = 10) -> list[YahooSearchCandidate]:
+        """Search Yahoo using one exact ISIN query and no fuzzy/name fallback.
+
+        Yahoo search is only a discovery mechanism here.  A returned symbol is
+        never identity evidence by itself; the resolver independently binds it
+        back to the same exact ISIN/shareClassFIGI through OpenFIGI and then
+        validates Yahoo quote/chart metadata.
+        """
+        token = str(isin or "").strip().upper()
+        if not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}[0-9]", token):
+            return []
+        if not hasattr(self, "_run_search_memo"):
+            self._run_search_memo = {}
+        if not hasattr(self, "metrics"):
+            self.metrics = defaultdict(int)
+        cached = self._run_search_memo.get(token)
+        if cached is not None:
+            self.metrics["search_memo_hits"] += 1
+            return list(cached)
+
+        self.metrics["search_queries"] += 1
+        try:
+            raw = self.data.get_raw_json(
+                self.SEARCH_URL,
+                params={
+                    "q": token,
+                    "quotesCount": max(1, int(max_results)),
+                    "newsCount": 0,
+                    "listsCount": 0,
+                    "enableFuzzyQuery": "false",
+                    "enableNavLinks": "false",
+                    "enableCb": "false",
+                },
+                timeout=25,
+            )
+        except Exception as exc:
+            raise ProviderError(f"Yahoo exact-ISIN search failed for {token}: {exc}") from exc
+
+        out: list[YahooSearchCandidate] = []
+        seen: set[str] = set()
+        for row in raw.get("quotes") or []:
+            symbol = _nullable_text(row.get("symbol"))
+            if not symbol:
+                continue
+            symbol = symbol.upper()
+            if symbol in seen:
+                continue
+            seen.add(symbol)
+            out.append(YahooSearchCandidate(
+                symbol=symbol,
+                exchange=_nullable_text(row.get("exchange")),
+                quote_type=_nullable_text(row.get("quoteType")),
+                short_name=_nullable_text(row.get("shortname") or row.get("shortName")),
+                long_name=_nullable_text(row.get("longname") or row.get("longName")),
+            ))
+        self.metrics["search_returned_candidates"] += len(out)
+        self._run_search_memo[token] = tuple(out)
+        return list(out)
 
     def quotes(self, symbols: Iterable[str]) -> dict[str, YahooQuote]:
         requested = [s for s in symbols if s]

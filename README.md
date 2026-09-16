@@ -1,4 +1,307 @@
-# TV Market Identity Prototype v0.3.49
+# TV Market Identity Prototype v0.3.63
+
+## v0.3.63 — stale-listing / corporate-action diagnostics
+
+Diagnostic-only release. Admission remains `0.3.62-policy62`; no resolver policy
+is relaxed and the existing VERIFIED cache remains valid.
+
+The v0.3.62 residual audit showed that both targeted home-market OpenFIGI proof
+paths (`ID_ISIN + micCode` and `ID_EXCH_SYMBOL + micCode`) return no mapping for
+the remaining ARX/OPTT/DAL candidates. More importantly, several
+`SHARE_CLASS_MISSING` rejects carry identifiers that became stale after recent
+reverse splits/share consolidations. Such rows must not be admitted merely
+because the issuer/ticker looks familiar.
+
+v0.3.63 therefore adds evidence only:
+
+- `active_symbol` is included in the ordinary TradingView snapshot and `TvRow`;
+- `--rejection-audit` records that value for every rejected row;
+- the audit performs a separate exact-ticker TradingView probe for current
+  reference data and records `active_symbol`, `isin`, and, when the endpoint
+  supports them, `cusip` and `figi`;
+- CUSIP/FIGI probing is isolated from the production universe query and fails
+  soft into diagnostic `errors`, so an undocumented/authorization-dependent
+  field can never break acquisition or affect admission.
+
+The purpose is to distinguish a genuine unresolved current listing from a
+retired/stale source symbol after a corporate action. A later policy release may
+exclude proven inactive predecessor listings or bridge a successor only when a
+machine-readable stable identifier supports it. No name matching, successor
+allowlist, or old-ISIN admission is introduced here.
+
+
+## v0.3.62 — exact ISIN + home-MIC listing confirmation
+
+Policy release `0.3.62-policy62`. Existing VERIFIED bindings from policy61,
+policy59, policy58, and the previous policy56/55/54/53/49/44 chain remain
+cache-compatible; rejected rows are re-evaluated.
+
+The v0.3.61 live Germany run proved that `ID_EXCH_SYMBOL + micCode` is not a
+reliable primary confirmation primitive for the remaining Yahoo home-market
+candidates: all three targeted jobs (`ARX/XTSE`, `OPTT/XASE`, `DAL/XMIL`)
+returned no usable mapping even though Yahoo exact-ISIN search and quote
+metadata were internally consistent.
+
+v0.3.62 moves the independent OpenFIGI confirmation one level closer to the
+actual identity model. For a Yahoo candidate whose ticker is absent from the
+unscoped OpenFIGI `ID_ISIN` rows, the resolver now asks OpenFIGI whether the
+**same exact ISIN** exists on the reviewed Yahoo home MIC and requires the
+**same independently established shareClassFIGI**:
+
+```text
+TradingView exact ISIN
+  -> OpenFIGI ID_ISIN (unscoped)
+  -> exactly one observed non-null shareClassFIGI
+  -> Yahoo Search by exact ISIN only
+  -> reviewed Yahoo exchange code -> ISO MIC
+  -> bounded Yahoo symbol/suffix contract for that MIC
+  -> OpenFIGI ID_ISIN + micCode
+  -> require the same shareClassFIGI
+  -> strict Yahoo symbol + exchange + currency + EQUITY quote contract
+```
+
+This proves **security identity + home listing identity** without requiring
+Yahoo and OpenFIGI to use identical ticker syntax. `ID_EXCH_SYMBOL + micCode`
+remains only as a secondary fallback when the exact-ISIN+MIC mapping is absent.
+A conflicting share class is a hard fail and does not fall through to symbol
+proof. Unknown Yahoo exchanges, malformed/incorrect Yahoo suffixes, multiple
+valid Yahoo routes, missing share-class evidence, and quote-contract
+contradictions remain fail-closed. No name matching or suffix guessing is used.
+
+`--rejection-audit` now also records `home_mic`, the exact targeted
+`ID_ISIN+micCode` OpenFIGI rows, whether the expected share class was confirmed,
+and any conflicting share classes. This evidence is diagnostic only.
+
+## v0.3.61 — exact home-venue exchange-symbol confirmation
+
+Policy release `0.3.61-policy61`. Existing VERIFIED bindings from policy59,
+policy58, and the previous policy56/55/54/53/49/44 chain remain
+cache-compatible; rejected rows are re-evaluated.
+
+The v0.3.60 candidate-level audit isolated a narrow provider-coverage gap: Yahoo
+exact-ISIN search can return a single valid home-market `EQUITY` symbol even
+when OpenFIGI's *unscoped* `ID_ISIN` response omits that local ticker. Rather
+than trust Yahoo Search or introduce ticker/name heuristics, v0.3.61 adds a
+second independent OpenFIGI proof for reviewed Yahoo venues:
+
+```text
+TradingView exact ISIN
+  -> OpenFIGI ID_ISIN (unscoped)
+  -> exactly one observed non-null shareClassFIGI
+  -> Yahoo Search by exact ISIN only
+  -> if the Yahoo ticker is absent from unscoped OpenFIGI rows:
+       Yahoo exchange code -> reviewed ISO MIC
+       Yahoo symbol -> exact local exchange symbol
+       OpenFIGI ID_EXCH_SYMBOL + micCode
+       require the same shareClassFIGI
+  -> strict Yahoo symbol + exchange + currency + EQUITY quote contract
+```
+
+The initial reviewed venue bridge is intentionally limited to the exchanges
+actually exposed by the v0.3.60 residual audit: `TOR -> XTSE`, `ASE -> XASE`,
+and `MIL -> XMIL`. These are venue mappings, not security allowlists. Unknown
+Yahoo exchange codes are not guessed. A conflicting or missing share class, an
+unresolved local symbol, multiple valid Yahoo routes, or any Yahoo contract
+contradiction remains fail-closed. No fuzzy-name matching is introduced.
+
+## v0.3.60 — home-market rejection audit expansion
+
+Diagnostic-only release. Admission remains `0.3.59-policy59`; no resolver
+policy is relaxed. The Germany v0.3.59 residual set is small enough that the
+next bottleneck must be diagnosed at Yahoo-candidate level rather than inferred
+from aggregate counters.
+
+`--rejection-audit` now records, for each rejected exact-ISIN row with a usable
+observed share class:
+
+```text
+Yahoo exact-ISIN search candidate
+  -> search symbol / exchange / quoteType / names
+  -> bounded Yahoo ticker identity keys
+  -> exact-ISIN OpenFIGI ticker/shareClass confirmation
+  -> Yahoo quote metadata and strict contract blocks
+  -> chart fallback metadata and strict contract blocks
+  -> final per-candidate admission_blocks
+```
+
+The new JSONL fields are `home_market_audit_status` and
+`home_market_search_candidates`. They are evidence-only and are never consumed
+by resolver admission. This release exists to distinguish ticker-proof gaps
+from Yahoo quote-contract failures before any further policy change.
+
+## v0.3.59 — observed-unique shareClassFIGI home-market rescue
+
+Policy release `0.3.59-policy59`. VERIFIED bindings from policy58 and the
+previous policy56/55/54/53/49/44 chain remain cache-compatible; rejected rows
+are re-evaluated.
+
+The v0.3.58 full-Germany audit showed a provider-completeness edge case: for
+many exact ISINs OpenFIGI reports one consistent non-null `shareClassFIGI` on
+some venue rows while omitting `shareClassFIGI` on other rows. v0.3.58 treated
+any omission as a hard block. v0.3.59 changes only that completeness guard:
+
+```text
+exact TradingView ISIN
+  -> compatible OpenFIGI rows
+  -> exactly one observed non-null shareClassFIGI
+  -> rows with shareClassFIGI=null are non-evidence
+  -> Yahoo exact-ISIN search candidate must match an OpenFIGI ticker
+     on a row that explicitly carries that same shareClassFIGI
+  -> same strict Yahoo symbol/exchange/currency/EQUITY quote contract
+```
+
+This does **not** infer a share class for rows where OpenFIGI omitted it. A
+missing-share row cannot confirm a Yahoo ticker. Zero observed share classes,
+more than one observed share class, ticker mismatch, multiple valid Yahoo
+routes, or quote-contract contradictions remain fail-closed. `GETTEX:PEQ` and
+other taxonomy conflicts are unchanged.
+
+## v0.3.58 — exact-ISIN Yahoo home-market discovery
+
+Policy release `0.3.58-policy58`. Existing VERIFIED bindings from policy56,
+policy55, policy54, policy53, policy49, and policy44 remain cache-compatible;
+older rejects are re-evaluated.
+
+For rejected German `stock/common` rows with an exact TradingView ISIN, the
+resolver now has one final fail-closed quote-routing path after all German
+listing rescues are exhausted:
+
+```text
+TradingView exact ISIN
+  -> OpenFIGI ID_ISIN (unscoped)
+  -> exactly one non-null shareClassFIGI across compatible equity rows
+  -> Yahoo Search with the exact ISIN only (fuzzy disabled)
+  -> candidate ticker must occur in the same OpenFIGI exact-ISIN evidence
+  -> Yahoo quote/chart must explicitly confirm symbol + exchange + currency + EQUITY
+  -> VERIFIED as YAHOO_EXACT_ISIN_HOME_MARKET
+```
+
+This is a **quote-routing** rescue, not a German listing proof. Therefore Yahoo
+home-market currency may differ from TradingView Germany `EUR`. The persisted
+refresh contract is correspondingly strict and independent of the German quote
+contract: the same Yahoo symbol, same Yahoo exchange, same currency, and
+`quoteType=EQUITY` must remain true. Multiple simultaneously valid Yahoo routes
+remain rejected rather than being ranked heuristically. No fuzzy-name search,
+suffix guessing, or generic taxonomy relaxation is used.
+
+## v0.3.57 — rejection-audit unscoped exact-ISIN diagnostics
+
+Diagnostic-only release; resolver policy remains `0.3.56-policy56`.
+
+`--rejection-audit` records the result of an unscoped OpenFIGI `ID_ISIN` lookup
+for every rejected row with an ISIN. This evidence is **not used for admission**.
+It exposes home/global ticker and exchange-code candidates (`unscoped_openfigi`)
+plus a compact status/share-class summary so the home-market Yahoo fallback can
+be designed from exact-ISIN evidence instead of fuzzy name search.
+
+The lookup is batched and reuses the provider run memo, so jobs already executed
+by resolver diagnostics do not cause duplicate network calls.
+
+## v0.3.56 — exact-ISIN equity-like + Yahoo ETF taxonomy reconciliation
+
+Policy release `0.3.56-policy56`. Existing VERIFIED bindings from policy55,
+policy54, policy53, policy49, and policy44 remain cache-compatible; older rejects
+are re-evaluated.
+
+The final Germany exact-ISIN rescue now tolerates one additional provider-only
+classification disagreement: OpenFIGI may classify the exact share class as a
+reviewed exchange-traded equity-like form (`Unit / Unit`, `Stapled Security /
+Unit`, `Dutch Cert / Depositary Receipt`, or `Savings Share / Common Stock`)
+while Yahoo labels the *same exact German listing* as `ETF`. This rule is
+identity-only and requires all of the following simultaneously:
+
+- exact TradingView ISIN and one non-null OpenFIGI `shareClassFIGI`;
+- the existing reviewed equity-like OpenFIGI taxonomy;
+- exact expected Yahoo symbol;
+- explicit matching EUR currency;
+- explicit compatible German regional venue;
+- Yahoo quote type exactly `ETF`.
+
+`MUTUALFUND`, synthetic `YHD`, missing currency/venue, wrong currency/venue, and
+mixed fund taxonomy remain fail-closed. Successful mappings use
+`GERMANY_FINAL_EXACT_ISIN_RESCUE_EQUITY_LIKE_YAHOO_ETF_TAXONOMY`.
+
+Offline replay over the real v0.3.55 residual audit rescued exactly 3 of 92 rows
+(`FWB:3IJ0`, `LS:577633`, `GETTEX:5VC`) and no others. Expected Germany residual
+after policy56 is therefore about 89 rows, subject to live provider/universe
+drift.
+
+
+## v0.3.55 — exact-ISIN listed closed-end fund identity rescue
+
+Policy release `0.3.55-policy55`. Existing VERIFIED bindings from policy54,
+policy53, policy49, and policy44 remain cache-compatible; older rejects are
+re-evaluated.
+
+The bounded final Germany rescue now treats a pure OpenFIGI
+`Closed-End Fund / Mutual Fund` classification as identity-compatible with a
+TradingView `stock/common` row only when the existing exact-ISIN contract is
+fully satisfied: one non-null `shareClassFIGI`, source-side corroboration when
+present, and Yahoo's ordinary EUR/EQUITY/German-venue contract. These mappings
+use `GERMANY_FINAL_EXACT_ISIN_RESCUE_LISTED_FUND`.
+
+This is an identity-routing decision only; downstream GARP eligibility remains a
+separate concern. Mixed/private-equity fund taxonomy is still fail-closed. In
+particular, an ISIN/share class that is also returned as `Pvt Eqty Fund / Mutual
+Fund` is not admitted by this rule.
+
+Offline replay over the real v0.3.54 residual audit rescued exactly 10 of 102
+rows, while the mixed Private Equity Holding case remained rejected. Expected
+Germany residual after policy55 is therefore about 92 rows, subject to live
+provider/universe drift.
+
+
+## v0.3.54 — exact-ISIN share-subtype reconciliation
+
+Policy release `0.3.54-policy54`. Existing VERIFIED bindings from policy53,
+policy49, and policy44 remain cache-compatible; older rejects are re-evaluated.
+
+The bounded final Germany rescue now also reconciles provider naming differences
+for the same exact-ISIN share class when TradingView and OpenFIGI disagree only
+on the listed-equity subtype:
+
+- TradingView `preferred` -> OpenFIGI `Common Stock / Common Stock`;
+- TradingView `preferred` -> OpenFIGI `Savings Share / Common Stock`;
+- TradingView `stock/common` -> OpenFIGI `Preference / Preference`.
+
+Admission still requires exact TradingView ISIN, one non-null shareClassFIGI,
+source-side corroboration when present, and Yahoo's ordinary EUR/EQUITY/venue
+contract.  These cases use mapping method
+`GERMANY_FINAL_EXACT_ISIN_RESCUE_SHARE_SUBTYPE`.
+
+Fund taxonomies remain intentionally excluded: `Closed-End Fund` and
+`Pvt Eqty Fund` are still fail-closed.  A replay over the v0.3.53 Germany audit
+rescued exactly 8 of 110 residual rows and did not admit any fund row.
+
+
+## v0.3.53 — final exact-ISIN Germany rescue for alias/taxonomy gaps
+
+Policy release `0.3.53-policy53`. Existing VERIFIED bindings from policy49 and
+policy44 remain cache-compatible; prior rejects are re-evaluated.
+
+After the normal resolver finishes, only already-rejected German `stock/common`
+rows with an exact TradingView ISIN and one of the reviewed residual reasons are
+re-probed across the bounded German regional MIC set. Admission still requires:
+
+- exact `ID_ISIN + MIC` OpenFIGI evidence;
+- exactly one non-null `shareClassFIGI` across Yahoo-valid targets;
+- any available source-side exact-ISIN evidence to corroborate that same share
+  class;
+- Yahoo to pass the ordinary EUR/type/venue contract, except for the pre-existing
+  bounded German Yahoo ETF/MUTUALFUND anomaly on ordinary common-equity/REIT
+  identities.
+
+The rescue deliberately permits multiple OpenFIGI ticker aliases on the same MIC
+when they all identify the same share class; Yahoo chooses the usable quote alias
+only after identity is fixed.  A narrow exact-ISIN-only taxonomy extension covers
+`Unit/Unit`, `Stapled Security/Unit`, `Dutch Cert/Depositary Receipt`, and
+`Savings Share/Common Stock` when Yahoo independently confirms a normal EQUITY
+quote. `Closed-End Fund`, `Pvt Eqty Fund`, and TradingView preferred rows remain
+fail-closed.
+
+New telemetry is prefixed with `germany_final_exact_isin_rescue_`,
+`openfigi_germany_final_rescue_`, and `yahoo_germany_final_rescue_`.
+
 
 ## v0.3.49 — exact-ISIN German regional source-gap bridge + bounded Yahoo retry
 
