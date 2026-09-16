@@ -2243,13 +2243,30 @@ def test_v079_xnys_rule_itself_does_not_claim_xnas(tmp_path):
     db.close()
 
 
-def test_v079_unit_does_not_generalize_to_stock_common(tmp_path):
+def test_v079_unit_does_not_generalize_to_stock_common_without_v0415_share_class(tmp_path):
+    # v0.4.15 deliberately adds a narrow XNYS stock/common Unit rescue. Keep
+    # the historical non-generalization regression as a negative control that
+    # falls outside the new contract: source evidence has no shareClassFIGI.
+    class OFUnitNoShareV079(OFUnitV079):
+        def map_jobs(self, jobs):
+            mapped = super().map_jobs(jobs)
+            out = []
+            for identities in mapped:
+                out.append([type(i)(
+                    figi=i.figi, composite_figi=i.composite_figi,
+                    share_class_figi=None, ticker=i.ticker, name=i.name,
+                    security_type=i.security_type, security_type2=i.security_type2,
+                    exch_code=i.exch_code,
+                ) for i in identities])
+            return out
+
     db=CacheDB(tmp_path / "v079-stock.sqlite")
-    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    r=BatchResolver(db, FHUnitV079(), OFUnitNoShareV079(), YHUnitV079())
     row=TvRow("NYSE:STKU", "NYSE", "STKU", None, "USD", "stock", ("common",), None, None, 10.0, "US0000000103")
     got=r.resolve([row])[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    assert r.stats["us_xnys_stock_common_unit_source_unconfirmed"] == 1
     db.close()
 
 

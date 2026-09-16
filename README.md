@@ -1447,3 +1447,7 @@ Adds/refreshes the full-cohort `FINNHUB_TYPE_MISMATCH:?` evidence audit via `--u
 
 ## v0.4.13
 Diagnostic-only correction for the US `FINNHUB_TYPE_MISMATCH:?` full-cohort audit. `--us-finnhub-unknown-type-audit` no longer drops rejected rows merely because TradingView ISIN is missing. Such rows are emitted with `classification=MISSING_TV_ISIN`; OpenFIGI/Yahoo exact-ISIN calls are skipped for them. Admission is unchanged and resolver policy remains `0.4.11-policy411`.
+
+### v0.4.15
+
+Functional US identity release. Adds the evidence-gated `US_XNYS_STOCK_COMMON_FINNHUB_UNIT_EXACT_ISIN` rescue for the v0.4.14-audited NYSE stock/common subset rejected as Finnhub `Unit`. Admission requires exact TV ISIN, XNYS stock/common, exactly one scoped OpenFIGI `Unit/Unit` FIGI with non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate equal to the TV ticker with NYSE-compatible USD/EQUITY quote metadata. XNAS and OTC remain outside the rule. Resolver policy is `0.4.15-policy415`.
