@@ -2415,13 +2415,17 @@ def _write_us_finnhub_gdr_audit(path: Path, rows, bindings: dict, resolver: Batc
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-def _write_us_finnhub_named_type_audit(path: Path, rows, bindings: dict, resolver: BatchResolver, finnhub_type: str) -> None:
-    """Diagnostic-only exact-ISIN/source audit for one Finnhub mismatch subtype."""
+def _write_us_finnhub_named_type_audit(
+    path: Path, rows, bindings: dict, resolver: BatchResolver,
+    finnhub_type: str | None = None, *, rejection_reason: str | None = None,
+) -> None:
+    """Diagnostic-only exact-ISIN/source audit for one Finnhub rejection cohort."""
+    target_reason = rejection_reason or f"FINNHUB_TYPE_MISMATCH:{finnhub_type}"
     cohort = [
         r for r in rows
         if r.isin and (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED"
-        and b.rejection_reason == f"FINNHUB_TYPE_MISMATCH:{finnhub_type}"
+        and b.rejection_reason == target_reason
     ]
     scoped_jobs = []
     scoped_indexes = []
@@ -2542,6 +2546,11 @@ def _write_us_finnhub_nvdr_audit(path: Path, rows, bindings: dict, resolver: Bat
 
 def _write_us_finnhub_sdr_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     _write_us_finnhub_named_type_audit(path, rows, bindings, resolver, "SDR")
+
+def _write_us_finnhub_no_symbol_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    _write_us_finnhub_named_type_audit(
+        path, rows, bindings, resolver, rejection_reason="FINNHUB_NO_SYMBOL"
+    )
 
 def _write_us_xnas_source_binding_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only audit of rejected rows whose reviewed source MIC is XNAS."""
@@ -3400,6 +3409,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_sdr_audit)
             _write_us_finnhub_sdr_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub SDR audit: {audit_path.resolve()}")
+        if args.us_finnhub_no_symbol_audit:
+            audit_path = Path(args.us_finnhub_no_symbol_audit)
+            _write_us_finnhub_no_symbol_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub NO_SYMBOL audit: {audit_path.resolve()}")
         if args.us_xnas_source_binding_audit:
             audit_path = Path(args.us_xnas_source_binding_audit)
             _write_us_xnas_source_binding_audit(audit_path, rows, bindings, resolver)
@@ -3748,6 +3761,11 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-sdr-audit",
         default=None,
         help="Write v0.4.5 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:SDR rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-no-symbol-audit",
+        default=None,
+        help="Write v0.4.6 diagnostic-only exact-ISIN/source JSONL for US FINNHUB_NO_SYMBOL rejects",
     )
     r.add_argument(
         "--us-xnas-source-binding-audit",
