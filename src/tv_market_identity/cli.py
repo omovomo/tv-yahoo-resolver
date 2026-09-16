@@ -10,6 +10,7 @@ from pathlib import Path
 
 from dotenv import find_dotenv, load_dotenv
 
+from . import __version__
 from .cache import CacheDB
 from .config import load_screen_config
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
@@ -1407,7 +1408,7 @@ def _write_us_xase_fund_unit_cohort_audit(path: Path, rows, bindings: dict, reso
         else:
             classification = "YAHOO_XASE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.3.92",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "identity_status": b.status if b else None,
@@ -1528,7 +1529,7 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
             classification = "IDENTITY_OR_CURRENCY_EVIDENCE_INCOMPLETE"
 
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.3.93",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "rejection_reason": b.rejection_reason, "source_mic": source_mic,
@@ -1650,7 +1651,7 @@ def _write_us_finnhub_royalty_trust_audit(path: Path, rows, bindings: dict, reso
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.3.94",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -1772,7 +1773,7 @@ def _write_us_finnhub_ltd_part_audit(path: Path, rows, bindings: dict, resolver:
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.3.96",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -1897,7 +1898,7 @@ def _write_us_finnhub_closed_end_fund_audit(path: Path, rows, bindings: dict, re
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.3.98",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2022,7 +2023,7 @@ def _write_us_finnhub_cdi_audit(path: Path, rows, bindings: dict, resolver: Batc
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.0",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2146,7 +2147,7 @@ def _write_us_finnhub_stapled_security_audit(path: Path, rows, bindings: dict, r
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.0",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2270,7 +2271,7 @@ def _write_us_finnhub_preference_audit(path: Path, rows, bindings: dict, resolve
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.2",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2394,7 +2395,7 @@ def _write_us_finnhub_gdr_audit(path: Path, rows, bindings: dict, resolver: Batc
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.3",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2414,19 +2415,13 @@ def _write_us_finnhub_gdr_audit(path: Path, rows, bindings: dict, resolver: Batc
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-def _write_us_finnhub_common_stock_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.4.4 diagnostic-only exact-ISIN/source audit for Common Stock rejects.
-
-    The audit deliberately does not treat Finnhub Common Stock as compatible with
-    ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
-    exact-ISIN/direct-symbol metadata so a later policy decision can be based on
-    the whole cohort rather than on ticker or name heuristics.
-    """
+def _write_us_finnhub_named_type_audit(path: Path, rows, bindings: dict, resolver: BatchResolver, finnhub_type: str) -> None:
+    """Diagnostic-only exact-ISIN/source audit for one Finnhub mismatch subtype."""
     cohort = [
         r for r in rows
         if r.isin and (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED"
-        and b.rejection_reason == "FINNHUB_TYPE_MISMATCH:Common Stock"
+        and b.rejection_reason == f"FINNHUB_TYPE_MISMATCH:{finnhub_type}"
     ]
     scoped_jobs = []
     scoped_indexes = []
@@ -2518,7 +2513,7 @@ def _write_us_finnhub_common_stock_audit(path: Path, rows, bindings: dict, resol
         else:
             classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.3",
+            "diagnostic_only": True, "diagnostic_release": __version__,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -2538,6 +2533,15 @@ def _write_us_finnhub_common_stock_audit(path: Path, rows, bindings: dict, resol
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+def _write_us_finnhub_common_stock_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    _write_us_finnhub_named_type_audit(path, rows, bindings, resolver, "Common Stock")
+
+def _write_us_finnhub_nvdr_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    _write_us_finnhub_named_type_audit(path, rows, bindings, resolver, "NVDR")
+
+def _write_us_finnhub_sdr_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    _write_us_finnhub_named_type_audit(path, rows, bindings, resolver, "SDR")
 
 def _write_us_xnas_source_binding_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only audit of rejected rows whose reviewed source MIC is XNAS."""
@@ -3388,6 +3392,14 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_common_stock_audit)
             _write_us_finnhub_common_stock_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub Common Stock audit: {audit_path.resolve()}")
+        if args.us_finnhub_nvdr_audit:
+            audit_path = Path(args.us_finnhub_nvdr_audit)
+            _write_us_finnhub_nvdr_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub NVDR audit: {audit_path.resolve()}")
+        if args.us_finnhub_sdr_audit:
+            audit_path = Path(args.us_finnhub_sdr_audit)
+            _write_us_finnhub_sdr_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub SDR audit: {audit_path.resolve()}")
         if args.us_xnas_source_binding_audit:
             audit_path = Path(args.us_xnas_source_binding_audit)
             _write_us_xnas_source_binding_audit(audit_path, rows, bindings, resolver)
@@ -3726,6 +3738,16 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-common-stock-audit",
         default=None,
         help="Write v0.4.4 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:Common Stock rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-nvdr-audit",
+        default=None,
+        help="Write v0.4.5 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:NVDR rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-sdr-audit",
+        default=None,
+        help="Write v0.4.5 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:SDR rejects",
     )
     r.add_argument(
         "--us-xnas-source-binding-audit",
