@@ -1424,3 +1424,8 @@ Adds `--us-yahoo-currency-unknown-audit` for US `YAHOO_CURRENCY_MISMATCH:?` reje
 ### v0.3.94 diagnostic-only: US Finnhub Royalty Trust residual audit
 
 Admission policy remains `0.3.87-policy87`. The `run` command adds `--us-finnhub-royalty-trust-audit PATH`, which records exact ISIN + reviewed source-MIC OpenFIGI evidence together with Yahoo direct-symbol and exact-ISIN metadata for current `FINNHUB_TYPE_MISMATCH:Royalty Trst` rejects. No taxonomy compatibility or admission rule is changed.
+
+
+## v0.4.3 diagnostic
+
+Adds `--us-finnhub-gdr-audit PATH` for diagnostic-only evidence collection of US `FINNHUB_TYPE_MISMATCH:GDR` rejects. Admission policy remains `0.3.99-policy99`.

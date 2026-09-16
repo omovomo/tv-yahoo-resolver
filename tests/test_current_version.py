@@ -5,9 +5,9 @@ from tv_market_identity.policy import RESOLVER_VERSION
 
 
 def test_current_package_version():
-    assert tv_market_identity.__version__ == "0.4.2"
+    assert tv_market_identity.__version__ == "0.4.3"
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    assert 'version = "0.4.2"' in pyproject.read_text(encoding="utf-8")
+    assert 'version = "0.4.3"' in pyproject.read_text(encoding="utf-8")
 
 
 def test_diagnostic_release_keeps_functional_policy():

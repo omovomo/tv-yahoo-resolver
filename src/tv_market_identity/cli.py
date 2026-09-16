@@ -2290,6 +2290,130 @@ def _write_us_finnhub_preference_audit(path: Path, rows, bindings: dict, resolve
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+def _write_us_finnhub_gdr_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """v0.4.3 diagnostic-only exact-ISIN/source audit for GDR rejects.
+
+    The audit deliberately does not treat Finnhub GDR as compatible with
+    ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
+    exact-ISIN/direct-symbol metadata so a later policy decision can be based on
+    the whole cohort rather than on ticker or name heuristics.
+    """
+    cohort = [
+        r for r in rows
+        if r.isin and (b := bindings.get(r.tv_id)) is not None
+        and b.status == "REJECTED"
+        and b.rejection_reason == "FINNHUB_TYPE_MISMATCH:GDR"
+    ]
+    scoped_jobs = []
+    scoped_indexes = []
+    for i, r in enumerate(cohort):
+        mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        if mic:
+            scoped_indexes.append(i)
+            scoped_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
+    scoped_mapped = [[] for _ in cohort]
+    try:
+        mapped = resolver.openfigi.map_jobs(scoped_jobs) if scoped_jobs else []
+        for i, xs in zip(scoped_indexes, mapped):
+            scoped_mapped[i] = list(xs)
+    except ProviderError:
+        pass
+
+    search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
+    searches = {}
+    if callable(search_fn):
+        for r in cohort:
+            token = str(r.isin).upper().strip()
+            if token not in searches:
+                try:
+                    searches[token] = list(search_fn(token))
+                except ProviderError:
+                    searches[token] = []
+    symbols = list(dict.fromkeys(
+        [r.symbol for r in cohort if r.symbol]
+        + [c.symbol for cs in searches.values() for c in cs if c.symbol]
+    ))
+    try:
+        quotes = resolver.yahoo.quotes(symbols) if symbols else {}
+    except ProviderError:
+        quotes = {}
+
+    def of_record(x):
+        return {"figi": x.figi, "composite_figi": x.composite_figi,
+                "share_class_figi": x.share_class_figi, "ticker": x.ticker,
+                "name": x.name, "security_type": x.security_type,
+                "security_type2": x.security_type2, "exch_code": x.exch_code}
+
+    def q_record(q, r, source_mic):
+        if q is None:
+            return None
+        return {
+            "symbol": q.symbol, "exchange": q.exchange,
+            "full_exchange_name": q.full_exchange_name, "market": q.market,
+            "currency": q.currency, "quote_type": q.quote_type,
+            "source_venue_compatible": bool(source_mic and yahoo_venue_compatible(source_mic, q)),
+            "currency_compatible": bool(not r.currency or not q.currency or currency_compatible(r.currency, q.currency)),
+            "equity": str(q.quote_type or "").upper() == "EQUITY",
+        }
+
+    records = []
+    for r, scoped in zip(cohort, scoped_mapped):
+        b = bindings[r.tv_id]
+        source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        scoped_figis = sorted({x.figi for x in scoped if x.figi})
+        direct = q_record(quotes.get(r.symbol), r, source_mic)
+        cs = searches.get(str(r.isin).upper().strip(), [])
+        candidates = []
+        strict = []
+        for c in cs:
+            q = q_record(quotes.get(c.symbol), r, source_mic)
+            exact_symbol = str(c.symbol or "").upper().strip() == str(r.symbol or "").upper().strip()
+            rec = {
+                "symbol": c.symbol, "search_exchange": c.exchange,
+                "search_quote_type": c.quote_type, "exact_tv_symbol": exact_symbol,
+                "quote": q,
+            }
+            rec["strict_same_source_equity"] = bool(
+                exact_symbol and str(c.quote_type or "").upper() == "EQUITY" and q
+                and q["source_venue_compatible"] and q["currency_compatible"] and q["equity"]
+            )
+            candidates.append(rec)
+            if rec["strict_same_source_equity"]:
+                strict.append(rec)
+        direct_strict = bool(direct and direct["source_venue_compatible"] and direct["currency_compatible"] and direct["equity"])
+        if len(scoped_figis) == 1 and len(strict) == 1:
+            classification = "SOURCE_SCOPED_AND_YAHOO_EXACT_ISIN_STRICT"
+        elif len(scoped_figis) == 1 and direct_strict:
+            classification = "SOURCE_SCOPED_AND_YAHOO_DIRECT_STRICT_ONLY"
+        elif not scoped:
+            classification = "OPENFIGI_SOURCE_NO_MATCH"
+        elif len(scoped_figis) != 1:
+            classification = "OPENFIGI_SOURCE_AMBIGUOUS"
+        elif not cs:
+            classification = "YAHOO_EXACT_ISIN_NOT_DISCOVERED"
+        else:
+            classification = "YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
+        records.append({
+            "diagnostic_only": True, "diagnostic_release": "0.4.3",
+            "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
+            "tv_currency": r.currency, "tv_type": r.tv_type,
+            "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
+            "rejection_reason": b.rejection_reason, "finnhub_symbol": b.finnhub_symbol,
+            "finnhub_type": b.finnhub_type,
+            "finnhub_exact_tv_symbol": str(b.finnhub_symbol or "").upper().strip() == str(r.symbol or "").upper().strip(),
+            "source_mic": source_mic, "source_scoped_figi_count": len(scoped_figis),
+            "source_scoped_figis": scoped_figis,
+            "source_scoped_openfigi": [of_record(x) for x in scoped],
+            "yahoo_direct_symbol": direct,
+            "yahoo_exact_isin_candidate_count": len(cs),
+            "yahoo_exact_isin_candidates": candidates,
+            "yahoo_exact_isin_strict_same_source_count": len(strict),
+            "classification": classification,
+        })
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 def _write_us_xnas_source_binding_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only audit of rejected rows whose reviewed source MIC is XNAS."""
@@ -3132,6 +3256,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_preference_audit)
             _write_us_finnhub_preference_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub Preference audit: {audit_path.resolve()}")
+        if args.us_finnhub_gdr_audit:
+            audit_path = Path(args.us_finnhub_gdr_audit)
+            _write_us_finnhub_gdr_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub GDR audit: {audit_path.resolve()}")
         if args.us_xnas_source_binding_audit:
             audit_path = Path(args.us_xnas_source_binding_audit)
             _write_us_xnas_source_binding_audit(audit_path, rows, bindings, resolver)
@@ -3460,6 +3588,11 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-preference-audit",
         default=None,
         help="Write v0.4.2 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:Preference rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-gdr-audit",
+        default=None,
+        help="Write v0.4.3 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:GDR rejects",
     )
     r.add_argument(
         "--us-xnas-source-binding-audit",
