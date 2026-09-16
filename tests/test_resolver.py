@@ -2686,3 +2686,58 @@ def test_v099_closed_end_fund_requires_unique_exact_yahoo_source_route(tmp_path)
         assert got.status == "REJECTED"
         assert r.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] == 0
         db.close()
+
+class OFNoSymbolXNYSPreferredV048:
+    batch_size = 100
+    def __init__(self, security_type="PUBLIC", security_type2="Preferred Stock", count=1):
+        self.security_type, self.security_type2, self.count = security_type, security_type2, count
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for j in jobs:
+            ids=[OpenFigiIdentity(figi=f"OF{i}_{j['idValue']}", composite_figi=None, share_class_figi=None,
+                 ticker="TY 6.125 PERP", name="Preferred", security_type=self.security_type,
+                 security_type2=self.security_type2, exch_code="US") for i in range(self.count)]
+            out.append(ids)
+        return out
+
+
+def _run_v048_no_symbol_rescue(tmp_path, yahoo=None, of=None, prefix="NYSE", symbol="TY/P"):
+    db=CacheDB(tmp_path / "v048.sqlite")
+    r=BatchResolver(db, FHNYSESlashPreferred(), of or OFNoSymbolXNYSPreferredV048(), yahoo or YHNYSESlashPreferred(candidate="TY-P"))
+    row=TvRow(f"{prefix}:{symbol}", prefix, symbol, None, "USD", "stock", ("preferred",), None, None, 25.0, "US90214J3095")
+    initial=[Binding(tv_id=row.tv_id, tv_symbol=row.symbol, tv_prefix=row.prefix, tv_currency=row.currency,
+                     tv_type=row.tv_type, status="REJECTED", rejection_reason="FINNHUB_NO_SYMBOL")]
+    got=r._us_xnys_finnhub_no_symbol_preferred_exact_isin_rescue([row], initial)[0]
+    db.close()
+    return got
+
+
+def test_v048_xnys_no_symbol_preferred_same_source_rescue_without_shareclassfigi(tmp_path):
+    got=_run_v048_no_symbol_rescue(tmp_path)
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_FINNHUB_NO_SYMBOL_PREFERRED_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert got.yahoo_symbol == "TY-P"
+    assert got.share_class_figi is None
+
+
+def test_v048_xnys_no_symbol_preferred_rejects_multiple_scoped_figis(tmp_path):
+    got=_run_v048_no_symbol_rescue(tmp_path, of=OFNoSymbolXNYSPreferredV048(count=2))
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_NO_SYMBOL"
+
+
+def test_v048_xnys_no_symbol_preferred_rejects_cross_market_yahoo(tmp_path):
+    got=_run_v048_no_symbol_rescue(tmp_path, yahoo=YHNYSESlashPreferred(candidate="TY-P", exchange="FRA", full="Frankfurt", currency="EUR"))
+    assert got.status == "REJECTED"
+
+
+def test_v048_xnys_no_symbol_preferred_does_not_apply_to_xase(tmp_path):
+    got=_run_v048_no_symbol_rescue(tmp_path, prefix="AMEX", symbol="PHXE/P")
+    assert got.status == "REJECTED"
+
+
+def test_v048_xnys_no_symbol_preferred_rejects_noncorrelated_yahoo_symbol(tmp_path):
+    got=_run_v048_no_symbol_rescue(tmp_path, yahoo=YHNYSESlashPreferred(candidate="OTHER-P"))
+    assert got.status == "REJECTED"

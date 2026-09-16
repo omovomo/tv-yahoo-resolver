@@ -2552,6 +2552,86 @@ def _write_us_finnhub_no_symbol_audit(path: Path, rows, bindings: dict, resolver
         path, rows, bindings, resolver, rejection_reason="FINNHUB_NO_SYMBOL"
     )
 
+
+def _write_us_finnhub_no_symbol_xnys_preferred_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """Diagnostic-only audit for XNYS slash-symbol FINNHUB_NO_SYMBOL rows.
+
+    Tests whether exact ISIN independently yields one scoped XNYS OpenFIGI preferred
+    record and one Yahoo same-source USD/EQUITY candidate whose provider symbol is
+    the slash-preferred notation counterpart. This is evidence only; no admission.
+    """
+    cohort = [
+        r for r in rows
+        if r.isin and TV_PREFIX_TO_MIC.get(r.prefix) == "XNYS" and "/" in str(r.symbol or "")
+        and (b := bindings.get(r.tv_id)) is not None
+        and b.status == "REJECTED" and b.rejection_reason == "FINNHUB_NO_SYMBOL"
+    ]
+    jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in cohort]
+    try:
+        mapped = resolver.openfigi.map_jobs(jobs) if jobs else []
+    except ProviderError:
+        mapped = [[] for _ in jobs]
+    search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
+    searches = {}
+    if callable(search_fn):
+        for r in cohort:
+            token = str(r.isin).upper().strip()
+            try: searches[token] = list(search_fn(token))
+            except ProviderError: searches[token] = []
+    symbols = list(dict.fromkeys(c.symbol for cs in searches.values() for c in cs if c.symbol))
+    try: quotes = resolver.yahoo.quotes(symbols) if symbols else {}
+    except ProviderError: quotes = {}
+
+    def of_record(x):
+        return {"figi": x.figi, "composite_figi": x.composite_figi,
+                "share_class_figi": x.share_class_figi, "ticker": x.ticker,
+                "name": x.name, "security_type": x.security_type,
+                "security_type2": x.security_type2, "exch_code": x.exch_code}
+
+    records=[]
+    for r, scoped in zip(cohort, mapped):
+        b=bindings[r.tv_id]
+        figis=sorted({x.figi for x in scoped if x.figi})
+        preferred=[x for x in scoped if (x.security_type or "").upper()=="PUBLIC" and (x.security_type2 or "").upper()=="PREFERRED STOCK"]
+        cs=searches.get(str(r.isin).upper().strip(), [])
+        candidates=[]
+        for c in cs:
+            q=quotes.get(c.symbol)
+            venue_ok=bool(q and yahoo_venue_compatible("XNYS", q))
+            currency_ok=bool(q and (not r.currency or not q.currency or currency_compatible(r.currency,q.currency)))
+            equity_ok=bool(q and (q.quote_type or "").upper()=="EQUITY" and (c.quote_type or "").upper()=="EQUITY")
+            # Relation is checked, never used to construct a provider symbol.
+            slash_counterpart = str(r.symbol or "").upper().replace("/", "-") == str(c.symbol or "").upper()
+            strict=bool(q and venue_ok and currency_ok and equity_ok and slash_counterpart)
+            candidates.append({"symbol":c.symbol,"search_exchange":c.exchange,"search_quote_type":c.quote_type,
+                "quote_exchange":q.exchange if q else None,"quote_full_exchange_name":q.full_exchange_name if q else None,
+                "quote_currency":q.currency if q else None,"quote_type":q.quote_type if q else None,
+                "xnys_venue_compatible":venue_ok,"currency_compatible":currency_ok,"equity_compatible":equity_ok,
+                "slash_preferred_counterpart":slash_counterpart,"strict_same_source_counterpart":strict})
+        strict_count=sum(1 for x in candidates if x["strict_same_source_counterpart"])
+        source_unique=len(figis)==1
+        source_preferred=source_unique and len(preferred)==1
+        if source_preferred and strict_count==1 and len(cs)==1:
+            classification="XNYS_UNIQUE_SOURCE_PREFERRED_AND_UNIQUE_YAHOO_COUNTERPART"
+        elif not source_unique:
+            classification="XNYS_SOURCE_NOT_UNIQUE"
+        elif not source_preferred:
+            classification="XNYS_SOURCE_TAXONOMY_UNCONFIRMED"
+        elif strict_count!=1 or len(cs)!=1:
+            classification="YAHOO_COUNTERPART_UNCONFIRMED_OR_AMBIGUOUS"
+        else:
+            classification="EVIDENCE_INCOMPLETE"
+        records.append({"diagnostic_only":True,"diagnostic_release":__version__,"tv_id":r.tv_id,"tv_symbol":r.symbol,
+            "tv_isin":r.isin,"tv_currency":r.currency,"tv_type":r.tv_type,"tv_type_specs":list(r.type_specs),
+            "rejection_reason":b.rejection_reason,"source_mic":"XNYS","source_scoped_figi_count":len(figis),
+            "source_scoped_openfigi":[of_record(x) for x in scoped],"source_unique_public_preferred":source_preferred,
+            "source_share_class_figi_present":any(x.share_class_figi for x in scoped),
+            "yahoo_exact_isin_candidate_count":len(cs),"yahoo_strict_same_source_counterpart_count":strict_count,
+            "yahoo_exact_isin_candidates":candidates,"classification":classification})
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open("w",encoding="utf-8") as f:
+        for record in records: f.write(json.dumps(record,ensure_ascii=False,sort_keys=True)+"\n")
+
 def _write_us_xnas_source_binding_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only audit of rejected rows whose reviewed source MIC is XNAS."""
     cohort = [r for r in rows if r.isin and TV_PREFIX_TO_MIC.get(r.prefix) == "XNAS" and (b := bindings.get(r.tv_id)) is not None and b.status == "REJECTED"]
@@ -3413,6 +3493,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_no_symbol_audit)
             _write_us_finnhub_no_symbol_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub NO_SYMBOL audit: {audit_path.resolve()}")
+        if args.us_finnhub_no_symbol_xnys_preferred_audit:
+            audit_path = Path(args.us_finnhub_no_symbol_xnys_preferred_audit)
+            _write_us_finnhub_no_symbol_xnys_preferred_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub NO_SYMBOL XNYS preferred audit: {audit_path.resolve()}")
         if args.us_xnas_source_binding_audit:
             audit_path = Path(args.us_xnas_source_binding_audit)
             _write_us_xnas_source_binding_audit(audit_path, rows, bindings, resolver)
@@ -3766,6 +3850,11 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-no-symbol-audit",
         default=None,
         help="Write v0.4.6 diagnostic-only exact-ISIN/source JSONL for US FINNHUB_NO_SYMBOL rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-no-symbol-xnys-preferred-audit",
+        default=None,
+        help="Write v0.4.7 diagnostic-only same-source exact-ISIN audit for XNYS slash-symbol FINNHUB_NO_SYMBOL rejects",
     )
     r.add_argument(
         "--us-xnas-source-binding-audit",

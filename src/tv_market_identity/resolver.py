@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -656,6 +656,7 @@ class BatchResolver:
             us_bindings = self._us_ootc_preferred_empty_type_public_rescue(us, us_bindings)
             us_bindings = self._us_otc_preferred_rescue(us, us_bindings)
             us_bindings = self._us_nyse_preferred_exact_isin_symbol_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_finnhub_no_symbol_preferred_exact_isin_rescue(us, us_bindings)
             new_bindings.extend(us_bindings)
         if non_us:
             new_bindings.extend(self._resolve_non_us(non_us))
@@ -1672,6 +1673,98 @@ class BatchResolver:
             )
             self.stats["us_nyse_preferred_symbol_rescue_matches"] += 1
 
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+
+    def _us_xnys_finnhub_no_symbol_preferred_exact_isin_rescue(
+        self, rows: list[TvRow], bindings: list[Binding]
+    ) -> list[Binding]:
+        """Rescue audited XNYS preferred listings missing from Finnhub universe.
+
+        This is a same-source exact-ISIN rule, not a cross-venue bridge. The Yahoo
+        symbol is discovered by exact ISIN and never constructed. shareClassFIGI
+        is deliberately not required because OpenFIGI uniquely proves the exact
+        ISIN on the same XNYS source venue.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if r.prefix != "NYSE" or "/" not in (r.symbol or "") or not r.isin:
+                continue
+            if not b or b.rejection_reason != "FINNHUB_NO_SYMBOL":
+                continue
+            if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_no_symbol_preferred_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_no_symbol_preferred_openfigi_unavailable"] += len(jobs)
+            return bindings
+
+        proven = {}
+        for r, identities in zip(eligible, mapped):
+            preferred = [x for x in identities if
+                (x.security_type or "").strip().upper() == "PUBLIC" and
+                (x.security_type2 or "").strip().lower() == "preferred stock"]
+            figis = {x.figi for x in preferred if x.figi}
+            if len(figis) != 1:
+                self.stats["us_xnys_no_symbol_preferred_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in preferred if x.figi == figi)
+            self.stats["us_xnys_no_symbol_preferred_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_no_symbol_preferred_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if punctuation_key(c.symbol) != punctuation_key(r.symbol):
+                self.stats["us_xnys_no_symbol_preferred_punctuation_mismatch"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_no_symbol_preferred_yahoo_unconfirmed"] += 1
+                continue
+            if (q.currency or "").upper() != "USD" or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_xnys_no_symbol_preferred_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_no_symbol_preferred_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_FINNHUB_NO_SYMBOL_PREFERRED_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_no_symbol_preferred_rescue_matches"] += 1
         return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
 
     def _us_ootc_preferred_empty_type_public_rescue(
