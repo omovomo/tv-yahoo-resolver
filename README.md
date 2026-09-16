@@ -1,3 +1,7 @@
+## v0.4.22 functional — ARCX stock/common Ltd Part exact-ISIN rescue
+
+Adds `US_ARCX_STOCK_COMMON_FINNHUB_LTD_PART_EXACT_ISIN` for the v0.4.18-audited AMEX/ARCX `FINNHUB_TYPE_MISMATCH:Ltd Part` stock/common cohort. Admission requires exact TV ISIN, exactly one `ID_ISIN + ARCX` OpenFIGI FIGI classified `Ltd Part / Partnership Shares` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is ARCX-compatible, explicitly USD, and `EQUITY`. OOTC, XNYS, and XNAS cases are not admitted by this path. Resolver policy is `0.4.22-policy422`.
+
 ## v0.4.21 functional — OOTC stock/common Closed-End Fund exact-ISIN rescue
 
 Adds `US_OOTC_STOCK_COMMON_FINNHUB_CLOSED_END_FUND_EXACT_ISIN` for the v0.4.18-audited OOTC `FINNHUB_TYPE_MISMATCH:Closed-End Fund` stock/common cohort. Admission requires exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `Closed-End Fund / Mutual Fund` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. XNAS source-NO-MATCH and Yahoo `ETF` cases remain rejected. This is not a global Closed-End Fund taxonomy override. Resolver policy is `0.4.21-policy421`.
