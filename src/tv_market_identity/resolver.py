@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -645,7 +645,18 @@ class BatchResolver:
         non_us = [r for r in missing if not is_us_tv(r)]
         new_bindings: list[Binding] = []
         if us:
-            new_bindings.extend(self._resolve_us(us))
+            us_bindings = self._resolve_us(us)
+            us_bindings = self._us_same_venue_preferred_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_fund_unit_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_fund_unit_public_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_stock_common_royalty_trust_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_stock_common_ltd_part_rescue(us, us_bindings)
+            us_bindings = self._us_xnys_stock_common_closed_end_fund_rescue(us, us_bindings)
+            us_bindings = self._us_xnas_fund_unit_rescue(us, us_bindings)
+            us_bindings = self._us_ootc_preferred_empty_type_public_rescue(us, us_bindings)
+            us_bindings = self._us_otc_preferred_rescue(us, us_bindings)
+            us_bindings = self._us_nyse_preferred_exact_isin_symbol_rescue(us, us_bindings)
+            new_bindings.extend(us_bindings)
         if non_us:
             new_bindings.extend(self._resolve_non_us(non_us))
 
@@ -797,6 +808,1133 @@ class BatchResolver:
 
         return verified + rejected
 
+    def _us_same_venue_preferred_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue a US preferred share only with exact same-venue evidence.
+
+        This path is deliberately narrower than the generic home-market rescue.
+        It never crosses venues and therefore does not use a missing
+        shareClassFIGI as a bridge.  Admission requires:
+
+        * TradingView ``stock/preferred`` with an exact ISIN;
+        * a reviewed source MIC;
+        * exactly one compatible OpenFIGI FIGI from ``ID_ISIN + source MIC``
+          whose taxonomy explicitly says Preferred Stock;
+        * either one unique exact-ISIN Yahoo candidate satisfying the strict
+          same-venue/currency/EQUITY quote contract, or, only when Yahoo exact
+          ISIN discovery returns no candidates at all, the exact TradingView
+          source symbol satisfying that same quote contract.
+
+        Finnhub ``PUBLIC``/missing type is treated as incomplete taxonomy only
+        inside this independently proven path.  Any ambiguity or contradiction
+        remains fail-closed.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            reason = b.rejection_reason if b else None
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not reason or not reason.startswith("FINNHUB_TYPE_MISMATCH:"):
+                continue
+            actual = reason.split(":", 1)[1]
+            if actual not in {"PUBLIC", "?"}:
+                continue
+            if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs or not r.isin:
+                continue
+            if not TV_PREFIX_TO_MIC.get(r.prefix):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [
+            {"idType": "ID_ISIN", "idValue": r.isin, "micCode": TV_PREFIX_TO_MIC[r.prefix]}
+            for r in eligible
+        ]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_preferred_same_venue_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_preferred_same_venue_openfigi_unavailable"] += len(jobs)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            compatible = [x for x in identities if openfigi_type_compatible(r, x)]
+            preferred = [
+                x for x in compatible
+                if (x.security_type2 or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+                or (x.security_type or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+            ]
+            figis = {x.figi for x in preferred if x.figi}
+            # Exactly one venue FIGI is required.  If several provider rows
+            # describe that same FIGI, retain one deterministically.
+            if len(figis) != 1:
+                self.stats["us_preferred_same_venue_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            chosen = next(x for x in preferred if x.figi == figi)
+            proven[r.tv_id] = chosen
+            self.stats["us_preferred_same_venue_source_proven"] += 1
+
+        if not proven:
+            return bindings
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not callable(search_fn):
+            return bindings
+
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            token = str(r.isin).upper().strip()
+            if token not in searches:
+                try:
+                    searches[token] = list(search_fn(token))
+                except ProviderError:
+                    searches[token] = []
+
+        search_symbols = sorted({
+            c.symbol for cs in searches.values() for c in cs if c.symbol
+        })
+        try:
+            search_quotes = self.yahoo.quotes(search_symbols) if search_symbols else {}
+        except ProviderError:
+            search_quotes = {}
+
+        # Exact TV symbol is a fallback only when exact-ISIN discovery returned
+        # no candidates at all, matching the evidence tested in v0.3.70.
+        tv_symbols = sorted({
+            r.symbol for r in eligible
+            if r.tv_id in proven and not searches.get(str(r.isin).upper().strip(), []) and r.symbol
+        })
+        try:
+            tv_quotes = self.yahoo.quotes(tv_symbols) if tv_symbols else {}
+        except ProviderError:
+            tv_quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            if of is None:
+                continue
+            source_mic = TV_PREFIX_TO_MIC[r.prefix]
+            cs = searches.get(str(r.isin).upper().strip(), [])
+            admitted: list[YahooQuote] = []
+            for c in cs:
+                q = search_quotes.get(c.symbol)
+                if (c.quote_type or "").upper() != "EQUITY" or q is None:
+                    continue
+                if not yahoo_type_compatible(r, q.quote_type):
+                    continue
+                if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                    continue
+                if not yahoo_venue_compatible(source_mic, q):
+                    continue
+                admitted.append(q)
+
+            method = "US_PREFERRED_SAME_VENUE_EXACT_ISIN_YAHOO"
+            if cs:
+                # Search ambiguity is fail-closed even if only one candidate
+                # happens to survive quote filtering: exact-ISIN discovery must
+                # identify one route, not ask quote metadata to choose among
+                # multiple discovered symbols.
+                if len(cs) != 1 or len(admitted) != 1:
+                    self.stats["us_preferred_same_venue_yahoo_search_unconfirmed"] += 1
+                    continue
+                y = admitted[0]
+            else:
+                q = tv_quotes.get(r.symbol)
+                if q is None or not yahoo_type_compatible(r, q.quote_type):
+                    self.stats["us_preferred_same_venue_tv_symbol_unconfirmed"] += 1
+                    continue
+                if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                    self.stats["us_preferred_same_venue_tv_symbol_unconfirmed"] += 1
+                    continue
+                if not yahoo_venue_compatible(source_mic, q):
+                    self.stats["us_preferred_same_venue_tv_symbol_unconfirmed"] += 1
+                    continue
+                y = q
+                method = "US_PREFERRED_SAME_VENUE_EXACT_TV_SYMBOL"
+
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=y, mic=source_mic,
+                source_mic=source_mic, target_mic=source_mic,
+                mapping_method=method, source_of=of, target_of=of,
+            )
+            self.stats["us_preferred_same_venue_rescue_matches"] += 1
+            self.stats[f"us_preferred_same_venue_rescue_matches_{_telemetry_token(source_mic)}"] += 1
+
+        if not rescued:
+            return bindings
+        return [rescued.get(b.tv_id, b) for b in bindings]
+
+    def _us_xnys_fund_unit_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue NYSE fund/unit rows when Finnhub calls the security ``Unit``.
+
+        v0.3.78 audited the complete full-US ``FINNHUB_TYPE_MISMATCH:Unit``
+        cohort.  The XNYS fund/unit subset formed a clean 33/33 contract.  This
+        path encodes only that demonstrated subset; it deliberately does not
+        generalize to XNAS or TradingView stock/common rows.
+
+        Admission requires exact ISIN, TradingView ``fund`` + ``unit``, XNYS,
+        one unscoped OpenFIGI shareClassFIGI, one exact ``ID_ISIN + XNYS``
+        venue FIGI explicitly classified Unit, matching shareClassFIGI, and one
+        Yahoo exact-ISIN route confirmed as NYSE-compatible USD/EQUITY.  Yahoo
+        symbols are discovered, never constructed.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Unit":
+                continue
+            if r.prefix != "NYSE" or (r.tv_type or "").lower() != "fund" or "unit" not in specs or not r.isin:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = []
+        for r in eligible:
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"})
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_fund_unit_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_fund_unit_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for i, r in enumerate(eligible):
+            unscoped = mapped[2 * i]
+            source = mapped[2 * i + 1]
+            unscoped_shares = {x.share_class_figi for x in unscoped if x.share_class_figi}
+            unit_source = [x for x in source if (
+                (x.security_type or "").strip().lower() == "unit"
+                or (x.security_type2 or "").strip().lower() == "unit"
+            )]
+            source_figis = {x.figi for x in unit_source if x.figi}
+            source_shares = {x.share_class_figi for x in unit_source if x.share_class_figi}
+            if len(unscoped_shares) != 1 or len(source_figis) != 1 or source_shares != unscoped_shares:
+                self.stats["us_xnys_fund_unit_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(source_figis))
+            proven[r.tv_id] = next(x for x in unit_source if x.figi == figi and x.share_class_figi in unscoped_shares)
+            self.stats["us_xnys_fund_unit_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                self.stats["us_xnys_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_FUND_UNIT_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_fund_unit_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnys_fund_unit_public_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the audited NYSE fund/unit cohort reported as Finnhub PUBLIC.
+
+        v0.3.83 found six fund/unit PUBLIC rejects with direct same-venue proof:
+        exact TradingView ISIN + XNYS maps to exactly one OpenFIGI FIGI whose
+        taxonomy is PUBLIC / Preferred Stock, while Yahoo exact-ISIN discovery
+        returns exactly one ticker-correlated NYSE-compatible USD/EQUITY route.
+        No shareClassFIGI is required because this path never crosses venues.
+        XNAS and stock/preferred rows are deliberately outside this rule.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:PUBLIC":
+                continue
+            if r.prefix != "NYSE" or (r.tv_type or "").lower() != "fund" or "unit" not in specs or not r.isin:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_fund_unit_public_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_fund_unit_public_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            preferred_public = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "public"
+                and (x.security_type2 or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+            )]
+            figis = {x.figi for x in preferred_public if x.figi}
+            if len(figis) != 1:
+                self.stats["us_xnys_fund_unit_public_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in preferred_public if x.figi == figi)
+            self.stats["us_xnys_fund_unit_public_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_fund_unit_public_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            ticker_ok = punctuation_key(r.symbol) in _yahoo_symbol_identity_keys(c.symbol)
+            if not ticker_ok or (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_fund_unit_public_yahoo_unconfirmed"] += 1
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                self.stats["us_xnys_fund_unit_public_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_fund_unit_public_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_FUND_UNIT_PUBLIC_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_fund_unit_public_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnys_stock_common_royalty_trust_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the v0.3.94-audited XNYS stock/common Royalty Trust cohort.
+
+        Admission is deliberately same-venue and exact-identity only: TradingView
+        must provide an exact ISIN for NYSE stock/common; the current rejection
+        must be Finnhub ``Royalty Trst``; ``ID_ISIN + XNYS`` must yield exactly
+        one Royalty Trst/Common Stock FIGI with the exact TV ticker; and Yahoo
+        exact-ISIN discovery must yield exactly one exact-TV-symbol route whose
+        quote is NYSE-compatible, reports a compatible currency, and is EQUITY.
+        OTC and XNAS are outside this audited rule.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Royalty Trst":
+                continue
+            if (r.prefix != "NYSE" or (r.tv_type or "").lower() != "stock"
+                    or "common" not in specs or not r.isin):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_stock_common_royalty_trust_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_stock_common_royalty_trust_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            source = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "royalty trst"
+                and (x.security_type2 or "").strip().lower() == "common stock"
+                and str(x.ticker or "").upper().strip() == str(r.symbol or "").upper().strip()
+            )]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_xnys_stock_common_royalty_trust_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in source if x.figi == figi)
+            self.stats["us_xnys_stock_common_royalty_trust_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_stock_common_royalty_trust_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if str(c.symbol or "").upper().strip() != str(r.symbol or "").upper().strip():
+                self.stats["us_xnys_stock_common_royalty_trust_yahoo_unconfirmed"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_stock_common_royalty_trust_yahoo_unconfirmed"] += 1
+                continue
+            if not q.currency or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_xnys_stock_common_royalty_trust_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_stock_common_royalty_trust_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_STOCK_COMMON_ROYALTY_TRUST_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_stock_common_royalty_trust_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnys_stock_common_ltd_part_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the v0.3.96-audited XNYS stock/common Ltd Part cohort.
+
+        This is intentionally narrower than a taxonomy override. Admission requires
+        exact TV ISIN, an XNYS-scoped unique OpenFIGI source identity classified
+        ``Ltd Part / Partnership Shares`` with exact ticker and a shareClassFIGI,
+        plus exactly one Yahoo exact-ISIN candidate for the exact TV symbol whose
+        quote is NYSE-compatible, currency-compatible, and EQUITY.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Ltd Part":
+                continue
+            if (r.prefix != "NYSE" or (r.tv_type or "").lower() != "stock"
+                    or "common" not in specs or not r.isin):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_stock_common_ltd_part_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_stock_common_ltd_part_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            source = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "ltd part"
+                and (x.security_type2 or "").strip().lower() == "partnership shares"
+                and bool((x.share_class_figi or "").strip())
+                and str(x.ticker or "").upper().strip() == str(r.symbol or "").upper().strip()
+            )]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_xnys_stock_common_ltd_part_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in source if x.figi == figi)
+            self.stats["us_xnys_stock_common_ltd_part_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_stock_common_ltd_part_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if str(c.symbol or "").upper().strip() != str(r.symbol or "").upper().strip():
+                self.stats["us_xnys_stock_common_ltd_part_yahoo_unconfirmed"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_stock_common_ltd_part_yahoo_unconfirmed"] += 1
+                continue
+            if not q.currency or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_xnys_stock_common_ltd_part_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_stock_common_ltd_part_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_STOCK_COMMON_LTD_PART_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_stock_common_ltd_part_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnys_stock_common_closed_end_fund_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the v0.3.98-audited XNYS stock/common Closed-End Fund cohort.
+
+        Admission requires exact TV ISIN, one XNYS-scoped OpenFIGI source FIGI
+        with exact ticker, ``Closed-End Fund / Mutual Fund`` taxonomy and a
+        shareClassFIGI, plus exactly one Yahoo exact-ISIN candidate for the
+        exact TV symbol whose quote is NYSE-compatible, currency-compatible,
+        and EQUITY.  No XNAS/OTC provider-gap exception is implied.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Closed-End Fund":
+                continue
+            if (r.prefix != "NYSE" or (r.tv_type or "").lower() != "stock"
+                    or "common" not in specs or not r.isin):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnys_stock_common_closed_end_fund_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnys_stock_common_closed_end_fund_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            source = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "closed-end fund"
+                and (x.security_type2 or "").strip().lower() == "mutual fund"
+                and bool((x.share_class_figi or "").strip())
+                and str(x.ticker or "").upper().strip() == str(r.symbol or "").upper().strip()
+            )]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_xnys_stock_common_closed_end_fund_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in source if x.figi == figi)
+            self.stats["us_xnys_stock_common_closed_end_fund_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnys_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if str(c.symbol or "").upper().strip() != str(r.symbol or "").upper().strip():
+                self.stats["us_xnys_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnys_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if not q.currency or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_xnys_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_xnys_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_XNYS_STOCK_COMMON_CLOSED_END_FUND_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_xnas_fund_unit_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue NASDAQ fund/unit rows using the audited XNAS provider-gap contract.
+
+        v0.3.80 found 146/146 rejected NASDAQ fund/unit rows with the same
+        pattern: exact-ISIN OpenFIGI resolves one share class and classifies it
+        as Unit, ``ID_ISIN + XNAS`` returns no rows, while Yahoo exact-ISIN
+        independently returns the exact TradingView symbol on a Nasdaq venue
+        with USD/EQUITY metadata.  The scoped OpenFIGI miss is therefore
+        treated only as a demonstrated XNAS provider limitation for this narrow
+        cohort, not as a generic permission to ignore source-MIC proof.
+
+        Admission requires TV NASDAQ + fund/unit + exact ISIN, the existing
+        Finnhub Unit rejection, exactly one unscoped OpenFIGI shareClassFIGI,
+        at least one Unit identity in that share class whose ticker exactly
+        equals the TV ticker, no scoped XNAS OpenFIGI rows, and exactly one
+        Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and
+        whose quote is XNAS-compatible USD/EQUITY.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Unit":
+                continue
+            if r.prefix != "NASDAQ" or (r.tv_type or "").lower() != "fund" or "unit" not in specs or not r.isin:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = []
+        for r in eligible:
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNAS"})
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_xnas_fund_unit_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_xnas_fund_unit_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for i, r in enumerate(eligible):
+            unscoped = mapped[2 * i]
+            scoped = mapped[2 * i + 1]
+            shares = {x.share_class_figi for x in unscoped if x.share_class_figi}
+            if len(shares) != 1 or scoped:
+                self.stats["us_xnas_fund_unit_identity_unconfirmed"] += 1
+                continue
+            share = next(iter(shares))
+            units = [x for x in unscoped if (
+                x.share_class_figi == share
+                and ((x.security_type or "").strip().lower() == "unit"
+                     or (x.security_type2 or "").strip().lower() == "unit")
+                and (x.ticker or "").strip().upper() == r.symbol.strip().upper()
+            )]
+            if not units:
+                self.stats["us_xnas_fund_unit_identity_unconfirmed"] += 1
+                continue
+            # Multiple venue FIGIs are normal in the unscoped response; the
+            # share class, Unit taxonomy and exact ticker are the identity
+            # invariants audited in v0.3.80.
+            proven[r.tv_id] = units[0]
+            self.stats["us_xnas_fund_unit_identity_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_xnas_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            if not c.symbol or c.symbol.strip().upper() != r.symbol.strip().upper():
+                self.stats["us_xnas_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            q = quotes.get(c.symbol)
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_xnas_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                self.stats["us_xnas_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNAS", q):
+                self.stats["us_xnas_fund_unit_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNAS", source_mic="XNAS", target_mic="XNAS",
+                mapping_method="US_XNAS_FUND_UNIT_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_xnas_fund_unit_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_nyse_preferred_exact_isin_symbol_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue NYSE slash-form preferred symbols via Yahoo exact-ISIN discovery.
+
+        The Yahoo symbol is never constructed. Admission requires exact TV ISIN,
+        exact XNYS OpenFIGI source proof for one Preferred Stock FIGI, exactly one
+        Yahoo exact-ISIN candidate, punctuation correlation with the TV symbol,
+        and an explicit NYSE/USD/EQUITY Yahoo quote for that returned candidate.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            reason = b.rejection_reason if b else None
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if r.prefix != "NYSE" or "/" not in (r.symbol or ""):
+                continue
+            if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs or not r.isin:
+                continue
+            if not reason or not (reason.startswith("YAHOO_TYPE_MISMATCH:") or reason == "YAHOO_SYMBOL_NOT_FOUND"):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "XNYS"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_nyse_preferred_symbol_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_nyse_preferred_symbol_openfigi_unavailable"] += len(jobs)
+            return bindings
+
+        proven = {}
+        for r, identities in zip(eligible, mapped):
+            preferred = [x for x in identities if openfigi_type_compatible(r, x) and (
+                (x.security_type2 or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+                or (x.security_type or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+            )]
+            figis = {x.figi for x in preferred if x.figi}
+            if len(figis) != 1:
+                self.stats["us_nyse_preferred_symbol_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in preferred if x.figi == figi)
+            self.stats["us_nyse_preferred_symbol_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_nyse_preferred_symbol_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if punctuation_key(c.symbol) != punctuation_key(r.symbol):
+                self.stats["us_nyse_preferred_symbol_punctuation_mismatch"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_nyse_preferred_symbol_yahoo_unconfirmed"] += 1
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                self.stats["us_nyse_preferred_symbol_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("XNYS", q):
+                self.stats["us_nyse_preferred_symbol_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="XNYS", source_mic="XNYS", target_mic="XNYS",
+                mapping_method="US_NYSE_PREFERRED_EXACT_ISIN_SYMBOL", source_of=of, target_of=of,
+            )
+            self.stats["us_nyse_preferred_symbol_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_ootc_preferred_empty_type_public_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the audited OTC preferred cohort with empty Finnhub taxonomy.
+
+        Admission is intentionally narrower than treating a missing Finnhub type
+        as compatible.  The exact TradingView symbol must have exactly one
+        same-currency Finnhub universe row, that row must explicitly bind the
+        listing to OOTC and its type must be empty.  Exact ISIN + OOTC must then
+        expose exactly one OpenFIGI FIGI explicitly classified PUBLIC /
+        Preferred Stock.  Finally Yahoo exact-ISIN discovery must itself be
+        unique and return the exact TV ticker with an OOTC-compatible USD/EQUITY
+        quote.  This is same-source evidence; no shareClassFIGI bridge is used.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if r.prefix != "OTC" or not r.isin:
+                continue
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:?":
+                continue
+            if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        universe = self.cache.load_finnhub_universe()
+        source_bound: list[TvRow] = []
+        for r in eligible:
+            exact = []
+            seen = set()
+            for raw in universe:
+                symbol = str(raw.get("symbol") or "").upper().strip()
+                if symbol != str(r.symbol or "").upper().strip():
+                    continue
+                if not currency_compatible(r.currency, raw.get("currency")):
+                    continue
+                key = (raw.get("symbol"), raw.get("mic"), raw.get("currency"), raw.get("type"), raw.get("figi"), raw.get("shareClassFIGI"))
+                if key not in seen:
+                    seen.add(key); exact.append(raw)
+            if len(exact) != 1:
+                self.stats["us_ootc_preferred_empty_type_finnhub_source_unconfirmed"] += 1
+                continue
+            raw = exact[0]
+            if str(raw.get("mic") or "").upper().strip() != "OOTC" or str(raw.get("type") or "").strip():
+                self.stats["us_ootc_preferred_empty_type_finnhub_source_unconfirmed"] += 1
+                continue
+            source_bound.append(r)
+            self.stats["us_ootc_preferred_empty_type_finnhub_source_proven"] += 1
+        if not source_bound:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "OOTC"} for r in source_bound]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_ootc_preferred_empty_type_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_ootc_preferred_empty_type_openfigi_unavailable"] += len(jobs)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(source_bound, mapped):
+            public_preferred = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "public"
+                and (x.security_type2 or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+            )]
+            figis = {x.figi for x in public_preferred if x.figi}
+            if len(figis) != 1:
+                self.stats["us_ootc_preferred_empty_type_openfigi_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in public_preferred if x.figi == figi)
+            self.stats["us_ootc_preferred_empty_type_openfigi_source_proven"] += 1
+        if not proven:
+            return bindings
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in source_bound:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in source_bound:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_ootc_preferred_empty_type_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if c.symbol != r.symbol or (c.quote_type or "").upper() != "EQUITY":
+                self.stats["us_ootc_preferred_empty_type_yahoo_unconfirmed"] += 1
+                continue
+            if q is None or (q.quote_type or "").upper() != "EQUITY" or not yahoo_venue_compatible("OOTC", q):
+                self.stats["us_ootc_preferred_empty_type_yahoo_unconfirmed"] += 1
+                continue
+            if not q.currency or not currency_compatible(r.currency, q.currency):
+                self.stats["us_ootc_preferred_empty_type_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="OOTC", source_mic="OOTC", target_mic="OOTC",
+                mapping_method="US_OOTC_PREFERRED_FINNHUB_EMPTY_TYPE_EXACT_ISIN",
+                source_of=of, target_of=of,
+            )
+            self.stats["us_ootc_preferred_empty_type_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_otc_preferred_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue an OTC preferred only after discovering one exact source MIC.
+
+        TradingView ``OTC`` is deliberately not mapped to a single ISO MIC.
+        For a ``stock/preferred`` rejected solely because Finnhub reports an
+        unspecified type (``?``), exact ISIN is probed against a bounded set of
+        reviewed current OTC MICs.  Admission requires exactly one MIC to
+        expose exactly one compatible Preferred Stock FIGI, and that MIC must
+        be OOTC.  Yahoo exact-ISIN discovery must then return exactly one route,
+        whose symbol is exactly the TradingView symbol and whose quote is an
+        explicitly reviewed OTC Markets provider venue (OQB or PNK), with
+        compatible currency and EQUITY taxonomy.
+
+        OQB/PNK are treated as Yahoo provider venue codes compatible with the
+        independently proven OOTC source context; they are not asserted to be
+        ISO-MIC aliases.  No cross-venue fallback, ticker guessing, or missing
+        shareClassFIGI bridge is permitted.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if r.prefix != "OTC" or not r.isin:
+                continue
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:?":
+                continue
+            if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        candidate_mics = ("OTCM", "OTCB", "OOTC", "OTCD")
+        jobs = [
+            {"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic}
+            for r in eligible for mic in candidate_mics
+        ]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_otc_preferred_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_otc_preferred_openfigi_unavailable"] += len(jobs)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        pos = 0
+        for r in eligible:
+            proven_by_mic: dict[str, OpenFigiIdentity] = {}
+            for mic in candidate_mics:
+                identities = list(mapped[pos]); pos += 1
+                compatible = [x for x in identities if openfigi_type_compatible(r, x)]
+                preferred = [
+                    x for x in compatible
+                    if (x.security_type2 or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+                    or (x.security_type or "").strip().lower() in {"preferred stock", "preferred", "preference"}
+                ]
+                figis = {x.figi for x in preferred if x.figi}
+                if len(figis) == 1:
+                    figi = next(iter(figis))
+                    proven_by_mic[mic] = next(x for x in preferred if x.figi == figi)
+            if set(proven_by_mic) != {"OOTC"}:
+                if len(proven_by_mic) > 1:
+                    self.stats["us_otc_preferred_source_ambiguous"] += 1
+                else:
+                    self.stats["us_otc_preferred_source_unconfirmed"] += 1
+                continue
+            proven[r.tv_id] = proven_by_mic["OOTC"]
+            self.stats["us_otc_preferred_source_proven_OOTC"] += 1
+
+        if not proven:
+            return bindings
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not callable(search_fn):
+            return bindings
+
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            token = str(r.isin).upper().strip()
+            if token not in searches:
+                try:
+                    searches[token] = list(search_fn(token))
+                except ProviderError:
+                    searches[token] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            if of is None:
+                continue
+            cs = searches.get(str(r.isin).upper().strip(), [])
+            # Exact-ISIN discovery itself must be unique.  Quote filtering may
+            # validate that route, but must never choose among search routes.
+            if len(cs) != 1:
+                self.stats["us_otc_preferred_yahoo_search_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            if c.symbol != r.symbol:
+                self.stats["us_otc_preferred_yahoo_symbol_mismatch"] += 1
+                continue
+            q = quotes.get(c.symbol)
+            if q is None or not yahoo_type_compatible(r, q.quote_type):
+                self.stats["us_otc_preferred_yahoo_contract_unconfirmed"] += 1
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                self.stats["us_otc_preferred_yahoo_contract_unconfirmed"] += 1
+                continue
+            exchange = str(q.exchange or "").upper().strip()
+            full_name = str(q.full_exchange_name or "").lower()
+            if exchange not in {"OQB", "PNK"} or "otc markets" not in full_name:
+                self.stats["us_otc_preferred_yahoo_venue_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="OOTC",
+                source_mic="OOTC", target_mic="OOTC",
+                mapping_method="US_OTC_PREFERRED_EXACT_ISIN_SAME_LISTING",
+                source_of=of, target_of=of,
+            )
+            self.stats["us_otc_preferred_rescue_matches"] += 1
+            self.stats[f"us_otc_preferred_rescue_matches_{_telemetry_token(exchange)}"] += 1
+
+        if not rescued:
+            return bindings
+        return [rescued.get(b.tv_id, b) for b in bindings]
+
     def _resolve_non_us(self, rows: list[TvRow]) -> list[Binding]:
         """Resolve non-US listings with OpenFIGI as the identity authority.
 
@@ -859,8 +1997,8 @@ class BatchResolver:
 
             retry_rows: list[TvRow] = []
             retry_jobs: list[dict] = []
-            german_direct_isin_rows: list[TvRow] = []
-            german_direct_isin_jobs: list[dict] = []
+            direct_isin_rows: list[TvRow] = []
+            direct_isin_jobs: list[dict] = []
             isin_fallback_rows: list[tuple[TvRow, str]] = []
             isin_fallback_jobs: list[dict] = []
             isin_unscoped_rows: list[tuple[TvRow, str]] = []
@@ -1077,10 +2215,10 @@ class BatchResolver:
                         })
                         continue
                     if ((reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
-                            and r.prefix in {"FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
+                            and r.prefix in {"FWB", "DUS", "HAM", "SWB", "MUN", "HAN", "BX"}
                             and r.isin):
-                        german_direct_isin_rows.append(r)
-                        german_direct_isin_jobs.append({
+                        direct_isin_rows.append(r)
+                        direct_isin_jobs.append({
                             "idType": "ID_ISIN",
                             "idValue": r.isin,
                             "micCode": TV_PREFIX_TO_MIC[r.prefix],
@@ -1090,17 +2228,17 @@ class BatchResolver:
                         continue
                     rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
 
-                if german_direct_isin_jobs:
+                if direct_isin_jobs:
                     try:
-                        german_direct_isin_mapped = self.openfigi.map_jobs(german_direct_isin_jobs)
-                        self.stats["openfigi_jobs"] += len(german_direct_isin_jobs)
-                        self.stats["openfigi_german_direct_isin_fallback_jobs"] += len(german_direct_isin_jobs)
-                        self.stats["openfigi_http_batches"] += (len(german_direct_isin_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                        direct_isin_mapped = self.openfigi.map_jobs(direct_isin_jobs)
+                        self.stats["openfigi_jobs"] += len(direct_isin_jobs)
+                        self.stats["openfigi_direct_isin_fallback_jobs"] += len(direct_isin_jobs)
+                        self.stats["openfigi_http_batches"] += (len(direct_isin_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
                     except ProviderError as exc:
-                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in german_direct_isin_rows)
-                        german_direct_isin_mapped = [[] for _ in german_direct_isin_rows]
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in direct_isin_rows)
+                        direct_isin_mapped = [[] for _ in direct_isin_rows]
 
-                    for r, identities in zip(german_direct_isin_rows, german_direct_isin_mapped):
+                    for r, identities in zip(direct_isin_rows, direct_isin_mapped):
                         of, collapsed = _select_isin_bridge_target(r, identities)
                         prefix_token = _telemetry_token(r.prefix)
                         if of is not None:
@@ -1108,11 +2246,11 @@ class BatchResolver:
                                 r, of, collapsed,
                                 method_override="TV_ISIN_SAME_VENUE_FALLBACK",
                             )
-                            self.stats["openfigi_german_direct_isin_fallback_matches"] += 1
-                            self.stats[f"openfigi_german_direct_isin_fallback_matches_{prefix_token}"] += 1
+                            self.stats["openfigi_direct_isin_fallback_matches"] += 1
+                            self.stats[f"openfigi_direct_isin_fallback_matches_{prefix_token}"] += 1
                             continue
-                        self.stats["openfigi_german_direct_isin_fallback_no_match"] += 1
-                        self.stats[f"openfigi_german_direct_isin_fallback_no_match_{prefix_token}"] += 1
+                        self.stats["openfigi_direct_isin_fallback_no_match"] += 1
+                        self.stats[f"openfigi_direct_isin_fallback_no_match_{prefix_token}"] += 1
                         if not add_target_provider_strict_fallback(r):
                             rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
 
@@ -2620,7 +3758,7 @@ class BatchResolver:
             verified.extend(final_rescued)
             rejected = [b for b in rejected if b.tv_id not in final_ids]
 
-        home_rescued = self._germany_exact_isin_yahoo_home_market_rescue(rows, rejected)
+        home_rescued = self._exact_isin_yahoo_home_market_rescue(rows, rejected)
         if home_rescued:
             home_ids = {b.tv_id for b in home_rescued}
             verified.extend(home_rescued)
@@ -2943,12 +4081,12 @@ class BatchResolver:
         return rescued
 
 
-    def _germany_exact_isin_yahoo_home_market_rescue(
+    def _exact_isin_yahoo_home_market_rescue(
         self,
         rows: list[TvRow],
         rejected: list[Binding],
     ) -> list[Binding]:
-        """Resolve a rejected German source row to Yahoo's home-market listing.
+        """Resolve an eligible rejected source row to Yahoo's home-market listing.
 
         This path deliberately changes quote routing, not security identity.
         TradingView's exact ISIN is resolved unscoped at OpenFIGI; admission
@@ -2959,8 +4097,8 @@ class BatchResolver:
         MIC with the same shareClassFIGI. ID_EXCH_SYMBOL + home MIC is retained only
         as a secondary fallback when the targeted ISIN mapping is absent.
         Quote/chart metadata must explicitly report the same Yahoo exchange plus
-        a currency and EQUITY type.  TradingView Germany EUR is intentionally not
-        compared with the home-market quote currency.
+        a currency and EQUITY type.  The source-listing currency is intentionally not compared with the home-market
+        quote currency: this path changes quote routing, not security identity.
 
         Multiple simultaneously-valid Yahoo symbols remain fail-closed because
         choosing a preferred home listing would otherwise require a new routing
@@ -2971,10 +4109,12 @@ class BatchResolver:
             "OPENFIGI_TARGET_NO_MATCH",
             "YAHOO_NO_MATCH",
             "YAHOO_TYPE_MISMATCH:MUTUALFUND",
+            "YAHOO_SUFFIX_UNKNOWN:XBRN",
+            "YAHOO_CURRENCY_UNREPORTED_TARGET_ONLY",
         }
         eligible_prefixes = {
             "XETR", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN",
-            "GETTEX", "LS", "LSX", "TRADEGATE",
+            "GETTEX", "LS", "LSX", "TRADEGATE", "BX", "SIX",
         }
         rejected_by_id = {b.tv_id: b for b in rejected}
         candidate_rows: list[TvRow] = []
@@ -2982,9 +4122,19 @@ class BatchResolver:
             b = rejected_by_id.get(r.tv_id)
             if b is None or b.rejection_reason not in eligible_reasons:
                 continue
+            kind = tv_type_kind(r)
             specs = {str(x).lower() for x in r.type_specs if x}
-            if (r.prefix not in eligible_prefixes or not r.isin
-                    or tv_type_kind(r) != "STOCK" or "common" not in specs):
+            if r.prefix not in eligible_prefixes or not r.isin:
+                continue
+            # Exact-ISIN/share-class proof is security-level evidence, so the
+            # generic home-route fallback can also cover preferred shares and
+            # depositary receipts.  Taxonomy still has to be compatible in
+            # OpenFIGI and Yahoo must explicitly return EQUITY.
+            if kind == "STOCK" and "common" not in specs:
+                continue
+            if kind == "PREFERRED" and "preferred" not in specs:
+                continue
+            if kind not in {"STOCK", "PREFERRED", "ADR"}:
                 continue
             candidate_rows.append(r)
         if not candidate_rows:

@@ -1,5 +1,5 @@
 from tv_market_identity.cache import CacheDB
-from tv_market_identity.models import TvRow, YahooQuote
+from tv_market_identity.models import Binding, TvRow, YahooQuote
 from tv_market_identity.resolver import BatchResolver
 
 
@@ -1953,3 +1953,736 @@ def test_policy49_reuses_policy44_verified_cache_entries(tmp_path):
     assert resolver.stats["cache_hits"] == 1
     assert resolver.stats["cache_misses"] == 0
     db.close()
+
+class FHPreferredIncomplete:
+    def us_symbols(self):
+        return [
+            {"symbol":"BMNP","displaySymbol":"BMNP","description":"PREFERRED","currency":"USD","type":"PUBLIC","mic":"XNYS","figi":"FH_BMNP","shareClassFIGI":None},
+            {"symbol":"SOJE","displaySymbol":"SOJE","description":"PREFERRED","currency":"USD","type":"?","mic":"XNYS","figi":"FH_SOJE","shareClassFIGI":None},
+            {"symbol":"NASP","displaySymbol":"NASP","description":"PREFERRED","currency":"USD","type":"PUBLIC","mic":"XNAS","figi":"FH_NASP","shareClassFIGI":None},
+        ]
+
+
+class OFPreferredSameVenue:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            if job.get("idType") == "ID_ISIN" and job.get("micCode") == "XNYS":
+                out.append([OpenFigiIdentity(
+                    figi="OF_" + job["idValue"], composite_figi="COMP", share_class_figi=None,
+                    ticker="PREF", name="PREFERRED", security_type="PUBLIC",
+                    security_type2="Preferred Stock", exch_code="US",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHPreferredSameVenue:
+    batch_size = 75
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        if isin == "US0000000001":
+            return [YahooSearchCandidate("BMNP", "NYQ", "EQUITY", None, None)]
+        return []
+
+    def quotes(self, symbols):
+        out = {}
+        for symbol in symbols:
+            if symbol in {"BMNP", "SOJE", "NASP"}:
+                out[symbol] = YahooQuote(symbol, "NYQ" if symbol != "NASP" else "NMS", "NYSE" if symbol != "NASP" else "NasdaqGS", "USD", "EQUITY", "us_market", None, None, 25.0, 0)
+        return out
+
+
+def test_us_preferred_same_venue_exact_isin_yahoo_admission(tmp_path):
+    db = CacheDB(tmp_path / "pref_isin.sqlite")
+    r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
+    row = TvRow("NYSE:BMNP", "NYSE", "BMNP", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000001")
+    got = r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_PREFERRED_SAME_VENUE_EXACT_ISIN_YAHOO"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert got.source_venue_figi == got.target_venue_figi == "OF_US0000000001"
+    assert got.share_class_figi is None
+    db.close()
+
+
+def test_us_preferred_same_venue_exact_tv_symbol_fallback_admission(tmp_path):
+    db = CacheDB(tmp_path / "pref_tv.sqlite")
+    r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
+    row = TvRow("NYSE:SOJE", "NYSE", "SOJE", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000002")
+    got = r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.yahoo_symbol == "SOJE"
+    assert got.mapping_method == "US_PREFERRED_SAME_VENUE_EXACT_TV_SYMBOL"
+    assert got.share_class_figi is None
+    db.close()
+
+
+def test_us_preferred_same_venue_requires_source_isin_mic_proof(tmp_path):
+    db = CacheDB(tmp_path / "pref_fail.sqlite")
+    r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
+    row = TvRow("NASDAQ:NASP", "NASDAQ", "NASP", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000003")
+    got = r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:PUBLIC"
+    db.close()
+
+class FHOTCPreferredIncomplete:
+    def us_symbols(self):
+        return [
+            {"symbol":"OTCP","displaySymbol":"OTCP","description":"PREFERRED","currency":"USD","type":"?","mic":"OOTC","figi":"FH_OTCP","shareClassFIGI":None},
+            {"symbol":"PINKP","displaySymbol":"PINKP","description":"PREFERRED","currency":"USD","type":"?","mic":"OOTC","figi":"FH_PINKP","shareClassFIGI":None},
+            {"symbol":"CROSSF","displaySymbol":"CROSSF","description":"PREFERRED","currency":"USD","type":"?","mic":"OOTC","figi":"FH_CROSSF","shareClassFIGI":None},
+            {"symbol":"AMBPF","displaySymbol":"AMBPF","description":"PREFERRED","currency":"USD","type":"?","mic":"OOTC","figi":"FH_AMBPF","shareClassFIGI":None},
+        ]
+
+class OFOTCPreferredDiscovery:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            isin=job.get("idValue"); mic=job.get("micCode")
+            matched = mic == "OOTC" or (isin == "US0000000014" and mic == "OTCM")
+            if matched:
+                out.append([OpenFigiIdentity(
+                    figi=f"OF_{isin}_{mic}", composite_figi="COMP", share_class_figi=None,
+                    ticker="PREF", name="PREFERRED", security_type="PUBLIC",
+                    security_type2="Preferred Stock", exch_code="US")])
+            else:
+                out.append([])
+        return out
+
+class YHOTCPreferred:
+    batch_size=75
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        symbols={
+            "US0000000011":("OTCP","OQB"),
+            "US0000000012":("PINKP","PNK"),
+            "US0000000013":("HOME.TO","TOR"),
+            "US0000000014":("AMBPF","OQB"),
+        }
+        v=symbols.get(isin)
+        return [YahooSearchCandidate(v[0],v[1],"EQUITY",None,None)] if v else []
+    def quotes(self, symbols):
+        out={}
+        for symbol in symbols:
+            if symbol == "OTCP":
+                out[symbol]=YahooQuote(symbol,"OQB","OTC Markets OTCQB","USD","EQUITY","us_market",None,None,25.0,0)
+            elif symbol == "PINKP":
+                out[symbol]=YahooQuote(symbol,"PNK","OTC Markets OTCPK","USD","EQUITY","us_market",None,None,25.0,0)
+            elif symbol == "HOME.TO":
+                out[symbol]=YahooQuote(symbol,"TOR","Toronto","USD","EQUITY","ca_market",None,None,25.0,0)
+            elif symbol == "AMBPF":
+                out[symbol]=YahooQuote(symbol,"OQB","OTC Markets OTCQB","USD","EQUITY","us_market",None,None,25.0,0)
+        return out
+
+
+def test_us_otc_preferred_unique_ootc_oqb_admission(tmp_path):
+    db=CacheDB(tmp_path/"otc_oqb.sqlite")
+    r=BatchResolver(db,FHOTCPreferredIncomplete(),OFOTCPreferredDiscovery(),YHOTCPreferred())
+    row=TvRow("OTC:OTCP","OTC","OTCP",None,"USD","stock",("preferred",),None,None,25.0,"US0000000011")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_OTC_PREFERRED_EXACT_ISIN_SAME_LISTING"
+    assert got.source_mic == got.target_mic == "OOTC"
+    assert got.yahoo_symbol == "OTCP"
+    assert got.share_class_figi is None
+    db.close()
+
+
+def test_us_otc_preferred_unique_ootc_pnk_admission(tmp_path):
+    db=CacheDB(tmp_path/"otc_pnk.sqlite")
+    r=BatchResolver(db,FHOTCPreferredIncomplete(),OFOTCPreferredDiscovery(),YHOTCPreferred())
+    row=TvRow("OTC:PINKP","OTC","PINKP",None,"USD","stock",("preferred",),None,None,25.0,"US0000000012")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.yahoo_symbol == "PINKP"
+    db.close()
+
+
+def test_us_otc_preferred_cross_market_yahoo_remains_rejected(tmp_path):
+    db=CacheDB(tmp_path/"otc_cross.sqlite")
+    r=BatchResolver(db,FHOTCPreferredIncomplete(),OFOTCPreferredDiscovery(),YHOTCPreferred())
+    row=TvRow("OTC:CROSSF","OTC","CROSSF",None,"USD","stock",("preferred",),None,None,25.0,"US0000000013")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:?"
+    db.close()
+
+
+def test_us_otc_preferred_multiple_proven_mics_remains_rejected(tmp_path):
+    db=CacheDB(tmp_path/"otc_amb.sqlite")
+    r=BatchResolver(db,FHOTCPreferredIncomplete(),OFOTCPreferredDiscovery(),YHOTCPreferred())
+    row=TvRow("OTC:AMBPF","OTC","AMBPF",None,"USD","stock",("preferred",),None,None,25.0,"US0000000014")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:?"
+    db.close()
+
+class FHNYSESlashPreferred:
+    def us_symbols(self):
+        return []
+
+class OFNYSESlashPreferred:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        return [[OpenFigiIdentity(figi="OF_" + j["idValue"], composite_figi=None, share_class_figi=None, ticker="PSA", name="Preferred", security_type="PUBLIC", security_type2="Preferred Stock", exch_code="US")] for j in jobs]
+
+class YHNYSESlashPreferred:
+    def __init__(self, candidate="PSA-PU", exchange="NYQ", full="NYSE", currency="USD", qtype="EQUITY"):
+        self.candidate, self.exchange, self.full, self.currency, self.qtype = candidate, exchange, full, currency, qtype
+    def search_exact_isin(self, isin):
+        from tv_market_identity.models import YahooSearchCandidate
+        return [YahooSearchCandidate(self.candidate, self.exchange, self.qtype, None, None)]
+    def quotes(self, symbols):
+        return {s: YahooQuote(s, self.exchange, self.full, self.currency, self.qtype, "us_market", None, None, 25.0, 0) for s in symbols}
+
+def _run_nyse_slash_rescue(tmp_path, yahoo, reason="YAHOO_SYMBOL_NOT_FOUND", tv_symbol="PSA/PU"):
+    db = CacheDB(tmp_path / "slash.sqlite")
+    r = BatchResolver(db, FHNYSESlashPreferred(), OFNYSESlashPreferred(), yahoo)
+    row = TvRow("NYSE:" + tv_symbol, "NYSE", tv_symbol, None, "USD", "stock", ("preferred",), None, None, 25.0, "US74460W3622")
+    # Test the rescue directly so the fixture precisely controls the prior rejection class.
+    initial = [Binding(tv_id=row.tv_id, tv_symbol=row.symbol, tv_prefix=row.prefix, tv_currency=row.currency, tv_type=row.tv_type, status="REJECTED", rejection_reason=reason)]
+    got = r._us_nyse_preferred_exact_isin_symbol_rescue([row], initial)[0]
+    db.close()
+    return got
+
+def test_v077_nyse_slash_preferred_exact_isin_symbol_rescue(tmp_path):
+    got = _run_nyse_slash_rescue(tmp_path, YHNYSESlashPreferred())
+    assert got.status == "VERIFIED"
+    assert got.yahoo_symbol == "PSA-PU"
+    assert got.mapping_method == "US_NYSE_PREFERRED_EXACT_ISIN_SYMBOL"
+    assert got.source_mic == got.target_mic == "XNYS"
+
+def test_v077_nyse_slash_preferred_rescues_prior_yahoo_mutualfund_rejection(tmp_path):
+    got = _run_nyse_slash_rescue(tmp_path, YHNYSESlashPreferred(candidate="TDS-PU"), "YAHOO_TYPE_MISMATCH:MUTUALFUND", "TDS/PU")
+    assert got.status == "VERIFIED"
+
+def test_v077_nyse_slash_preferred_rejects_cross_market_exact_isin(tmp_path):
+    got = _run_nyse_slash_rescue(tmp_path, YHNYSESlashPreferred(candidate="PUP0.F", exchange="FRA", full="Frankfurt", currency="EUR"))
+    assert got.status == "REJECTED"
+
+def test_v077_nyse_slash_preferred_rejects_noncorrelated_yahoo_symbol(tmp_path):
+    got = _run_nyse_slash_rescue(tmp_path, YHNYSESlashPreferred(candidate="OTHER-PU"))
+    assert got.status == "REJECTED"
+
+class FHUnitV079:
+    def us_symbols(self):
+        return [
+            {"symbol":"FUNDU","displaySymbol":"FUNDU","description":"FUND UNIT","currency":"USD","type":"Unit","mic":"XNYS","figi":"FH_FUNDU","shareClassFIGI":"SC1"},
+            {"symbol":"NASU","displaySymbol":"NASU","description":"NASDAQ UNIT","currency":"USD","type":"Unit","mic":"XNAS","figi":"FH_NASU","shareClassFIGI":"SC2"},
+            {"symbol":"STKU","displaySymbol":"STKU","description":"STOCK UNIT","currency":"USD","type":"Unit","mic":"XNYS","figi":"FH_STKU","shareClassFIGI":"SC3"},
+            {"symbol":"BADU","displaySymbol":"BADU","description":"BAD UNIT","currency":"USD","type":"Unit","mic":"XNYS","figi":"FH_BADU","shareClassFIGI":"SC4"},
+        ]
+
+class OFUnitV079:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            isin=job.get("idValue")
+            mic=job.get("micCode")
+            shares={"US0000000101":"SC1","US0000000102":"SC2","US0000000103":"SC3","US0000000104":"SC4"}
+            sc=shares.get(isin)
+            if not sc:
+                out.append([]); continue
+            if isin == "US0000000102" and mic == "XNAS":
+                out.append([]); continue
+            if isin == "US0000000104" and mic == "XNYS":
+                sc="DIFFERENT"
+            tickers={"US0000000101":"FUNDU","US0000000102":"NASU","US0000000103":"STKU","US0000000104":"BADU"}
+            out.append([OpenFigiIdentity(
+                figi=f"OF_{isin}_{mic or 'ALL'}", composite_figi=f"COMP_{isin}",
+                share_class_figi=sc, ticker=tickers.get(isin, "UNIT"), name="UNIT TEST",
+                security_type="Unit", security_type2="Unit", exch_code="US",
+            )])
+        return out
+
+class YHUnitV079:
+    batch_size = 75
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        symbols={"US0000000101":"FUNDU","US0000000102":"NASU","US0000000103":"STKU","US0000000104":"BADU"}
+        s=symbols.get(isin)
+        return [YahooSearchCandidate(s, "NYQ" if s != "NASU" else "NMS", "EQUITY", None, None)] if s else []
+    def quotes(self, symbols):
+        return {s: YahooQuote(s, "NMS" if s == "NASU" else "NYQ", "NasdaqGS" if s == "NASU" else "NYSE", "USD", "EQUITY", "us_market", None, None, 10.0, 0) for s in symbols}
+
+
+def test_v079_xnys_fund_unit_exact_isin_admission(tmp_path):
+    db=CacheDB(tmp_path / "v079-unit.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NYSE:FUNDU", "NYSE", "FUNDU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000101")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_FUND_UNIT_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert got.share_class_figi == "SC1"
+    assert r.stats["us_xnys_fund_unit_source_proven"] == 1
+    assert r.stats["us_xnys_fund_unit_rescue_matches"] == 1
+    db.close()
+
+
+def test_v079_xnys_rule_itself_does_not_claim_xnas(tmp_path):
+    # v0.3.81 adds a separate audited XNAS rule; the original XNYS rule must
+    # still not be the path that admits this row.
+    db=CacheDB(tmp_path / "v079-xnas.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NASDAQ:NASU", "NASDAQ", "NASU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000102")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNAS_FUND_UNIT_EXACT_ISIN"
+    assert r.stats["us_xnys_fund_unit_rescue_matches"] == 0
+    db.close()
+
+
+def test_v079_unit_does_not_generalize_to_stock_common(tmp_path):
+    db=CacheDB(tmp_path / "v079-stock.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NYSE:STKU", "NYSE", "STKU", None, "USD", "stock", ("common",), None, None, 10.0, "US0000000103")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    db.close()
+
+
+def test_v079_xnys_fund_unit_requires_matching_share_class(tmp_path):
+    db=CacheDB(tmp_path / "v079-share.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NYSE:BADU", "NYSE", "BADU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000104")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    assert r.stats["us_xnys_fund_unit_source_unconfirmed"] == 1
+    db.close()
+
+# v0.3.81: the v0.3.80 diagnostic established a homogeneous 146-row XNAS
+# fund/unit provider-gap cohort.  These tests keep the rescue narrow.
+def test_v081_xnas_fund_unit_exact_isin_admission(tmp_path):
+    db=CacheDB(tmp_path / "v081-xnas-unit.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NASDAQ:NASU", "NASDAQ", "NASU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000102")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNAS_FUND_UNIT_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNAS"
+    assert got.share_class_figi == "SC2"
+    assert r.stats["us_xnas_fund_unit_identity_proven"] == 1
+    assert r.stats["us_xnas_fund_unit_rescue_matches"] == 1
+    db.close()
+
+
+def test_v081_xnas_unit_does_not_generalize_to_stock_common(tmp_path):
+    db=CacheDB(tmp_path / "v081-xnas-stock.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV079())
+    row=TvRow("NASDAQ:NASU", "NASDAQ", "NASU", None, "USD", "stock", ("common",), None, None, 10.0, "US0000000102")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    assert r.stats["us_xnas_fund_unit_rescue_matches"] == 0
+    db.close()
+
+
+class YHUnitV081WrongSymbol(YHUnitV079):
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        if isin == "US0000000102":
+            return [YahooSearchCandidate("OTHERU", "NMS", "EQUITY", None, None)]
+        return super().search_exact_isin(isin, max_results)
+    def quotes(self, symbols):
+        return {s: YahooQuote(s, "NMS", "NasdaqGS", "USD", "EQUITY", "us_market", None, None, 10.0, 0) for s in symbols}
+
+
+def test_v081_xnas_fund_unit_requires_exact_yahoo_symbol(tmp_path):
+    db=CacheDB(tmp_path / "v081-xnas-symbol.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV079(), YHUnitV081WrongSymbol())
+    row=TvRow("NASDAQ:NASU", "NASDAQ", "NASU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000102")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    assert r.stats["us_xnas_fund_unit_yahoo_unconfirmed"] == 1
+    db.close()
+
+
+class OFUnitV081ScopedConflict(OFUnitV079):
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=super().map_jobs(jobs)
+        for i, job in enumerate(jobs):
+            if job.get("idValue") == "US0000000102" and job.get("micCode") == "XNAS":
+                out[i]=[OpenFigiIdentity(figi="CONFLICT", composite_figi="CONFLICT", share_class_figi="SC2", ticker="NASU", name="NASDAQ UNIT", security_type="Unit", security_type2="Unit", exch_code="US")]
+        return out
+
+
+def test_v081_xnas_fund_unit_requires_scoped_no_match_pattern(tmp_path):
+    db=CacheDB(tmp_path / "v081-xnas-scoped.sqlite")
+    r=BatchResolver(db, FHUnitV079(), OFUnitV081ScopedConflict(), YHUnitV079())
+    row=TvRow("NASDAQ:NASU", "NASDAQ", "NASU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000102")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Unit"
+    assert r.stats["us_xnas_fund_unit_identity_unconfirmed"] == 1
+    db.close()
+
+# v0.3.84: six audited NYSE fund/unit PUBLIC rows have direct same-venue proof.
+class FHPublicV084:
+    batch_size = 100
+    def us_symbols(self):
+        return [
+            {"symbol":"PUBU","displaySymbol":"PUBU","description":"PUBLIC UNIT","currency":"USD","type":"PUBLIC","mic":"XNYS","figi":"FH_PUBU"},
+            {"symbol":"PREF","displaySymbol":"PREF","description":"PREFERRED","currency":"USD","type":"PUBLIC","mic":"XNYS","figi":"FH_PREF"},
+        ]
+
+class OFPublicV084:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            isin=job.get("idValue"); mic=job.get("micCode")
+            if isin == "US0000000841" and mic == "XNYS":
+                out.append([OpenFigiIdentity("OF_PUBU", "COMP", None, "PUBU", "PUBLIC UNIT", "PUBLIC", "Preferred Stock", "US")])
+            elif isin == "US0000000842" and mic == "XNYS":
+                out.append([OpenFigiIdentity("OF_PREF", "COMP2", None, "PREF", "PREFERRED", "PUBLIC", "Preferred Stock", "US")])
+            else:
+                out.append([])
+        return out
+
+class YHPublicV084:
+    batch_size = 75
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        s={"US0000000841":"PUBU","US0000000842":"PREF"}.get(isin)
+        return [YahooSearchCandidate(s, "NYQ", "EQUITY", None, None)] if s else []
+    def quotes(self, symbols):
+        return {s: YahooQuote(s, "NYQ", "NYSE", "USD", "EQUITY", "us_market", None, None, 10.0, 0) for s in symbols}
+
+def test_v084_xnys_fund_unit_public_exact_isin_admission(tmp_path):
+    db=CacheDB(tmp_path / "v084-public.sqlite")
+    r=BatchResolver(db, FHPublicV084(), OFPublicV084(), YHPublicV084())
+    row=TvRow("NYSE:PUBU", "NYSE", "PUBU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000841")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_FUND_UNIT_PUBLIC_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert got.share_class_figi is None
+    assert r.stats["us_xnys_fund_unit_public_source_proven"] == 1
+    assert r.stats["us_xnys_fund_unit_public_rescue_matches"] == 1
+    db.close()
+
+def test_v084_public_rule_does_not_generalize_to_stock_preferred(tmp_path):
+    db=CacheDB(tmp_path / "v084-public-preferred.sqlite")
+    r=BatchResolver(db, FHPublicV084(), OFPublicV084(), YHPublicV084())
+    row=TvRow("NYSE:PREF", "NYSE", "PREF", None, "USD", "stock", ("preferred",), None, None, 10.0, "US0000000842")
+    got=r.resolve([row])[row.tv_id]
+    # Existing preferred same-venue path is allowed to admit this independently;
+    # the new fund/unit PUBLIC method must never be the admission route.
+    assert got.mapping_method != "US_XNYS_FUND_UNIT_PUBLIC_EXACT_ISIN"
+    assert r.stats["us_xnys_fund_unit_public_rescue_matches"] == 0
+    db.close()
+
+def test_v084_public_rule_does_not_claim_xnas(tmp_path):
+    db=CacheDB(tmp_path / "v084-public-xnas.sqlite")
+    r=BatchResolver(db, FHPublicV084(), OFPublicV084(), YHPublicV084())
+    row=TvRow("NASDAQ:PUBU", "NASDAQ", "PUBU", None, "USD", "fund", ("unit",), None, None, 10.0, "US0000000841")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:PUBLIC"
+    assert r.stats["us_xnys_fund_unit_public_rescue_matches"] == 0
+    db.close()
+
+# v0.3.87: audited OOTC preferred rows with empty Finnhub type and PUBLIC source proof.
+class FHEmptyOOTCV087:
+    batch_size = 100
+    def us_symbols(self):
+        return [{"symbol":"EPREF","displaySymbol":"EPREF","description":"EMPTY TYPE PREF","currency":"USD","type":"","mic":"OOTC","figi":"FH_EPREF"}]
+
+class OFEmptyOOTCV087:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            if job.get("idValue") == "US0000000871" and job.get("micCode") == "OOTC":
+                out.append([OpenFigiIdentity("OF_EPREF","COMP",None,"EPREF","EMPTY TYPE PREF","PUBLIC","Preferred Stock","US")])
+            else:
+                out.append([])
+        return out
+
+class YHEmptyOOTCV087:
+    batch_size = 75
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        return [YahooSearchCandidate("EPREF","OID","EQUITY",None,None)] if isin == "US0000000871" else []
+    def quotes(self, symbols):
+        return {s: YahooQuote(s,"OID","OTC Markets OTCID","USD","EQUITY","us_market",None,None,10.0,0) for s in symbols}
+
+def test_v087_ootc_preferred_empty_type_public_exact_isin_admission(tmp_path):
+    db=CacheDB(tmp_path / "v087-ootc-empty.sqlite")
+    r=BatchResolver(db,FHEmptyOOTCV087(),OFEmptyOOTCV087(),YHEmptyOOTCV087())
+    row=TvRow("OTC:EPREF","OTC","EPREF",None,"USD","stock",("preferred",),None,None,10.0,"US0000000871")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_OOTC_PREFERRED_FINNHUB_EMPTY_TYPE_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "OOTC"
+    assert got.share_class_figi is None
+    assert r.stats["us_ootc_preferred_empty_type_finnhub_source_proven"] == 1
+    assert r.stats["us_ootc_preferred_empty_type_openfigi_source_proven"] == 1
+    assert r.stats["us_ootc_preferred_empty_type_rescue_matches"] == 1
+    db.close()
+
+class OFPrivateOOTCV087(OFEmptyOOTCV087):
+    def map_jobs(self,jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        return [[OpenFigiIdentity("OF_EPREF","COMP",None,"EPREF","EMPTY TYPE PREF","PRIVATE","Preferred Stock","US")] if j.get("micCode") == "OOTC" else [] for j in jobs]
+
+def test_v087_ootc_empty_type_private_preferred_stays_rejected(tmp_path):
+    db=CacheDB(tmp_path / "v087-private.sqlite")
+    r=BatchResolver(db,FHEmptyOOTCV087(),OFPrivateOOTCV087(),YHEmptyOOTCV087())
+    row=TvRow("OTC:EPREF","OTC","EPREF",None,"USD","stock",("preferred",),None,None,10.0,"US0000000871")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:?"
+    assert r.stats["us_ootc_preferred_empty_type_rescue_matches"] == 0
+    db.close()
+
+def test_v087_ootc_empty_type_common_stays_rejected(tmp_path):
+    db=CacheDB(tmp_path / "v087-common.sqlite")
+    r=BatchResolver(db,FHEmptyOOTCV087(),OFEmptyOOTCV087(),YHEmptyOOTCV087())
+    row=TvRow("OTC:EPREF","OTC","EPREF",None,"USD","stock",("common",),None,None,10.0,"US0000000871")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "REJECTED"
+    assert r.stats["us_ootc_preferred_empty_type_rescue_matches"] == 0
+    db.close()
+
+# v0.3.95: audited NYSE stock/common Royalty Trust exact-ISIN rescue.
+class FHRoyaltyV095:
+    batch_size = 100
+    def us_symbols(self):
+        return [
+            {"symbol":"SJT","displaySymbol":"SJT","description":"ROYALTY TRUST","currency":"USD","type":"Royalty Trst","mic":"XNYS","figi":"FH_SJT"},
+            {"symbol":"MARPS","displaySymbol":"MARPS","description":"ROYALTY TRUST","currency":"USD","type":"Royalty Trst","mic":"XNAS","figi":"FH_MARPS"},
+            {"symbol":"ROYTL","displaySymbol":"ROYTL","description":"ROYALTY TRUST","currency":"USD","type":"Royalty Trst","mic":"OOTC","figi":"FH_ROYTL"},
+            {"symbol":"OTHER","displaySymbol":"OTHER","description":"OTHER","currency":"USD","type":"Common Stock","mic":"XNYS","figi":"FH_OTHER"},
+        ]
+
+class OFRoyaltyV095:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for j in jobs:
+            isin=j.get("idValue"); mic=j.get("micCode")
+            if isin == "US0000000951" and mic == "XNYS":
+                out.append([OpenFigiIdentity("OF_SJT","COMP",None,"SJT","TRUST","Royalty Trst","Common Stock","US")])
+            else:
+                out.append([])
+        return out
+
+class YHRoyaltyV095:
+    batch_size = 75
+    def __init__(self, symbol="SJT", exchange="NYQ"):
+        self.symbol=symbol; self.exchange=exchange
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        if isin != "US0000000951": return []
+        return [YahooSearchCandidate(self.symbol, self.exchange, "EQUITY", None, None)]
+    def quotes(self, symbols):
+        return {s: YahooQuote(s, self.exchange, "NYSE" if self.exchange=="NYQ" else "Nasdaq", "USD", "EQUITY", "us_market", None, None, 10.0, 0) for s in symbols}
+
+def test_v095_xnys_stock_common_royalty_trust_admission(tmp_path):
+    db=CacheDB(tmp_path / "v095-royalty.sqlite")
+    r=BatchResolver(db, FHRoyaltyV095(), OFRoyaltyV095(), YHRoyaltyV095())
+    row=TvRow("NYSE:SJT","NYSE","SJT",None,"USD","stock",("common",),None,None,10.0,"US0000000951")
+    got=r.resolve([row])[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_STOCK_COMMON_ROYALTY_TRUST_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert r.stats["us_xnys_stock_common_royalty_trust_source_proven"] == 1
+    assert r.stats["us_xnys_stock_common_royalty_trust_rescue_matches"] == 1
+    db.close()
+
+def test_v095_royalty_rule_does_not_claim_xnas_or_otc(tmp_path):
+    for prefix, symbol, isin in [("NASDAQ","MARPS","US0000000952"),("OTC","ROYTL","US0000000953")]:
+        db=CacheDB(tmp_path / f"v095-{symbol}.sqlite")
+        r=BatchResolver(db, FHRoyaltyV095(), OFRoyaltyV095(), YHRoyaltyV095())
+        row=TvRow(f"{prefix}:{symbol}",prefix,symbol,None,"USD","stock",("common",),None,None,10.0,isin)
+        got=r.resolve([row])[row.tv_id]
+        assert got.status == "REJECTED"
+        assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Royalty Trst"
+        assert r.stats["us_xnys_stock_common_royalty_trust_rescue_matches"] == 0
+        db.close()
+
+def test_v095_royalty_rule_requires_exact_yahoo_symbol_and_venue(tmp_path):
+    for symbol, exchange in [("SJT-X","NYQ"),("SJT","NMS")]:
+        db=CacheDB(tmp_path / f"v095-yahoo-{symbol}-{exchange}.sqlite")
+        r=BatchResolver(db, FHRoyaltyV095(), OFRoyaltyV095(), YHRoyaltyV095(symbol,exchange))
+        row=TvRow("NYSE:SJT","NYSE","SJT",None,"USD","stock",("common",),None,None,10.0,"US0000000951")
+        got=r.resolve([row])[row.tv_id]
+        assert got.status == "REJECTED"
+        assert r.stats["us_xnys_stock_common_royalty_trust_rescue_matches"] == 0
+        db.close()
+
+def test_v095_royalty_rule_does_not_claim_non_royalty_taxonomy(tmp_path):
+    db=CacheDB(tmp_path / "v095-other.sqlite")
+    r=BatchResolver(db, FHRoyaltyV095(), OFRoyaltyV095(), YHRoyaltyV095())
+    row=TvRow("NYSE:OTHER","NYSE","OTHER",None,"USD","stock",("common",),None,None,10.0,"US0000000954")
+    got=r.resolve([row])[row.tv_id]
+    assert got.mapping_method != "US_XNYS_STOCK_COMMON_ROYALTY_TRUST_EXACT_ISIN"
+    assert r.stats["us_xnys_stock_common_royalty_trust_rescue_matches"] == 0
+    db.close()
+
+# v0.3.97: audited NYSE stock/common Ltd Part exact-ISIN rescue.
+class FHLtdPartV097:
+    batch_size = 100
+    def us_symbols(self):
+        return [
+            {"symbol":"TXO","displaySymbol":"TXO","description":"PARTNERSHIP","currency":"USD","type":"Ltd Part","mic":"XNYS","figi":"FH_TXO"},
+            {"symbol":"PAGP","displaySymbol":"PAGP","description":"PARTNERSHIP","currency":"USD","type":"Ltd Part","mic":"XNAS","figi":"FH_PAGP"},
+        ]
+
+class OFLtdPartV097:
+    batch_size = 100
+    def __init__(self, share=True, st2="Partnership Shares", ticker="TXO"):
+        self.share=share; self.st2=st2; self.ticker=ticker
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for j in jobs:
+            if j.get("idValue") == "US0000000971" and j.get("micCode") == "XNYS":
+                out.append([OpenFigiIdentity(figi="OF_TXO", composite_figi=None, share_class_figi="SC_TXO" if self.share else None, ticker=self.ticker, name="PARTNERSHIP", security_type="Ltd Part", security_type2=self.st2, exch_code="US")])
+            else: out.append([])
+        return out
+
+class YHLtdPartV097:
+    batch_size = 75
+    def __init__(self, symbol="TXO", exchange="NYQ", currency="USD", count=1):
+        self.symbol=symbol; self.exchange=exchange; self.currency=currency; self.count=count
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        if isin != "US0000000971": return []
+        return [YahooSearchCandidate(self.symbol, self.exchange, "EQUITY", None, None) for _ in range(self.count)]
+    def quotes(self, symbols):
+        return {s: YahooQuote(s,self.exchange,"NYSE" if self.exchange=="NYQ" else "Nasdaq",self.currency,"EQUITY","us_market",None,None,10.0,0) for s in symbols}
+
+def _v097_row(prefix="NYSE", symbol="TXO", isin="US0000000971"):
+    return TvRow(f"{prefix}:{symbol}",prefix,symbol,None,"USD","stock",("common",),None,None,10.0,isin)
+
+def test_v097_xnys_stock_common_ltd_part_admission(tmp_path):
+    db=CacheDB(tmp_path / "v097-ltd.sqlite")
+    r=BatchResolver(db,FHLtdPartV097(),OFLtdPartV097(),YHLtdPartV097())
+    got=r.resolve([_v097_row()])["NYSE:TXO"]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_STOCK_COMMON_LTD_PART_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert r.stats["us_xnys_stock_common_ltd_part_source_proven"] == 1
+    assert r.stats["us_xnys_stock_common_ltd_part_rescue_matches"] == 1
+    db.close()
+
+def test_v097_ltd_part_rule_does_not_claim_xnas(tmp_path):
+    db=CacheDB(tmp_path / "v097-xnas.sqlite")
+    r=BatchResolver(db,FHLtdPartV097(),OFLtdPartV097(),YHLtdPartV097())
+    got=r.resolve([_v097_row("NASDAQ","PAGP","US0000000972")])["NASDAQ:PAGP"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Ltd Part"
+    assert r.stats["us_xnys_stock_common_ltd_part_rescue_matches"] == 0
+    db.close()
+
+def test_v097_ltd_part_requires_shareclass_and_partnership_taxonomy(tmp_path):
+    for of in [OFLtdPartV097(share=False), OFLtdPartV097(st2="Common Stock"), OFLtdPartV097(ticker="TXO-X")]:
+        db=CacheDB(tmp_path / f"v097-of-{id(of)}.sqlite")
+        r=BatchResolver(db,FHLtdPartV097(),of,YHLtdPartV097())
+        got=r.resolve([_v097_row()])["NYSE:TXO"]
+        assert got.status == "REJECTED"
+        assert r.stats["us_xnys_stock_common_ltd_part_rescue_matches"] == 0
+        db.close()
+
+def test_v097_ltd_part_requires_unique_exact_yahoo_source_route(tmp_path):
+    for yh in [YHLtdPartV097(symbol="TXO-X"),YHLtdPartV097(exchange="NMS"),YHLtdPartV097(currency="CAD"),YHLtdPartV097(count=2)]:
+        db=CacheDB(tmp_path / f"v097-yh-{id(yh)}.sqlite")
+        r=BatchResolver(db,FHLtdPartV097(),OFLtdPartV097(),yh)
+        got=r.resolve([_v097_row()])["NYSE:TXO"]
+        assert got.status == "REJECTED"
+        assert r.stats["us_xnys_stock_common_ltd_part_rescue_matches"] == 0
+        db.close()
+
+# v0.3.99: audited NYSE stock/common Closed-End Fund exact-ISIN rescue.
+class FHClosedEndV099:
+    batch_size = 100
+    def us_symbols(self):
+        return [
+            {"symbol":"PSUS","displaySymbol":"PSUS","description":"CEF","currency":"USD","type":"Closed-End Fund","mic":"XNYS","figi":"FH_PSUS"},
+            {"symbol":"PWRL","displaySymbol":"PWRL","description":"CEF","currency":"USD","type":"Closed-End Fund","mic":"XNAS","figi":"FH_PWRL"},
+        ]
+
+class OFClosedEndV099:
+    batch_size = 100
+    def __init__(self, share=True, st2="Mutual Fund", ticker="PSUS"):
+        self.share=share; self.st2=st2; self.ticker=ticker
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for j in jobs:
+            if j.get("idValue") == "US0000000991" and j.get("micCode") == "XNYS":
+                out.append([OpenFigiIdentity(figi="OF_PSUS", composite_figi=None, share_class_figi="SC_PSUS" if self.share else None, ticker=self.ticker, name="CEF", security_type="Closed-End Fund", security_type2=self.st2, exch_code="US")])
+            else: out.append([])
+        return out
+
+class YHClosedEndV099:
+    batch_size = 75
+    def __init__(self, symbol="PSUS", exchange="NYQ", currency="USD", qtype="EQUITY", count=1):
+        self.symbol=symbol; self.exchange=exchange; self.currency=currency; self.qtype=qtype; self.count=count
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        if isin != "US0000000991": return []
+        return [YahooSearchCandidate(self.symbol, self.exchange, self.qtype, None, None) for _ in range(self.count)]
+    def quotes(self, symbols):
+        return {s: YahooQuote(s,self.exchange,"NYSE" if self.exchange=="NYQ" else "Nasdaq",self.currency,self.qtype,"us_market",None,None,10.0,0) for s in symbols}
+
+def _v099_cef_row(prefix="NYSE", symbol="PSUS", isin="US0000000991"):
+    return TvRow(f"{prefix}:{symbol}",prefix,symbol,None,"USD","stock",("common",),None,None,10.0,isin)
+
+def test_v099_xnys_stock_common_closed_end_fund_admission(tmp_path):
+    db=CacheDB(tmp_path / "v099-cef.sqlite")
+    r=BatchResolver(db,FHClosedEndV099(),OFClosedEndV099(),YHClosedEndV099())
+    got=r.resolve([_v099_cef_row()])["NYSE:PSUS"]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_XNYS_STOCK_COMMON_CLOSED_END_FUND_EXACT_ISIN"
+    assert got.source_mic == got.target_mic == "XNYS"
+    assert r.stats["us_xnys_stock_common_closed_end_fund_source_proven"] == 1
+    assert r.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] == 1
+    db.close()
+
+def test_v099_closed_end_fund_rule_does_not_claim_xnas(tmp_path):
+    db=CacheDB(tmp_path / "v099-xnas.sqlite")
+    r=BatchResolver(db,FHClosedEndV099(),OFClosedEndV099(),YHClosedEndV099())
+    got=r.resolve([_v099_cef_row("NASDAQ","PWRL","US0000000992")])["NASDAQ:PWRL"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:Closed-End Fund"
+    assert r.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] == 0
+    db.close()
+
+def test_v099_closed_end_fund_requires_shareclass_and_exact_taxonomy(tmp_path):
+    for of in [OFClosedEndV099(share=False), OFClosedEndV099(st2="Common Stock"), OFClosedEndV099(ticker="PSUS-X")]:
+        db=CacheDB(tmp_path / f"v099-of-{id(of)}.sqlite")
+        r=BatchResolver(db,FHClosedEndV099(),of,YHClosedEndV099())
+        got=r.resolve([_v099_cef_row()])["NYSE:PSUS"]
+        assert got.status == "REJECTED"
+        assert r.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] == 0
+        db.close()
+
+def test_v099_closed_end_fund_requires_unique_exact_yahoo_source_route(tmp_path):
+    for yh in [YHClosedEndV099(symbol="PSUS-X"),YHClosedEndV099(exchange="NMS"),YHClosedEndV099(currency="CAD"),YHClosedEndV099(qtype="ETF"),YHClosedEndV099(count=2)]:
+        db=CacheDB(tmp_path / f"v099-yh-{id(yh)}.sqlite")
+        r=BatchResolver(db,FHClosedEndV099(),OFClosedEndV099(),yh)
+        got=r.resolve([_v099_cef_row()])["NYSE:PSUS"]
+        assert got.status == "REJECTED"
+        assert r.stats["us_xnys_stock_common_closed_end_fund_rescue_matches"] == 0
+        db.close()

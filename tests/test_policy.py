@@ -202,3 +202,8 @@ def test_tradingview_fund_reit_is_equity_identity_not_etf():
     row = TvRow("LSIN:0YO9", "LSIN", "0YO9", "REIT", "EUR", "fund", ("reit",), None, 1.0, 1.0)
     assert tv_type_kind(row) == "STOCK"
     assert yahoo_type_compatible(row, "EQUITY")
+
+
+def test_bx_swiss_prefix_maps_to_active_operating_mic_xbrn():
+    from tv_market_identity.policy import TV_PREFIX_TO_MIC
+    assert TV_PREFIX_TO_MIC["BX"] == "XBRN"

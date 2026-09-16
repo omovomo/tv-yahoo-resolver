@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.3.62-policy62"
+RESOLVER_VERSION = "0.3.99-policy99"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -26,6 +26,11 @@ TV_PREFIX_TO_MIC = {
     # TradingView SIX = SIX Swiss Exchange. Current Swiss blue-chip/main
     # equity venue MIC is XSWX; SIX is the provider prefix, not the MIC.
     "SIX": "XSWX",
+    # TradingView BX = BX Swiss. ISO 10383 operating MIC is XBRN.
+    # BX Sponsored Shares includes foreign equities traded in CHF; Yahoo does
+    # not expose an XBRN suffix, so exact-ISIN home-market rescue may reroute
+    # a proven BX source listing to the security's independently proven home venue.
+    "BX": "XBRN",
     # TradingView AQUIS = Aquis Stock Exchange (AQSE operating MIC).
     "AQUIS": "AQSE",
     # Reviewed German regional/Frankfurt provider prefixes.

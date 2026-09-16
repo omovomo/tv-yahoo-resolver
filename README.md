@@ -1,4 +1,72 @@
-# TV Market Identity Prototype v0.3.63
+# tv-market-identity-prototype v0.3.99
+
+Functional v0.3.99 adds the v0.3.98-audited XNYS-only stock/common `Closed-End Fund / Mutual Fund` exact-ISIN rescue. Admission requires exact TV ISIN, exactly one `ID_ISIN + XNYS` OpenFIGI FIGI with exact TV ticker, non-empty shareClassFIGI, `securityType=Closed-End Fund`, `securityType2=Mutual Fund`, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV symbol and whose quote is NYSE-compatible, currency-compatible, and `EQUITY`. XNAS/OTC source gaps, fuzzy/name matching, ticker construction, and generic taxonomy overrides remain excluded. Policy is `0.3.99-policy99`.
+
+Diagnostic-only v0.3.98; admission remains `0.3.97-policy97`. Previous functional policy:  adds the v0.3.96-audited XNYS-only stock/common `Ltd Part / Partnership Shares` exact-ISIN rescue. Admission requires exact TV ISIN, exactly one `ID_ISIN + XNYS` OpenFIGI FIGI with exact TV ticker, `securityType=Ltd Part`, `securityType2=Partnership Shares`, non-empty shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV symbol and whose quote is NYSE-compatible, currency-compatible, and `EQUITY`. Direct-Yahoo-only BEP, XNAS/XASE/OTC cases, fuzzy/name matching, ticker construction, and generic taxonomy overrides remain excluded. Compatible VERIFIED entries from `0.3.95-policy95` remain reusable; rejected entries are reprocessed under policy97.
+
+Diagnostic-only release. Admission policy remains `0.3.95-policy95`. The `run` command adds `--us-finnhub-ltd-part-audit PATH` for the complete current `FINNHUB_TYPE_MISMATCH:Ltd Part` rejection cohort. The audit records TradingView taxonomy and exact ISIN, Finnhub exact-symbol/type evidence, reviewed source MIC, scoped `ID_ISIN + source MIC` OpenFIGI FIGI/shareClassFIGI/security taxonomy/ticker evidence, Yahoo direct-symbol metadata, and Yahoo exact-ISIN discovery with exact-symbol/source-venue/currency/EQUITY checks. It does not change resolver admission, taxonomy compatibility, or cache policy.
+
+# tv-market-identity prototype v0.3.95
+
+Functional policy `0.3.95-policy95`: adds the v0.3.94-audited XNYS-only Royalty Trust bridge. TradingView NYSE `stock/common` rows rejected only as `FINNHUB_TYPE_MISMATCH:Royalty Trst` may be admitted only with exact ISIN, exactly one `ID_ISIN + XNYS` OpenFIGI FIGI classified `Royalty Trst / Common Stock` with the exact TV ticker, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV symbol and whose quote is NYSE-compatible, reports compatible currency, and is `EQUITY`. OTC and XNAS Royalty Trust rows remain outside the rule. No name/fuzzy matching, ticker construction, or cross-venue fallback is introduced. Compatible VERIFIED entries from `0.3.87-policy87` remain reusable; compatible rejected entries are reprocessed under policy95.
+
+## v0.3.94
+
+Diagnostic-only Royalty Trust cohort audit. Admission remained `0.3.87-policy87`; `--us-finnhub-royalty-trust-audit` measured exact source-MIC OpenFIGI evidence and Yahoo direct/exact-ISIN evidence for current `FINNHUB_TYPE_MISMATCH:Royalty Trst` rejects.
+
+# tv-market-identity prototype v0.3.90
+
+Diagnostic-only residual audit for remaining US `FINNHUB_TYPE_MISMATCH:?` rows. Resolver policy remains `0.3.87-policy87`; admission is unchanged. Adds `--us-finnhub-unknown-type-residual-audit` to classify each residual against the exact v0.3.87 OOTC preferred empty-type PUBLIC contract.
+
+Previous v0.3.81 functional XNAS fund/unit rescue: Based on the v0.3.80 full-US diagnostic cohort (146/146), NASDAQ fund/unit rows rejected only as `FINNHUB_TYPE_MISMATCH:Unit` may be admitted when exact-ISIN OpenFIGI proves one Unit share class, the known XNAS-scoped OpenFIGI query returns no rows, and Yahoo exact-ISIN independently returns the exact TradingView symbol with an XNAS-compatible USD/EQUITY contract. The rule is deliberately limited to this audited taxonomy cohort; it does not generalize XNAS scoped misses to preferred/common/other securities.
+
+## v0.3.77
+
+Functional policy `0.3.77-policy77`: adds an evidence-gated NYSE preferred symbol rescue for TradingView slash-form preferred shares rejected by Yahoo taxonomy/symbol lookup. The resolver never constructs a Yahoo symbol: it requires exact TV ISIN, unique OpenFIGI `ID_ISIN + XNYS` Preferred Stock FIGI, exactly one Yahoo exact-ISIN candidate, punctuation correlation to the TV symbol, and explicit Yahoo NYSE/USD/EQUITY quote metadata. Cross-market, ambiguous, missing, or non-correlated candidates remain rejected.
+
+# tv-market-identity-prototype v0.3.68
+
+Diagnostic refinement release; admission policy remains `0.3.67-policy67`. The exact-ISIN Yahoo home-market rescue is now a generic resolver fallback rather than a Germany/BX-specific path. It is available to reviewed source prefixes including SIX and BX when ordinary Yahoo routing is unavailable, while retaining exact ISIN, compatible OpenFIGI identity, one observed non-null shareClassFIGI, same-share-class candidate proof, and strict Yahoo EQUITY quote metadata. Preferred shares and depositary receipts can use the same security-level proof; multiple valid Yahoo routes remain fail-closed. `OPENFIGI_NO_MATCH` is intentionally not bypassed.
+
+The same-venue exact-ISIN telemetry was also renamed from `openfigi_german_direct_isin_fallback_*` to `openfigi_direct_isin_fallback_*`; the underlying proof remains exact `ID_ISIN + micCode`. Verified cache entries from `0.3.66-policy66` remain compatible.
+
+# TV Market Identity Prototype v0.3.66
+
+## v0.3.66 — BX Swiss venue support and structural-audit short circuit
+
+Functional policy release `0.3.66-policy66`. TradingView `BX` is mapped to the
+active ISO 10383 operating MIC `XBRN` (BX Swiss). Because Yahoo has no reviewed
+BX/XBRN listing suffix, a common-stock BX row is first required to obtain exact
+OpenFIGI source evidence at `XBRN`; only then may the existing exact-ISIN,
+share-class-gated Yahoo home-market rescue reroute quotes to an independently
+proven home listing. Source CHF is intentionally not compared with home-market
+currency because the route changes while security identity remains fixed.
+
+The rejection audit is also cheaper for structural `MIC_UNKNOWN` failures: it
+keeps the targeted TradingView identifier probe but skips unrelated deep
+OpenFIGI/Yahoo route diagnostics and classifies the row as
+`SOURCE_VENUE_UNKNOWN`. Existing VERIFIED `0.3.62-policy62` cache entries remain
+compatible; rejected rows must be refreshed to exercise the new BX policy.
+
+## v0.3.65 — market-agnostic classification precedence
+
+Diagnostic-only release. Admission remains `0.3.62-policy62`. UK validation
+showed that an explicit Yahoo type contradiction can coexist with missing
+OpenFIGI `shareClassFIGI`; the explicit taxonomy contradiction is the stronger
+classification signal. `YAHOO_TYPE_MISMATCH:*` now maps to `TAXONOMY_CONFLICT`
+before identifier/share-class/home-route classification. No resolver admission,
+cache semantics, or Germany-specific routing changes.
+
+## v0.3.64 — unresolved classification / registry groundwork
+
+Diagnostic-only release. Admission remains `0.3.62-policy62`; no resolver policy,
+VERIFIED-cache compatibility, or fail-closed boundary changes. Rejection audit
+records now include `resolution_classification` and `classification_evidence`.
+The classification separates missing source identifiers, missing OpenFIGI share-class
+metadata, undiscovered Yahoo routes, unconfirmed home routes, insufficient identity
+evidence, and taxonomy conflicts. `active_symbol=false` is evidence only and never
+by itself classifies a listing as retired/stale.
+
 
 ## v0.3.63 — stale-listing / corporate-action diagnostics
 
@@ -1224,3 +1292,133 @@ Useful counters:
 
 The resolver policy/cache identity remains `0.3.49-policy49`; existing verified
 bindings therefore remain compatible.
+
+## v0.3.68 diagnostic refinement
+
+The rejection audit now separates `ROUTE_AMBIGUOUS`, `SOURCE_IDENTITY_UNCONFIRMED`, `HOME_LISTING_UNCONFIRMED`, and `RUNTIME_CONTRACT_MISMATCH` from the previous broad `HOME_ROUTE_UNCONFIRMED` bucket. These labels are diagnostic only and do not change admission or cache semantics. Runtime home-market mismatches remain fail-closed; a subsequent rejected-row refresh can re-run full identity discovery rather than silently accepting venue metadata drift.
+
+### v0.3.69 diagnostic-only preferred same-venue audit
+
+Package v0.3.69 keeps admission policy `0.3.67-policy67` unchanged. Rejection audit now adds
+`preferred_same_venue_audit` for rejected US `stock/preferred` rows with Finnhub type mismatch
+on reviewed NYSE/Nasdaq source MICs. It records exact `ID_ISIN + source MIC` OpenFIGI evidence,
+exact-ISIN Yahoo discovery, and a strict same-source-venue Yahoo contract. The diagnostic never
+turns a rejection into VERIFIED and does not alter cache semantics.
+
+## v0.3.71 same-venue preferred admission
+
+Package v0.3.71 advances resolver policy to `0.3.71-policy71`. US `stock/preferred`
+rows rejected only because Finnhub reports the underspecified type `PUBLIC` or `?`
+can now be admitted without `shareClassFIGI` only when identity never crosses a
+venue: exact TradingView ISIN + reviewed source MIC must resolve to exactly one
+compatible OpenFIGI preferred FIGI, and Yahoo must independently confirm the same
+source venue, currency and `EQUITY` contract. Yahoo exact-ISIN discovery is used
+first; the exact TradingView source symbol is probed only when exact-ISIN discovery
+returns no candidates. Multiple discovered routes, OpenFIGI ambiguity/no-match,
+unknown source MIC, taxonomy conflicts, and Yahoo venue/currency/type contradictions
+remain fail-closed. Cross-venue home-market rescue still requires its existing
+share-class evidence.
+
+
+## v0.3.72 OTC preferred MIC discovery (diagnostic only)
+
+Package v0.3.72 keeps admission policy `0.3.71-policy71`. Rejection audit now
+probes exact ISIN for rejected `OTC` stock/preferred rows across a bounded
+reviewed US OTC MIC set (`OTCM`, `OTCB`, `OOTC`, `OTCD`) and records
+`otc_preferred_mic_discovery`. This does not map TradingView `OTC` to any MIC
+and cannot admit a security. Expired `PINX`/`PINI` are intentionally excluded.
+
+
+### v0.3.73 diagnostic-only OTC Yahoo discovery
+
+For rejected TradingView `OTC` preferred rows where exact `ID_ISIN + micCode` proves exactly one reviewed OTC MIC, `--rejection-audit` now records `otc_preferred_yahoo_discovery`. It tries Yahoo exact-ISIN discovery and, only when that returns no candidates, the exact TradingView symbol. The audit records raw Yahoo exchange/fullExchangeName/market/type/currency metadata and evaluates only type/currency (`non_venue_contract_valid`). It deliberately does **not** assume any Yahoo exchange-code to ISO-MIC equivalence and does not change admission. Resolver policy remains `0.3.71-policy71`.
+
+### v0.3.74 — evidence-gated OTC preferred admission
+
+Adds a functional US OTC preferred rescue without mapping the TradingView `OTC` prefix to one MIC. Exact TV ISIN is probed against the reviewed current OTC MIC set; admission requires exactly one proven MIC (`OOTC`) with one compatible Preferred Stock FIGI. Yahoo exact-ISIN discovery must return exactly one candidate whose symbol exactly equals the TradingView symbol, whose quote is `EQUITY`, currency-compatible, and whose reviewed Yahoo provider venue is `OQB` or `PNK` with `OTC Markets` metadata. Multiple/no proven MICs, cross-market Yahoo candidates, symbol mismatch, and all contract contradictions remain fail-closed. Policy: `0.3.74-policy74`.
+
+### v0.3.75 — diagnostic-only Yahoo anomaly matrix
+
+Adds evidence-only rejection diagnostics for residual `YAHOO_TYPE_MISMATCH:*`, `YAHOO_SYMBOL_NOT_FOUND`, and `YAHOO_RUNTIME_MISMATCH:*` rows. The audit records exact TV-symbol quote/chart metadata, exact-ISIN Yahoo search candidates with quote/chart metadata, and exact ISIN + reviewed source-MIC OpenFIGI evidence. It emits a diagnostic classification (`SAME_SOURCE_INSTRUMENT_PROVEN`, `YAHOO_TAXONOMY_ONLY_CONFLICT`, `VENUE_CONTRADICTION`, `YAHOO_SYMBOL_ABSENT`, or `INSUFFICIENT_EVIDENCE`). No diagnostic output participates in admission or cache semantics. Policy remains `0.3.74-policy74`.
+
+
+### v0.3.76 — diagnostic-only NYSE preferred symbol representation cohort
+
+Adds `run --nyse-preferred-symbol-audit PATH`, an evidence-only cohort audit over all TradingView `NYSE` `stock/preferred` rows whose exact TV symbol contains `/`, including rows already VERIFIED from cache. For each row it probes exact `ID_ISIN + XNYS` OpenFIGI source evidence, Yahoo exact-ISIN discovery, quote venue/currency/type metadata, and records whether the Yahoo-discovered symbol is punctuation-equivalent to the exact TV symbol. It does not construct a Yahoo ticker, does not admit any binding, and does not change cache semantics. Policy remains `0.3.74-policy74`.
+
+
+### v0.3.78 — diagnostic-only US Finnhub Unit cohort
+
+Adds `--us-finnhub-unit-audit PATH`. The audit selects only rejected rows with
+`FINNHUB_TYPE_MISMATCH:Unit` and records exact-ISIN OpenFIGI evidence both
+unscoped and at the reviewed TradingView source MIC, together with Yahoo
+exact-ISIN search and quote metadata. It does not change admission or cache
+semantics. Resolver policy remains `0.3.77-policy77`.
+
+### v0.3.79 — evidence-gated XNYS fund/unit taxonomy rescue
+
+Functional release based on the v0.3.78 full-US diagnostic cohort.  It rescues
+only TradingView `fund` + `unit` rows rejected as `FINNHUB_TYPE_MISMATCH:Unit`
+on NYSE/XNYS when exact ISIN proves one unscoped shareClassFIGI, exact
+`ID_ISIN + XNYS` proves one venue FIGI explicitly classified as `Unit` with the
+same shareClassFIGI, and Yahoo exact-ISIN discovery returns exactly one
+NYSE-compatible USD/EQUITY route.  No Yahoo symbol is constructed.  XNAS,
+stock/common, missing-source-MIC, ambiguous, and contradictory cases remain
+fail-closed.  Resolver policy: `0.3.79-policy79`.
+
+
+### v0.3.81 — evidence-gated XNAS fund/unit rescue
+
+The v0.3.80 diagnostic found 146/146 NASDAQ `fund/unit` rows rejected as Finnhub `Unit` with a homogeneous provider-gap pattern: unscoped exact-ISIN OpenFIGI had one Unit share class and the exact TV ticker, scoped `ID_ISIN + XNAS` returned no rows, and Yahoo exact-ISIN returned exactly the TV ticker with a strict Nasdaq/USD/EQUITY quote contract. v0.3.81 admits only that demonstrated cohort through `US_XNAS_FUND_UNIT_EXACT_ISIN`. Stock/common, preferred, other Finnhub taxonomy classes, Yahoo symbol differences, ambiguous/missing share classes, positive/conflicting scoped XNAS rows, and non-Nasdaq Yahoo routes remain fail-closed. Resolver policy: `0.3.81-policy81`.
+
+
+### v0.3.82 — diagnostic-only Yahoo MUTUALFUND audit
+
+Adds `--us-yahoo-mutualfund-audit PATH`. It writes evidence-only JSONL for rejected US `YAHOO_TYPE_MISMATCH:MUTUALFUND` rows: TV exact ISIN/source MIC/taxonomy, unscoped and source-scoped OpenFIGI identities/share classes, current Yahoo metadata, and every Yahoo exact-ISIN candidate with same-ticker/source-venue/currency/EQUITY diagnostics. No admission rule changes; resolver policy remains `0.3.81-policy81`.
+
+
+### v0.3.83 — diagnostic-only Finnhub PUBLIC audit
+
+Adds `--us-finnhub-public-audit PATH`. It writes evidence-only JSONL for rejected US `FINNHUB_TYPE_MISMATCH:PUBLIC` rows, including TV taxonomy/kind, exact ISIN, reviewed source MIC, unscoped and source-scoped OpenFIGI identities/share classes, and Yahoo exact-ISIN candidates with exact ticker/source venue/USD/EQUITY contract diagnostics. No admission rule changes; resolver policy remains `0.3.81-policy81`.
+
+### v0.3.85 — functional XNYS fund/unit PUBLIC rescue
+
+The v0.3.83 diagnostic isolated six NYSE fund/unit `FINNHUB_TYPE_MISMATCH:PUBLIC` rows with direct same-venue evidence. `US_XNYS_FUND_UNIT_PUBLIC_EXACT_ISIN` requires exact TV ISIN, XNYS fund/unit taxonomy, exactly one source-scoped OpenFIGI FIGI explicitly `PUBLIC / Preferred Stock`, and exactly one ticker-correlated Yahoo exact-ISIN candidate with NYSE-compatible USD/EQUITY quote metadata. Because source and target are both XNYS, missing shareClassFIGI is not used as a cross-venue bridge. XNAS, stock/preferred, ambiguous identities, ticker differences, and non-NYSE Yahoo routes remain rejected. Resolver policy: `0.3.85-policy84`.
+
+
+### v0.3.85 — diagnostic Finnhub unknown-type audit
+
+Adds `--us-finnhub-unknown-type-audit PATH`. For current US `FINNHUB_TYPE_MISMATCH:?` rejects it records TV exact ISIN/taxonomy/source MIC, the matching raw Finnhub universe rows, unscoped and source-scoped OpenFIGI evidence, and Yahoo exact-ISIN candidates with same-source/ticker/currency/EQUITY checks. Diagnostic only; resolver policy remains `0.3.84-policy84`.
+
+
+### v0.3.86 — diagnostic unknown-type OOTC source binding
+
+Fixes the v0.3.85 diagnostic so OTC `FINNHUB_TYPE_MISMATCH:?` rows can use a unique exact-symbol Finnhub `OOTC` MIC as diagnostic source evidence. The audit now runs the scoped OpenFIGI exact-ISIN job with that MIC and evaluates Yahoo venue compatibility against it. Conflicting or missing Finnhub MICs remain unresolved. Diagnostic only; resolver policy remains `0.3.84-policy84`.
+
+
+### v0.3.87 — functional OOTC preferred empty-type rescue
+
+Adds `US_OOTC_PREFERRED_FINNHUB_EMPTY_TYPE_EXACT_ISIN` only for the audited OTC stock/preferred cohort where Finnhub binds the exact symbol uniquely to OOTC but reports an empty type. Exact ISIN + OOTC must return one OpenFIGI FIGI explicitly `PUBLIC / Preferred Stock`, and Yahoo exact-ISIN discovery must return exactly one exact-ticker OOTC-compatible USD/EQUITY route. PRIVATE preferred, ADR/common, missing/ambiguous source proof, and cross-venue candidates remain rejected. Resolver policy: `0.3.87-policy87`.
+
+
+### v0.3.88 — diagnostic-only v0.3.87 rescue provenance
+
+Adds `--us-ootc-preferred-empty-type-rescue-audit PATH`. It selects only VERIFIED bindings whose mapping method is `US_OOTC_PREFERRED_FINNHUB_EMPTY_TYPE_EXACT_ISIN` and re-emits the exact-symbol Finnhub OOTC/empty-type evidence, exact `ID_ISIN+OOTC` OpenFIGI PUBLIC/Preferred Stock evidence, and exact-ISIN Yahoo OOTC/USD/EQUITY evidence. Admission policy remains `0.3.87-policy87`.
+
+### v0.3.89 — diagnostic-only SLMNP admission provenance
+
+Adds `--us-v087-slmnp-admission-audit PATH`. The audit does not change admission. It records the cached v0.3.87 binding, notes that this mapping method is reachable only through the exact-ISIN Yahoo search gate, performs two fresh exact-ISIN searches separated by `reset_run_cache()`, and records a fresh direct-symbol quote. Search candidates were not persisted in v0.3.87, so the audit distinguishes current provider drift from what can be proven from the code path without inventing historical Yahoo payloads. The v0.3.88 JSONL literal-backslash-newline writer defect is also corrected. Resolver policy remains `0.3.87-policy87`.
+
+
+### v0.3.90 — diagnostic-only unknown-type residual audit
+
+Adds `--us-finnhub-unknown-type-residual-audit PATH`. It audits only residual `FINNHUB_TYPE_MISMATCH:?` rows and records the first deterministic blocker against the v0.3.87 contract: outside TV preferred cohort, Finnhub source ambiguity/non-OOTC/non-empty type, OpenFIGI OOTC PUBLIC/Preferred proof, or Yahoo exact-ISIN symbol/venue/currency/EQUITY proof. Admission policy remains `0.3.87-policy87`.
+
+
+### v0.3.93 diagnostic-only
+Adds `--us-yahoo-currency-unknown-audit` for US `YAHOO_CURRENCY_MISMATCH:?` rejects. Admission policy remains `0.3.87-policy87`. The audit compares Yahoo quote currency with chart metadata and exact-ISIN discovery without changing resolver admission.
+
+
+### v0.3.94 diagnostic-only: US Finnhub Royalty Trust residual audit
+
+Admission policy remains `0.3.87-policy87`. The `run` command adds `--us-finnhub-royalty-trust-audit PATH`, which records exact ISIN + reviewed source-MIC OpenFIGI evidence together with Yahoo direct-symbol and exact-ISIN metadata for current `FINNHUB_TYPE_MISMATCH:Royalty Trst` rejects. No taxonomy compatibility or admission rule is changed.

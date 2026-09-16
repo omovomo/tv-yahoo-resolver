@@ -5,6 +5,7 @@ import os
 import time
 import re
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 from urllib.parse import quote
 
@@ -53,9 +54,12 @@ class FinnhubProvider:
 class OpenFigiProvider:
     URL = "https://api.openfigi.com/v3/mapping"
 
-    def __init__(self, api_key: str | None = None, timeout: int = 25):
+    def __init__(self, api_key: str | None = None, timeout: int = 25, max_workers: int = 4):
         self.api_key = api_key or os.getenv("OPENFIGI_API_KEY")
         self.timeout = timeout
+        # Bound concurrency: enough to overlap independent HTTP batches without
+        # allowing a caller-provided value to create an unbounded thread pool.
+        self.max_workers = max(1, min(int(max_workers), 16))
         self.session = requests.Session()
         self._run_memo: dict[str, tuple[OpenFigiIdentity, ...]] = {}
         self.metrics = defaultdict(int)
@@ -110,15 +114,46 @@ class OpenFigiProvider:
             if self.api_key:
                 headers["X-OPENFIGI-APIKEY"] = self.api_key
 
-            fetched: list[list[OpenFigiIdentity]] = []
-            for start in range(0, len(pending_jobs), self.batch_size):
-                chunk = pending_jobs[start:start + self.batch_size]
-                self.metrics["network_batches"] += 1
-                self.metrics["network_jobs"] += len(chunk)
+            chunks = [pending_jobs[start:start + self.batch_size]
+                      for start in range(0, len(pending_jobs), self.batch_size)]
+
+            def fetch_chunk(chunk: list[dict]) -> list[list[OpenFigiIdentity]]:
+                headers = {"Content-Type": "application/json"}
+                if self.api_key:
+                    headers["X-OPENFIGI-APIKEY"] = self.api_key
                 for attempt in range(4):
                     try:
+                        self.metrics["transport_attempts"] += 1
                         r = self.session.post(self.URL, headers=headers, json=chunk, timeout=self.timeout)
+                        # Track the most conservative server-reported remaining
+                        # allowance across all concurrent transport responses.
+                        # Do not treat a missing header as zero: zero is the
+                        # defaultdict sentinel, not rate-limit evidence.
+                        reset_raw = r.headers.get("ratelimit-reset")
+                        if reset_raw is not None:
+                            try:
+                                reset_seconds = float(reset_raw)
+                            except (TypeError, ValueError):
+                                pass
+                            else:
+                                self.metrics["rate_limit_reset_max_seconds"] = max(
+                                    float(self.metrics.get("rate_limit_reset_max_seconds", 0)),
+                                    reset_seconds,
+                                )
+
+                        remaining_raw = r.headers.get("ratelimit-remaining")
+                        if remaining_raw is not None:
+                            try:
+                                remaining = float(remaining_raw)
+                            except (TypeError, ValueError):
+                                pass
+                            else:
+                                current = self.metrics.get("rate_limit_remaining_min")
+                                if current is None or remaining < current:
+                                    self.metrics["rate_limit_remaining_min"] = remaining
                         if r.status_code == 429:
+                            self.metrics["rate_limit_429s"] += 1
+                            self.metrics["transport_retries"] += 1
                             wait = float(r.headers.get("ratelimit-reset") or 2 ** attempt)
                             time.sleep(max(0.5, min(wait, 10)))
                             continue
@@ -128,26 +163,38 @@ class OpenFigiProvider:
                     except Exception as exc:
                         if attempt == 3:
                             raise ProviderError(f"OpenFIGI mapping failed: {exc}") from exc
+                        self.metrics["transport_retries"] += 1
                         time.sleep(2 ** attempt)
                 else:
                     raise ProviderError("OpenFIGI mapping failed after retries")
-
                 if len(payload) != len(chunk):
                     raise ProviderError(f"OpenFIGI response length mismatch: {len(payload)} != {len(chunk)}")
+                parsed: list[list[OpenFigiIdentity]] = []
                 for result in payload:
                     identities: list[OpenFigiIdentity] = []
                     for row in result.get("data") or []:
                         identities.append(OpenFigiIdentity(
-                            figi=row.get("figi"),
-                            composite_figi=row.get("compositeFIGI"),
-                            share_class_figi=row.get("shareClassFIGI"),
-                            ticker=row.get("ticker"),
-                            name=row.get("name"),
-                            security_type=row.get("securityType"),
-                            security_type2=row.get("securityType2"),
-                            exch_code=row.get("exchCode"),
+                            figi=row.get("figi"), composite_figi=row.get("compositeFIGI"),
+                            share_class_figi=row.get("shareClassFIGI"), ticker=row.get("ticker"),
+                            name=row.get("name"), security_type=row.get("securityType"),
+                            security_type2=row.get("securityType2"), exch_code=row.get("exchCode"),
                         ))
-                    fetched.append(identities)
+                    parsed.append(identities)
+                return parsed
+
+            fetched_by_chunk: list[list[list[OpenFigiIdentity]] | None] = [None] * len(chunks)
+            workers = min(self.max_workers, len(chunks))
+            self.metrics["transport_max_workers"] = max(self.metrics["transport_max_workers"], workers)
+            self.metrics["concurrent_batches_submitted"] += len(chunks)
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {executor.submit(fetch_chunk, chunk): i for i, chunk in enumerate(chunks)}
+                for future in as_completed(futures):
+                    i = futures[future]
+                    fetched_by_chunk[i] = future.result()
+                    self.metrics["concurrent_batches_completed"] += 1
+                    self.metrics["network_batches"] += 1
+                    self.metrics["network_jobs"] += len(chunks[i])
+            fetched = [item for chunk_result in fetched_by_chunk for item in (chunk_result or [])]
 
             if len(fetched) != len(pending_keys):
                 raise ProviderError(f"OpenFIGI memoization alignment mismatch: {len(fetched)} != {len(pending_keys)}")

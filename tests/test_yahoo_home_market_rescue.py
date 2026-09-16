@@ -579,3 +579,138 @@ def test_home_market_local_symbol_is_bounded_to_reviewed_mic_suffix_contracts():
     assert _home_market_local_symbol("OPTT", "XASE") == "OPTT"
     assert _home_market_local_symbol("DAL.PA", "XMIL") is None
     assert _home_market_local_symbol("OPTT.X", "XASE") is None
+
+class OFBxHome:
+    batch_size = 100
+
+    def __init__(self):
+        self.jobs = []
+
+    def map_jobs(self, jobs):
+        self.jobs.extend(jobs)
+        out = []
+        for job in jobs:
+            if (job.get("idType") == "ID_EXCH_SYMBOL"
+                    and job.get("idValue") == "NVD"
+                    and job.get("micCode") == "XBRN"):
+                out.append([ofi("NVD", "NVDA_SHARE")])
+            elif (job.get("idType") == "ID_ISIN"
+                    and job.get("idValue") == "US67066G1040"
+                    and "micCode" not in job):
+                out.append([ofi("NVDA", "NVDA_SHARE")])
+            else:
+                out.append([])
+        return out
+
+
+def test_bx_swiss_source_is_proven_at_xbrn_then_routes_by_exact_isin_to_home_market(tmp_path):
+    db = CacheDB(tmp_path / "bx-home.sqlite")
+    bx = TvRow(
+        "BX:NVD", "BX", "NVD", "NVIDIA Corporation", "CHF",
+        "stock", ("common",), None, 1.0, 100.0, isin="US67066G1040",
+    )
+    yh = YHHome(
+        candidates=[YahooSearchCandidate("NVDA", "NMS", "EQUITY", "NVIDIA", "NVIDIA Corporation")],
+        quote=YahooQuote(
+            "NVDA", "NMS", "Nasdaq Global Select Market", "USD", "EQUITY", "us_market",
+            "NVIDIA", "NVIDIA Corporation", 100.0, 0,
+        ),
+    )
+    of = OFBxHome()
+    resolver = BatchResolver(db, None, of, yh)
+
+    b = resolver.resolve([bx])["BX:NVD"]
+
+    assert b.status == "VERIFIED"
+    assert b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET"
+    assert b.source_venue_code == "BX"
+    assert b.yahoo_symbol == "NVDA"
+    assert b.yahoo_currency == "USD"
+    assert any(j.get("idType") == "ID_EXCH_SYMBOL" and j.get("micCode") == "XBRN" for j in of.jobs)
+    assert yh.searches == ["US67066G1040"]
+    assert resolver.stats["yahoo_home_market_rescue_matches_BX"] == 1
+    db.close()
+
+class OFSwissGenericHome:
+    batch_size = 100
+
+    def __init__(self, source_symbol, source_mic, isin, home_symbol, share, *, sec_type="Common Stock", sec_type2="Common Stock"):
+        self.source_symbol = source_symbol
+        self.source_mic = source_mic
+        self.isin = isin
+        self.home_symbol = home_symbol
+        self.share = share
+        self.sec_type = sec_type
+        self.sec_type2 = sec_type2
+        self.jobs = []
+
+    def map_jobs(self, jobs):
+        self.jobs.extend(jobs)
+        out = []
+        for job in jobs:
+            if (job.get("idType") == "ID_EXCH_SYMBOL"
+                    and job.get("idValue") == self.source_symbol
+                    and job.get("micCode") == self.source_mic):
+                out.append([ofi(self.source_symbol, self.share, sec_type=self.sec_type, sec_type2=self.sec_type2)])
+            elif (job.get("idType") == "ID_ISIN"
+                    and job.get("idValue") == self.isin
+                    and "micCode" not in job):
+                out.append([ofi(self.home_symbol, self.share, sec_type=self.sec_type, sec_type2=self.sec_type2)])
+            else:
+                out.append([])
+        return out
+
+
+def test_six_yahoo_no_match_routes_by_exact_isin_to_home_market(tmp_path):
+    db = CacheDB(tmp_path / "six-generic-home.sqlite")
+    r = TvRow(
+        "SIX:NVDA.USD", "SIX", "NVDA.USD", "NVIDIA Corporation", "USD",
+        "stock", ("common",), None, 1.0, 100.0, isin="US67066G1040",
+    )
+    of = OFSwissGenericHome("NVDA.USD", "XSWX", "US67066G1040", "NVDA", "NVDA_SHARE")
+    yh = YHHome(
+        candidates=[YahooSearchCandidate("NVDA", "NMS", "EQUITY", "NVIDIA", "NVIDIA Corporation")],
+        quote=YahooQuote(
+            "NVDA", "NMS", "Nasdaq Global Select Market", "USD", "EQUITY", "us_market",
+            "NVIDIA", "NVIDIA Corporation", 100.0, 0,
+        ),
+    )
+    resolver = BatchResolver(db, None, of, yh)
+    b = resolver.resolve([r])[r.tv_id]
+    assert b.status == "VERIFIED"
+    assert b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET"
+    assert b.source_venue_code == "SIX"
+    assert b.yahoo_symbol == "NVDA"
+    assert yh.searches == ["US67066G1040"]
+    assert resolver.stats["yahoo_home_market_rescue_matches_SIX"] == 1
+    db.close()
+
+
+def test_bx_depositary_receipt_can_use_same_exact_isin_home_route(tmp_path):
+    db = CacheDB(tmp_path / "bx-dr-generic-home.sqlite")
+    r = TvRow(
+        "BX:SSUN", "BX", "SSUN", "Samsung Electronics GDR", "CHF",
+        "dr", ("",), None, 1.0, 100.0, isin="US7960502018",
+    )
+    of = OFSwissGenericHome(
+        "SSUN", "XBRN", "US7960502018", "SMSD", "SAMSUNG_SHARE",
+        sec_type="Depositary Receipt", sec_type2="Depositary Receipt",
+    )
+    yh = YHHome(
+        candidates=[YahooSearchCandidate("SMSD.IL", "IOB", "EQUITY", "Samsung GDR", "Samsung Electronics GDR")],
+        quote=YahooQuote(
+            "SMSD.IL", "IOB", "London Stock Exchange", "USD", "EQUITY", "gb_market",
+            "Samsung GDR", "Samsung Electronics GDR", 100.0, 0,
+        ),
+    )
+    # Unscoped OpenFIGI ticker must match Yahoo's bounded identity key. The
+    # provider may expose the local ticker without Yahoo's venue suffix.
+    of.home_symbol = "SMSD"
+    resolver = BatchResolver(db, None, of, yh)
+    b = resolver.resolve([r])[r.tv_id]
+    assert b.status == "VERIFIED"
+    assert b.mapping_method == "YAHOO_EXACT_ISIN_HOME_MARKET"
+    assert b.source_venue_code == "BX"
+    assert b.yahoo_symbol == "SMSD.IL"
+    assert resolver.stats["yahoo_home_market_rescue_matches_BX"] == 1
+    db.close()

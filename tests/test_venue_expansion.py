@@ -1024,7 +1024,7 @@ class YHSwbMutualFund:
         return {}
 
 
-def test_german_direct_isin_same_venue_fallback_enables_taxonomy_override(tmp_path):
+def test_direct_isin_same_venue_fallback_enables_taxonomy_override(tmp_path):
     db = CacheDB(tmp_path / "swb-isin-same-venue-mf.sqlite")
     r = BatchResolver(db, None, OFSwbIsinSameVenueFallback(), YHSwbMutualFund())
     row = TvRow(
@@ -1036,8 +1036,8 @@ def test_german_direct_isin_same_venue_fallback_enables_taxonomy_override(tmp_pa
     assert b.mapping_method == "TV_ISIN_SAME_VENUE_FALLBACK"
     assert b.target_mic == "XSTU"
     assert b.yahoo_quote_type == "MUTUALFUND"
-    assert r.stats["openfigi_german_direct_isin_fallback_jobs"] == 1
-    assert r.stats["openfigi_german_direct_isin_fallback_matches"] == 1
+    assert r.stats["openfigi_direct_isin_fallback_jobs"] == 1
+    assert r.stats["openfigi_direct_isin_fallback_matches"] == 1
     assert r.stats["target_provider_strict_fallback_jobs"] == 0
     assert r.stats["yahoo_germany_regional_fund_taxonomy_matches"] == 1
     db.close()
@@ -1054,7 +1054,7 @@ class YHSwbMissingCurrencyEquity:
         return {}
 
 
-def test_german_direct_isin_same_venue_fallback_allows_missing_yahoo_currency(tmp_path):
+def test_direct_isin_same_venue_fallback_allows_missing_yahoo_currency(tmp_path):
     db = CacheDB(tmp_path / "swb-isin-same-venue-no-currency.sqlite")
     r = BatchResolver(db, None, OFSwbIsinSameVenueFallback(), YHSwbMissingCurrencyEquity())
     row = TvRow(
