@@ -19,6 +19,7 @@ from .policy import (
     GERMANY_REGIONAL_TARGET_MICS,
     ISIN_SHARE_CLASS_BRIDGES,
     TV_PREFIX_TO_MIC,
+    TV_PREFIX_ALLOWED_MICS,
     bounded_symbol_variants,
     YAHOO_HOME_EXCHANGE_TO_MIC,
     currency_compatible,
@@ -1137,15 +1138,56 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
     ]
     evidence_rows = [r for r in cohort if r.isin]
 
+    # Diagnostic source-MIC recovery must also work for cached REJECTED rows.
+    # Use the reviewed direct prefix mapping when it is singular. For provider
+    # namespaces without one direct MIC (notably OTC and AMEX), recover a MIC
+    # only when the cached Finnhub universe has exactly one MIC for the exact
+    # symbol. This is evidence recovery, not admission logic.
+    try:
+        universe = resolver.cache.load_finnhub_universe()
+    except Exception:
+        universe = []
+    norm_index = {}
+    for raw in universe:
+        sym = str(raw.get("symbol") or "").upper().strip()
+        for key in symbol_index_keys(sym) if sym else []:
+            norm_index.setdefault(key, []).append(raw)
+
+    source_mics = {}
+    source_mic_origins = {}
+    for r in cohort:
+        direct = TV_PREFIX_TO_MIC.get(r.prefix)
+        if direct:
+            source_mics[r.tv_id] = direct
+            source_mic_origins[r.tv_id] = "TV_PREFIX_REVIEWED"
+            continue
+        raw_rows, seen = [], set()
+        for key in symbol_index_keys(r.symbol):
+            for raw in norm_index.get(key, []):
+                marker = json.dumps(raw, sort_keys=True, default=str)
+                if marker not in seen:
+                    seen.add(marker); raw_rows.append(raw)
+        allowed = TV_PREFIX_ALLOWED_MICS.get(r.prefix)
+        mics = sorted({
+            str(x.get("mic") or "").upper().strip() for x in raw_rows
+            if x.get("mic") and (not allowed or str(x.get("mic") or "").upper().strip() in allowed)
+        })
+        if len(mics) == 1:
+            source_mics[r.tv_id] = mics[0]
+            source_mic_origins[r.tv_id] = "FINNHUB_EXACT_SYMBOL_UNIQUE_MIC"
+        else:
+            source_mics[r.tv_id] = None
+            source_mic_origins[r.tv_id] = "UNRESOLVED"
+
     unscoped_jobs = [{"idType": "ID_ISIN", "idValue": r.isin} for r in evidence_rows]
     try:
         unscoped_mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
     except ProviderError:
         unscoped_mapped = [[] for _ in unscoped_jobs]
 
-    source_rows = [r for r in evidence_rows if TV_PREFIX_TO_MIC.get(r.prefix)]
+    source_rows = [r for r in evidence_rows if source_mics.get(r.tv_id)]
     source_jobs = [
-        {"idType": "ID_ISIN", "idValue": r.isin, "micCode": TV_PREFIX_TO_MIC[r.prefix]}
+        {"idType": "ID_ISIN", "idValue": r.isin, "micCode": source_mics[r.tv_id]}
         for r in source_rows
     ]
     try:
@@ -1186,7 +1228,7 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
     for r in cohort:
         unscoped = unscoped_by_tv.get(r.tv_id, [])
         b = bindings[r.tv_id]
-        source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        source_mic = source_mics.get(r.tv_id)
         source = source_by_tv.get(r.tv_id, [])
         unscoped_shares = sorted({x.share_class_figi for x in unscoped if x.share_class_figi})
         source_figis = sorted({x.figi for x in source if x.figi})
@@ -1231,7 +1273,7 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
             "diagnostic_only": True,
-            "diagnostic_release": "0.4.14",
+            "diagnostic_release": __version__,
             "classification": classification,
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type,
@@ -1239,11 +1281,14 @@ def _write_us_finnhub_unit_audit(path: Path, rows, bindings: dict, resolver: Bat
             "finnhub_type": b.finnhub_type,
             "rejection_reason": b.rejection_reason,
             "source_mic": source_mic,
+            "source_mic_origin": source_mic_origins.get(r.tv_id),
             "unscoped_openfigi_status": unscoped_status,
             "unscoped_share_class_figis": unscoped_shares,
             "unscoped_openfigi": [of_record(x) for x in unscoped],
             "source_openfigi_figis": source_figis,
             "source_openfigi_share_class_figis": source_shares,
+            "source_scoped_openfigi_status": ("UNIQUE_FIGI" if len(source_figis) == 1 else ("NO_MATCH" if not source else "AMBIGUOUS")),
+            "source_scoped_share_class_figis": source_shares,
             "source_openfigi_unique_figi": len(source_figis) == 1,
             "source_openfigi": [of_record(x) for x in source],
             "yahoo_exact_isin_candidate_count": len(cs),

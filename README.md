@@ -1,3 +1,19 @@
+## v0.4.26 functional — OOTC Unit exact-ISIN rescues
+
+Adds two separately taxonomy-gated same-source OOTC rescues for the audited `FINNHUB_TYPE_MISMATCH:Unit` cohort: `US_OOTC_STOCK_COMMON_FINNHUB_UNIT_EXACT_ISIN` and `US_OOTC_FUND_UNIT_FINNHUB_UNIT_EXACT_ISIN`. Both require exact TV ISIN, `ID_ISIN + OOTC`, exactly one qualifying `Unit / Unit` FIGI with exact TV ticker and non-null shareClassFIGI, and exactly one qualifying Yahoo exact-ISIN route for the exact TV ticker whose quote is OOTC-compatible, explicitly USD, currency-compatible, and `EQUITY`. The TV taxonomy gates remain separate (`stock/common` vs `fund/unit`); no generic Unit admission is added. Resolver policy is `0.4.26-policy426`, with `0.4.23-policy423` retained for compatible VERIFIED cache reuse.
+
+## v0.4.25 diagnostic-only — cached Unit source-MIC recovery
+
+Fixes `--us-finnhub-unit-audit` so cached `FINNHUB_TYPE_MISMATCH:Unit` rows recover source MIC evidence deterministically: reviewed direct TV prefix mapping where singular, otherwise exactly one MIC from exact-symbol Finnhub-universe evidence. Admission logic is unchanged; resolver policy remains `0.4.23-policy423`.
+
+## v0.4.24 diagnostic-only — current residual Finnhub Unit audit
+
+Refreshes the existing `--us-finnhub-unit-audit` output for the complete current `FINNHUB_TYPE_MISMATCH:Unit` residual cohort. The audit records exact TV ISIN/type/currency, source MIC, scoped and unscoped OpenFIGI FIGI/shareClassFIGI/taxonomy evidence, Yahoo exact-ISIN candidates and quote venue/currency/type compatibility, plus a fail-closed classification. It also exposes normalized `source_scoped_openfigi_status` and `source_scoped_share_class_figis` fields for compact cohort analysis. Admission logic is unchanged; resolver policy remains `0.4.23-policy423`.
+
+## v0.4.23 functional — OOTC stock/common Ltd Part exact-ISIN rescue
+
+Adds `US_OOTC_STOCK_COMMON_FINNHUB_LTD_PART_EXACT_ISIN` for the audited OOTC `FINNHUB_TYPE_MISMATCH:Ltd Part` stock/common cohort. Admission requires exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `Ltd Part / Partnership Shares` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. Resolver policy is `0.4.23-policy423`.
+
 ## v0.4.22 functional — ARCX stock/common Ltd Part exact-ISIN rescue
 
 Adds `US_ARCX_STOCK_COMMON_FINNHUB_LTD_PART_EXACT_ISIN` for the v0.4.18-audited AMEX/ARCX `FINNHUB_TYPE_MISMATCH:Ltd Part` stock/common cohort. Admission requires exact TV ISIN, exactly one `ID_ISIN + ARCX` OpenFIGI FIGI classified `Ltd Part / Partnership Shares` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is ARCX-compatible, explicitly USD, and `EQUITY`. OOTC, XNYS, and XNAS cases are not admitted by this path. Resolver policy is `0.4.22-policy422`.
