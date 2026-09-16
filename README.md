@@ -1,3 +1,7 @@
+## v0.4.18 diagnostic-only — residual Finnhub taxonomy audit
+
+Adds `--us-finnhub-residual-taxonomy-audit` for the ten remaining reviewed `FINNHUB_TYPE_MISMATCH` cohorts: Closed-End Fund, Ltd Part, CDI, Royalty Trst, Stapled Security, Preference, GDR, Common Stock, NVDR, and SDR. The audit is full-cohort (including missing ISIN) and records source MIC provenance, scoped/unscoped exact-ISIN OpenFIGI evidence, shareClassFIGI, Yahoo exact-ISIN candidates, and strict same-source EQUITY evidence. Admission policy remains `0.4.15-policy415`.
+
 # tv-market-identity-prototype v0.4.14
 
 Diagnostic-only v0.4.14 audits the complete current `FINNHUB_TYPE_MISMATCH:Unit` residual cohort with `--us-finnhub-unit-audit`. Rows without a TradingView ISIN are retained as explicit `MISSING_TV_ISIN` fail-closed controls; ISIN-bearing rows collect scoped/unscoped OpenFIGI and Yahoo exact-ISIN evidence and receive diagnostic classifications. Admission is unchanged and resolver policy remains `0.4.11-policy411`.

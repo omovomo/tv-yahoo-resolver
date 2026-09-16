@@ -3095,6 +3095,126 @@ def _write_us_finnhub_public_xnas_segment_audit(path: Path, rows, bindings: dict
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
+_V0418_FINNHUB_RESIDUAL_TYPES = {
+    "Closed-End Fund", "Ltd Part", "CDI", "Royalty Trst", "Stapled Security",
+    "Preference", "GDR", "Common Stock", "NVDR", "SDR",
+}
+
+
+def _write_us_finnhub_residual_taxonomy_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """v0.4.18 diagnostic-only audit of the remaining reviewed Finnhub taxonomy cohorts."""
+    cohort = [
+        r for r in rows
+        if (b := bindings.get(r.tv_id)) is not None
+        and b.status == "REJECTED"
+        and b.rejection_reason.startswith("FINNHUB_TYPE_MISMATCH:")
+        and b.rejection_reason.removeprefix("FINNHUB_TYPE_MISMATCH:") in _V0418_FINNHUB_RESIDUAL_TYPES
+    ]
+
+    try:
+        universe = resolver.cache.load_finnhub_universe()
+    except Exception:
+        universe = []
+    norm_index = {}
+    for raw in universe:
+        sym = str(raw.get("symbol") or "").upper().strip()
+        for key in symbol_index_keys(sym) if sym else []:
+            norm_index.setdefault(key, []).append(raw)
+
+    source_mics, source_origins, matching_rows = [], [], {}
+    for r in cohort:
+        raws, seen = [], set()
+        for key in symbol_index_keys(r.symbol):
+            for raw in norm_index.get(key, []):
+                sig = json.dumps(raw, sort_keys=True, default=str)
+                if sig not in seen:
+                    seen.add(sig); raws.append(raw)
+        matching_rows[r.tv_id] = raws
+        direct = TV_PREFIX_TO_MIC.get(r.prefix)
+        if direct:
+            source_mics.append(direct); source_origins.append("TV_PREFIX_REVIEWED")
+        else:
+            mics = sorted({str(x.get("mic") or "").upper().strip() for x in raws if x.get("mic")})
+            if len(mics) == 1:
+                source_mics.append(mics[0]); source_origins.append("FINNHUB_EXACT_SYMBOL_UNIQUE_MIC")
+            else:
+                source_mics.append(None); source_origins.append("UNRESOLVED")
+
+    unscoped = [[] for _ in cohort]; scoped = [[] for _ in cohort]
+    uj = [(i, {"idType":"ID_ISIN","idValue":r.isin}) for i,r in enumerate(cohort) if r.isin]
+    sj = [(i, {"idType":"ID_ISIN","idValue":r.isin,"micCode":mic}) for i,(r,mic) in enumerate(zip(cohort,source_mics)) if r.isin and mic]
+    for jobs, dest in ((uj, unscoped), (sj, scoped)):
+        if jobs:
+            try:
+                mapped = resolver.openfigi.map_jobs([j for _,j in jobs])
+                for (i,_), xs in zip(jobs,mapped): dest[i] = list(xs)
+            except ProviderError:
+                pass
+
+    search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
+    searches = {}
+    if callable(search_fn):
+        for r in cohort:
+            token = str(r.isin or "").upper().strip()
+            if token and token not in searches:
+                try: searches[token] = list(search_fn(token))
+                except ProviderError: searches[token] = []
+    symbols = list(dict.fromkeys(
+        [b.yahoo_symbol for r in cohort if (b := bindings[r.tv_id]).yahoo_symbol]
+        + [c.symbol for cs in searches.values() for c in cs if c.symbol]
+    ))
+    try: quotes = resolver.yahoo.quotes(symbols) if symbols else {}
+    except ProviderError: quotes = {}
+
+    def of_record(x):
+        return {"figi":x.figi,"composite_figi":x.composite_figi,"share_class_figi":x.share_class_figi,
+                "ticker":x.ticker,"name":x.name,"security_type":x.security_type,
+                "security_type2":x.security_type2,"exch_code":x.exch_code}
+
+    records=[]
+    for r, us, ss, mic, origin in zip(cohort,unscoped,scoped,source_mics,source_origins):
+        b=bindings[r.tv_id]
+        u_shares=sorted({x.share_class_figi for x in us if x.share_class_figi})
+        s_figis=sorted({x.figi for x in ss if x.figi})
+        s_shares=sorted({x.share_class_figi for x in ss if x.share_class_figi})
+        u_status="UNKNOWN" if not us else ("UNIQUE_SHARE_CLASS" if len(u_shares)==1 else ("SHARE_CLASS_MISSING" if not u_shares else "AMBIGUOUS_SHARE_CLASS"))
+        s_status="UNIQUE_FIGI" if len(s_figis)==1 else ("NO_MATCH" if not ss else "AMBIGUOUS")
+        cs=searches.get(str(r.isin or "").upper().strip(),[])
+        candidates=[]
+        for c in cs:
+            q=quotes.get(c.symbol)
+            ticker_ok=punctuation_key(c.symbol.split('.')[0]) == punctuation_key(r.symbol)
+            venue_ok=bool(q and mic and yahoo_venue_compatible(mic,q))
+            currency_ok=bool(q and (not r.currency or not q.currency or currency_compatible(r.currency,q.currency)))
+            equity_ok=bool(q and (q.quote_type or "").upper()=="EQUITY")
+            search_equity=(c.quote_type or "").upper()=="EQUITY"
+            candidates.append({"symbol":c.symbol,"search_exchange":c.exchange,"search_quote_type":c.quote_type,
+                "quote_returned":q is not None,"quote_exchange":q.exchange if q else None,
+                "quote_full_exchange_name":q.full_exchange_name if q else None,"quote_market":q.market if q else None,
+                "quote_currency":q.currency if q else None,"quote_type":q.quote_type if q else None,
+                "same_tv_ticker":ticker_ok,"source_venue_compatible":venue_ok,"currency_compatible":currency_ok,
+                "equity_quote":equity_ok,"strict_same_source_equity":bool(ticker_ok and venue_ok and currency_ok and equity_ok and search_equity)})
+        strict=[x for x in candidates if x["strict_same_source_equity"]]
+        if not r.isin: classification="MISSING_TV_ISIN"
+        elif s_status=="UNIQUE_FIGI" and len(strict)==1: classification="SOURCE_SCOPED_AND_YAHOO_STRICT"
+        elif s_status=="NO_MATCH" and u_status=="UNIQUE_SHARE_CLASS" and len(strict)==1: classification="SOURCE_SCOPED_NO_MATCH_BUT_UNSCOPED_AND_YAHOO_STRICT"
+        elif len(strict)>1: classification="YAHOO_STRICT_AMBIGUOUS"
+        elif not strict: classification="YAHOO_SOURCE_CONTRACT_UNCONFIRMED"
+        else: classification="IDENTITY_EVIDENCE_INCOMPLETE"
+        records.append({"diagnostic_only":True,"diagnostic_release":"0.4.18","tv_id":r.tv_id,"tv_symbol":r.symbol,
+            "tv_isin":r.isin,"tv_currency":r.currency,"tv_type":r.tv_type,"tv_type_specs":list(r.type_specs),
+            "tv_type_kind":tv_type_kind(r),"finnhub_type":(b.finnhub_type or b.rejection_reason.removeprefix("FINNHUB_TYPE_MISMATCH:")),"rejection_reason":b.rejection_reason,
+            "source_mic":mic,"source_mic_origin":origin,"finnhub_matching_symbol_rows":matching_rows[r.tv_id],
+            "unscoped_openfigi_status":u_status,"unscoped_share_class_figis":u_shares,"unscoped_openfigi":[of_record(x) for x in us],
+            "source_scoped_openfigi_status":s_status,"source_scoped_figis":s_figis,"source_scoped_share_class_figis":s_shares,
+            "source_scoped_openfigi":[of_record(x) for x in ss],"yahoo_exact_isin_candidate_count":len(cs),
+            "yahoo_strict_same_source_equity_candidate_count":len(strict),"yahoo_exact_isin_candidates":candidates,
+            "classification":classification})
+    path.parent.mkdir(parents=True,exist_ok=True)
+    with path.open("w",encoding="utf-8") as f:
+        for rec in records: f.write(json.dumps(rec,ensure_ascii=False,sort_keys=True)+"\n")
+
+
 def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only evidence audit for US FINNHUB_TYPE_MISMATCH:? rejects."""
     # Full rejection cohort: missing ISIN is diagnostic evidence and must not
@@ -3689,6 +3809,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_public_xnas_segment_audit)
             _write_us_finnhub_public_xnas_segment_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub PUBLIC XNAS segment audit: {audit_path.resolve()}")
+        if args.us_finnhub_residual_taxonomy_audit:
+            audit_path = Path(args.us_finnhub_residual_taxonomy_audit)
+            _write_us_finnhub_residual_taxonomy_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub residual taxonomy audit: {audit_path.resolve()}")
         if args.us_finnhub_unknown_type_audit:
             audit_path = Path(args.us_finnhub_unknown_type_audit)
             _write_us_finnhub_unknown_type_audit(audit_path, rows, bindings, resolver)
@@ -4055,6 +4179,11 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-public-xnas-segment-audit",
         default=None,
         help="Write v0.4.10 diagnostic-only XNAS preferred OpenFIGI/Yahoo segment-consistency JSONL",
+    )
+    r.add_argument(
+        "--us-finnhub-residual-taxonomy-audit",
+        default=None,
+        help="Write v0.4.18 diagnostic-only full residual Finnhub taxonomy JSONL for 10 reviewed mismatch types",
     )
     r.add_argument(
         "--us-finnhub-unknown-type-audit",
