@@ -1447,17 +1447,45 @@ def _write_us_xase_fund_unit_cohort_audit(path: Path, rows, bindings: dict, reso
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.3.93 diagnostic-only audit of US YAHOO_CURRENCY_MISMATCH:? rejects.
+    """v0.4.16 diagnostic-only full-cohort audit of YAHOO_CURRENCY_MISMATCH:?.
 
-    Compares the primary Yahoo quote response with chart metadata and exact-ISIN
-    discovery.  Missing currency is kept distinct from an explicit conflicting
-    currency; this function never changes admission or cache state.
+    Records exact source identity evidence, Yahoo quote/chart currency metadata,
+    and exact-ISIN discovery. Missing ISIN stays in the cohort and never causes
+    an OpenFIGI/Yahoo ISIN lookup. Nothing here participates in admission/cache.
     """
     cohort = [
         r for r in rows
-        if r.isin and (b := bindings.get(r.tv_id)) is not None
+        if (b := bindings.get(r.tv_id)) is not None
         and b.status == "REJECTED" and b.rejection_reason == "YAHOO_CURRENCY_MISMATCH:?"
     ]
+
+    # OpenFIGI: source-scoped proof plus unscoped exact-ISIN context.
+    scoped_jobs, scoped_indexes = [], []
+    unscoped_jobs, unscoped_indexes = [], []
+    for i, r in enumerate(cohort):
+        if not r.isin:
+            continue
+        unscoped_indexes.append(i)
+        unscoped_jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+        mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        if mic:
+            scoped_indexes.append(i)
+            scoped_jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": mic})
+    scoped_mapped = [[] for _ in cohort]
+    unscoped_mapped = [[] for _ in cohort]
+    try:
+        mapped = resolver.openfigi.map_jobs(scoped_jobs) if scoped_jobs else []
+        for i, xs in zip(scoped_indexes, mapped):
+            scoped_mapped[i] = list(xs)
+    except ProviderError:
+        pass
+    try:
+        mapped = resolver.openfigi.map_jobs(unscoped_jobs) if unscoped_jobs else []
+        for i, xs in zip(unscoped_indexes, mapped):
+            unscoped_mapped[i] = list(xs)
+    except ProviderError:
+        pass
+
     direct_symbols = []
     variants_by_tv = {}
     for r in cohort:
@@ -1478,8 +1506,10 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
     search_fn = getattr(resolver.yahoo, "search_exact_isin", None)
     if callable(search_fn):
         for r in cohort:
+            if not r.isin:
+                continue
             token = str(r.isin).upper().strip()
-            if token not in searches:
+            if token and token not in searches:
                 try:
                     searches[token] = list(search_fn(token))
                 except ProviderError:
@@ -1493,6 +1523,12 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
         search_charts = resolver.yahoo.chart_quotes(search_symbols) if search_symbols and hasattr(resolver.yahoo, "chart_quotes") else {}
     except ProviderError:
         search_charts = {}
+
+    def figirec(x):
+        return {"figi": x.figi, "composite_figi": x.composite_figi,
+                "share_class_figi": x.share_class_figi, "ticker": x.ticker,
+                "security_type": x.security_type, "security_type2": x.security_type2,
+                "exch_code": x.exch_code}
 
     def qrec(q, r, source_mic):
         if q is None:
@@ -1508,22 +1544,24 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
         }
 
     records = []
-    for r in cohort:
+    for i, r in enumerate(cohort):
         b = bindings[r.tv_id]
         source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
+        scoped = scoped_mapped[i]
+        unscoped = unscoped_mapped[i]
         direct = []
         for sym in variants_by_tv.get(r.tv_id, []):
-            direct.append({
-                "requested_symbol": sym,
-                "quote": qrec(quotes.get(sym), r, source_mic),
-                "chart": qrec(charts.get(sym), r, source_mic),
-            })
-        cs = searches.get(str(r.isin).upper().strip(), [])
+            direct.append({"requested_symbol": sym,
+                           "quote": qrec(quotes.get(sym), r, source_mic),
+                           "chart": qrec(charts.get(sym), r, source_mic)})
+        token = str(r.isin or "").upper().strip()
+        cs = searches.get(token, []) if token else []
         discovered = []
         for c in cs:
             discovered.append({
                 "symbol": c.symbol, "search_exchange": c.exchange,
                 "search_quote_type": c.quote_type,
+                "exact_tv_symbol": bool(c.symbol and c.symbol.upper() == r.symbol.upper()),
                 "quote": qrec(search_quotes.get(c.symbol), r, source_mic),
                 "chart": qrec(search_charts.get(c.symbol), r, source_mic),
             })
@@ -1534,11 +1572,12 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
         for x in discovered:
             for key in ("quote", "chart"):
                 q = x.get(key)
-                if (q and x["symbol"].upper() == r.symbol.upper() and q["currency_compatible"]
-                        and q["source_venue_compatible"] and q["type_compatible"]):
+                if q and x["exact_tv_symbol"] and q["currency_compatible"] and q["source_venue_compatible"] and q["type_compatible"]:
                     exact_same_source_good.append((x["symbol"], key))
 
-        if direct_quote_explicit_bad:
+        if not r.isin:
+            classification = "MISSING_TV_ISIN"
+        elif direct_quote_explicit_bad:
             classification = "EXPLICIT_CURRENCY_CONTRADICTION"
         elif direct_chart_good:
             classification = "QUOTE_CURRENCY_MISSING_CHART_STRICT_MATCH"
@@ -1550,10 +1589,17 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
             classification = "IDENTITY_OR_CURRENCY_EVIDENCE_INCOMPLETE"
 
         records.append({
-            "diagnostic_only": True, "diagnostic_release": __version__,
+            "diagnostic_only": True, "diagnostic_release": "0.4.16",
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "rejection_reason": b.rejection_reason, "source_mic": source_mic,
+            "source_scoped_openfigi_count": len(scoped),
+            "source_scoped_openfigi": [figirec(x) for x in scoped],
+            "unscoped_openfigi_count": len(unscoped),
+            "unscoped_openfigi": [figirec(x) for x in unscoped],
+            "source_scoped_unique_figi": len(scoped) == 1,
+            "source_scoped_share_class_figis": sorted({x.share_class_figi for x in scoped if x.share_class_figi}),
+            "unscoped_share_class_figis": sorted({x.share_class_figi for x in unscoped if x.share_class_figi}),
             "direct_symbol_variants": direct,
             "yahoo_exact_isin_candidate_count": len(cs),
             "yahoo_exact_isin_candidates": discovered,
@@ -1565,7 +1611,6 @@ def _write_us_yahoo_currency_unknown_audit(path: Path, rows, bindings: dict, res
     with path.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-
 
 
 def _write_us_finnhub_royalty_trust_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
@@ -3883,7 +3928,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-yahoo-currency-unknown-audit",
         default=None,
-        help="Write v0.3.93 diagnostic-only JSONL for US YAHOO_CURRENCY_MISMATCH:? rejects",
+        help="Write v0.4.16 diagnostic-only full-cohort JSONL for US YAHOO_CURRENCY_MISMATCH:? rejects",
     )
     r.add_argument(
         "--us-finnhub-royalty-trust-audit",

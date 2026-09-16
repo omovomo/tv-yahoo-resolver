@@ -1451,3 +1451,13 @@ Diagnostic-only correction for the US `FINNHUB_TYPE_MISMATCH:?` full-cohort audi
 ### v0.4.15
 
 Functional US identity release. Adds the evidence-gated `US_XNYS_STOCK_COMMON_FINNHUB_UNIT_EXACT_ISIN` rescue for the v0.4.14-audited NYSE stock/common subset rejected as Finnhub `Unit`. Admission requires exact TV ISIN, XNYS stock/common, exactly one scoped OpenFIGI `Unit/Unit` FIGI with non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate equal to the TV ticker with NYSE-compatible USD/EQUITY quote metadata. XNAS and OTC remain outside the rule. Resolver policy is `0.4.15-policy415`.
+
+### v0.4.16 — Yahoo unknown-currency full-cohort diagnostic
+
+Diagnostic-only expansion of `--us-yahoo-currency-unknown-audit` for every
+`YAHOO_CURRENCY_MISMATCH:?` rejection, including rows without TradingView ISIN.
+It records source-scoped and unscoped OpenFIGI exact-ISIN evidence, Yahoo direct
+quote/chart currency metadata, exact-ISIN discovery, exact-symbol correlation,
+and explicit classifications. Missing ISIN is emitted as `MISSING_TV_ISIN` and
+never queried by OpenFIGI/Yahoo ISIN endpoints. Admission is unchanged; resolver
+policy remains `0.4.15-policy415`.
