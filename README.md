@@ -1,3 +1,11 @@
+## v0.4.21 functional — OOTC stock/common Closed-End Fund exact-ISIN rescue
+
+Adds `US_OOTC_STOCK_COMMON_FINNHUB_CLOSED_END_FUND_EXACT_ISIN` for the v0.4.18-audited OOTC `FINNHUB_TYPE_MISMATCH:Closed-End Fund` stock/common cohort. Admission requires exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `Closed-End Fund / Mutual Fund` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. XNAS source-NO-MATCH and Yahoo `ETF` cases remain rejected. This is not a global Closed-End Fund taxonomy override. Resolver policy is `0.4.21-policy421`.
+
+## v0.4.20 functional — OOTC DR/GDR exact-ISIN rescue
+
+Adds `US_OOTC_DR_FINNHUB_GDR_EXACT_ISIN` for the v0.4.18-audited OOTC `FINNHUB_TYPE_MISMATCH:GDR` depositary-receipt cohort. Admission requires OTC `dr`, exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `GDR / Depositary Receipt` with exact TV ticker and non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. This is not a global `GDR -> EQUITY` compatibility rule. Resolver policy is `0.4.20-policy420`.
+
 ## v0.4.19 functional — OOTC stock/common Royalty Trst exact-ISIN rescue
 
 Adds `US_OOTC_STOCK_COMMON_FINNHUB_ROYALTY_TRST_EXACT_ISIN` for the v0.4.18-audited OOTC `FINNHUB_TYPE_MISMATCH:Royalty Trst` cohort. Admission requires OTC stock/common, exact TV ISIN, exactly one `ID_ISIN + OOTC` OpenFIGI FIGI classified `Royalty Trst / Common Stock` with non-null shareClassFIGI, and exactly one Yahoo exact-ISIN candidate whose symbol exactly equals the TV ticker and whose quote is OOTC-compatible, explicitly USD, and `EQUITY`. This is not a global `Royalty Trst -> EQUITY` compatibility rule. Resolver policy is `0.4.19-policy419`.

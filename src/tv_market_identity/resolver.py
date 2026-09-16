@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -655,6 +655,8 @@ class BatchResolver:
             us_bindings = self._us_xnys_stock_common_ltd_part_rescue(us, us_bindings)
             us_bindings = self._us_xnys_stock_common_closed_end_fund_rescue(us, us_bindings)
             us_bindings = self._us_ootc_stock_common_royalty_trust_rescue(us, us_bindings)
+            us_bindings = self._us_ootc_stock_common_closed_end_fund_rescue(us, us_bindings)
+            us_bindings = self._us_ootc_dr_gdr_rescue(us, us_bindings)
             us_bindings = self._us_xnas_fund_unit_rescue(us, us_bindings)
             us_bindings = self._us_ootc_preferred_empty_type_public_rescue(us, us_bindings)
             us_bindings = self._us_otc_preferred_rescue(us, us_bindings)
@@ -2074,6 +2076,203 @@ class BatchResolver:
                 source_of=of, target_of=of,
             )
             self.stats["us_ootc_stock_common_royalty_trust_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_ootc_stock_common_closed_end_fund_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the v0.4.18-audited OOTC stock/common Closed-End Fund cohort.
+
+        This is a same-source exact-identity rule, not a taxonomy override.
+        Admission requires an OTC stock/common row with exact TV ISIN and a
+        current ``FINNHUB_TYPE_MISMATCH:Closed-End Fund`` rejection; exactly
+        one ``ID_ISIN + OOTC`` OpenFIGI FIGI classified
+        Closed-End Fund/Mutual Fund with exact TV ticker and non-null
+        shareClassFIGI; and exactly one Yahoo exact-ISIN candidate whose symbol
+        exactly equals the TV ticker and whose quote is OOTC-compatible,
+        explicitly USD, and EQUITY.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:Closed-End Fund":
+                continue
+            if (r.prefix != "OTC" or (r.tv_type or "").lower() != "stock"
+                    or "common" not in specs or not r.isin):
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "OOTC"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_ootc_stock_common_closed_end_fund_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_ootc_stock_common_closed_end_fund_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            source = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "closed-end fund"
+                and (x.security_type2 or "").strip().lower() == "mutual fund"
+                and bool((x.share_class_figi or "").strip())
+                and str(x.ticker or "").upper().strip() == str(r.symbol or "").upper().strip()
+            )]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_ootc_stock_common_closed_end_fund_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in source if x.figi == figi)
+            self.stats["us_ootc_stock_common_closed_end_fund_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_ootc_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if str(c.symbol or "").upper().strip() != str(r.symbol or "").upper().strip():
+                self.stats["us_ootc_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_ootc_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if (q.currency or "").upper() != "USD" or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_ootc_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("OOTC", q):
+                self.stats["us_ootc_stock_common_closed_end_fund_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="OOTC", source_mic="OOTC", target_mic="OOTC",
+                mapping_method="US_OOTC_STOCK_COMMON_FINNHUB_CLOSED_END_FUND_EXACT_ISIN",
+                source_of=of, target_of=of,
+            )
+            self.stats["us_ootc_stock_common_closed_end_fund_rescue_matches"] += 1
+
+        return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
+
+    def _us_ootc_dr_gdr_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue the v0.4.18-audited OOTC DR/GDR exact-ISIN cohort.
+
+        Admission is limited to OTC TradingView depositary receipts rejected as
+        Finnhub GDR.  Exact ISIN must yield exactly one OOTC-scoped OpenFIGI
+        FIGI classified GDR/Depositary Receipt with non-null shareClassFIGI,
+        and Yahoo exact-ISIN discovery must yield exactly one candidate whose
+        symbol is the exact TV ticker and whose quote is OOTC-compatible, USD,
+        and EQUITY.  This is not a global GDR taxonomy compatibility rule.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            if not b or b.rejection_reason != "FINNHUB_TYPE_MISMATCH:GDR":
+                continue
+            if r.prefix != "OTC" or (r.tv_type or "").lower() != "dr" or not r.isin:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = [{"idType": "ID_ISIN", "idValue": r.isin, "micCode": "OOTC"} for r in eligible]
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_ootc_dr_gdr_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_ootc_dr_gdr_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, OpenFigiIdentity] = {}
+        for r, identities in zip(eligible, mapped):
+            source = [x for x in identities if (
+                (x.security_type or "").strip().lower() == "gdr"
+                and (x.security_type2 or "").strip().lower() == "depositary receipt"
+                and bool((x.share_class_figi or "").strip())
+                and str(x.ticker or "").upper().strip() == str(r.symbol or "").upper().strip()
+            )]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_ootc_dr_gdr_source_unconfirmed"] += 1
+                continue
+            figi = next(iter(figis))
+            proven[r.tv_id] = next(x for x in source if x.figi == figi)
+            self.stats["us_ootc_dr_gdr_source_proven"] += 1
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+        searches: dict[str, list[YahooSearchCandidate]] = {}
+        for r in eligible:
+            if r.tv_id not in proven:
+                continue
+            try:
+                searches[r.tv_id] = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                searches[r.tv_id] = []
+        symbols = sorted({c.symbol for cs in searches.values() for c in cs if c.symbol})
+        try:
+            quotes = self.yahoo.quotes(symbols) if symbols else {}
+        except ProviderError:
+            quotes = {}
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            of = proven.get(r.tv_id)
+            cs = searches.get(r.tv_id, [])
+            if of is None or len(cs) != 1:
+                self.stats["us_ootc_dr_gdr_yahoo_unconfirmed"] += 1
+                continue
+            c = cs[0]
+            q = quotes.get(c.symbol)
+            if str(c.symbol or "").upper().strip() != str(r.symbol or "").upper().strip():
+                self.stats["us_ootc_dr_gdr_yahoo_unconfirmed"] += 1
+                continue
+            if (c.quote_type or "").upper() != "EQUITY" or q is None or (q.quote_type or "").upper() != "EQUITY":
+                self.stats["us_ootc_dr_gdr_yahoo_unconfirmed"] += 1
+                continue
+            if (q.currency or "").upper() != "USD" or (r.currency and not currency_compatible(r.currency, q.currency)):
+                self.stats["us_ootc_dr_gdr_yahoo_unconfirmed"] += 1
+                continue
+            if not yahoo_venue_compatible("OOTC", q):
+                self.stats["us_ootc_dr_gdr_yahoo_unconfirmed"] += 1
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic="OOTC", source_mic="OOTC", target_mic="OOTC",
+                mapping_method="US_OOTC_DR_FINNHUB_GDR_EXACT_ISIN", source_of=of, target_of=of,
+            )
+            self.stats["us_ootc_dr_gdr_rescue_matches"] += 1
 
         return [rescued.get(b.tv_id, b) for b in bindings] if rescued else bindings
 
