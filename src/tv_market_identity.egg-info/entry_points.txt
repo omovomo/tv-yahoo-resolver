@@ -1,2 +1,0 @@
-[console_scripts]
-tv-market-id = tv_market_identity.cli:main

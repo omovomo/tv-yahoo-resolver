@@ -753,7 +753,7 @@ def test_v0414_unit_audit_keeps_missing_isin_in_full_cohort(tmp_path, monkeypatc
     out = tmp_path / "unit-missing.jsonl"
     cli._write_us_finnhub_unit_audit(out, [row], {row.tv_id: binding}, SimpleNamespace(openfigi=OF(), yahoo=Y()))
     rec = json.loads(out.read_text().strip())
-    assert rec["diagnostic_release"] == "0.4.46"
+    assert rec["diagnostic_release"] == "0.4.47"
     assert rec["classification"] == "MISSING_TV_ISIN"
     assert rec["tv_isin"] is None
     assert binding.status == "REJECTED"

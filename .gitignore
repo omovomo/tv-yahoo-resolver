@@ -1,7 +1,14 @@
 .venv/
 __pycache__/
+*.py[cod]
 .pytest_cache/
+*.egg-info/
 *.pyc
 cache/
 out/
+build/
+dist/
 .env
+deps/
+*.whl
+*.zip
