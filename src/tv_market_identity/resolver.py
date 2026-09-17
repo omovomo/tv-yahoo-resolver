@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:

@@ -14,7 +14,7 @@ from tv_market_identity.policy import RESOLVER_VERSION
 def test_v430_flag_and_policy_unchanged():
     a=parser().parse_args(['run','--us-finnhub-unknown-type-preferred-dr-audit','x.jsonl'])
     assert a.us_finnhub_unknown_type_preferred_dr_audit=='x.jsonl'
-    assert RESOLVER_VERSION=='0.4.35-policy435'
+    assert RESOLVER_VERSION=='0.4.38-policy438'
 
 def test_v430_focuses_preferred_and_dr(tmp_path):
     rows=[

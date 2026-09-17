@@ -106,3 +106,29 @@ def test_complete_universe_flag(tmp_path):
     assert cfg.paginate is False
     assert cfg.require_complete_universe is True
     assert cfg.limit == 100000
+
+import pytest
+
+
+@pytest.mark.parametrize(
+    ("filename", "market"),
+    [
+        ("identity_coverage_ireland.ini", "ireland"),
+        ("identity_coverage_hongkong.ini", "hongkong"),
+        ("identity_coverage_japan.ini", "japan"),
+    ],
+)
+def test_regional_discovery_coverage_presets(filename, market):
+    cfg_path = Path(__file__).resolve().parents[1] / "config" / filename
+    cfg = load_screen_config(cfg_path)
+    assert cfg.market == market
+    assert cfg.limit == 4000
+    assert cfg.order_by == "market_cap_basic"
+    assert cfg.ascending is False
+    assert cfg.primary_only is False
+    assert cfg.paginate is False
+    assert cfg.require_complete_universe is False
+    assert cfg.min_market_cap is None
+    assert cfg.min_avg_volume_90d is None
+    assert cfg.min_pe is None
+    assert cfg.sectors == ()

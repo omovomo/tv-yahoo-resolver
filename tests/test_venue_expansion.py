@@ -11,6 +11,8 @@ from tv_market_identity.resolver import BatchResolver
 
 def test_reviewed_venue_mappings_and_suffixes():
     assert TV_PREFIX_TO_MIC["AQUIS"] == "AQSE"
+    assert TV_PREFIX_TO_MIC["HKEX"] == "XHKG"
+    assert MIC_TO_YAHOO_SUFFIX["XHKG"] == ".HK"
     assert MIC_TO_YAHOO_SUFFIX["AQSE"] == ".AQ"
     assert TV_PREFIX_TO_MIC["FWB"] == "XFRA"
     assert MIC_TO_YAHOO_SUFFIX["XFRA"] == ".F"

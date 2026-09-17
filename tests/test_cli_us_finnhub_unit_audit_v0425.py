@@ -18,7 +18,7 @@ def test_v0425_unit_audit_recovers_otc_mic_for_cached_reject(tmp_path):
     b=Binding(r.tv_id,r.symbol,r.prefix,r.currency,r.tv_type,'REJECTED',finnhub_type='Unit',rejection_reason='FINNHUB_TYPE_MISMATCH:Unit')
     out=tmp_path/'a.jsonl'; cli._write_us_finnhub_unit_audit(out,[r],{r.tv_id:b},R())
     rec=json.loads(out.read_text())
-    assert rec['diagnostic_release']=='0.4.48'
+    assert rec['diagnostic_release']=='0.4.51'
     assert rec['source_mic']=='OOTC'
     assert rec['source_mic_origin']=='FINNHUB_EXACT_SYMBOL_UNIQUE_MIC'
     assert rec['source_scoped_openfigi_status']=='UNIQUE_FIGI'

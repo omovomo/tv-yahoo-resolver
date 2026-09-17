@@ -10,4 +10,4 @@ def test_v0446_removes_experimental_bridge_diagnostics_without_policy_change():
     assert '"resolution_classification"' in src
     assert '"unscoped_openfigi"' in src
     assert '"home_market_search_candidates"' in src
-    assert RESOLVER_VERSION == "0.4.35-policy435"
+    assert RESOLVER_VERSION == "0.4.38-policy438"

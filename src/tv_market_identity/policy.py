@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.35-policy435"
+RESOLVER_VERSION = "0.4.38-policy438"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -26,6 +26,9 @@ TV_PREFIX_TO_MIC = {
     # TradingView SIX = SIX Swiss Exchange. Current Swiss blue-chip/main
     # equity venue MIC is XSWX; SIX is the provider prefix, not the MIC.
     "SIX": "XSWX",
+    # TradingView HKEX is Hong Kong Exchanges and Clearing / Stock Exchange of Hong Kong.
+    # XHKG is the ISO 10383 operating MIC for the cash equity venue.
+    "HKEX": "XHKG",
     # TradingView BX = BX Swiss. ISO 10383 operating MIC is XBRN.
     # BX Sponsored Shares includes foreign equities traded in CHF; Yahoo does
     # not expose an XBRN suffix, so exact-ISIN home-market rescue may reroute
@@ -412,6 +415,11 @@ def yahoo_listing_symbol(
             return symbol + ".IL"
     if mic == "AQSE" and symbol.endswith(".GB"):
         symbol = symbol[:-3]
+    # Yahoo represents numeric Hong Kong listing codes with at least four
+    # digits (TV HKEX:700 -> Yahoo 0700.HK, HKEX:5 -> 0005.HK).  Preserve
+    # already-longer numeric codes and non-numeric symbols unchanged.
+    if mic == "XHKG" and symbol.isdigit():
+        symbol = symbol.zfill(4)
     suffix = MIC_TO_YAHOO_SUFFIX.get(mic, "")
     return symbol + suffix
 
@@ -468,6 +476,8 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XSTU": {"STU"},
         "XMUN": {"MUN"},
         "XHAN": {"HAN"},
+        # Yahoo represents Hong Kong Stock Exchange listings as HKG / HKSE.
+        "XHKG": {"HKG"},
         # Cboe BZX equity MIC / Yahoo exchange code.
         "BATS": {"BTS"},
         # OTCM is the ISO 10383 operating MIC for OTC Markets. Yahoo exposes
@@ -510,6 +520,7 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XSTU": ("STUTTGART",),
         "XMUN": ("MUNICH", "MUENCHEN", "MÜNCHEN"),
         "XHAN": ("HANNOVER", "HANOVER"),
+        "XHKG": ("HKSE", "HONG KONG STOCK EXCHANGE", "HONG KONG"),
         "BATS": ("CBOE US", "CBOE BZX", "BZX"),
         "OTCM": ("OTC MARKETS OTCQX", "OTC MARKETS OTCQB", "OTC MARKETS OTCPK", "OTCQX", "OTCQB", "OTCPK"),
         "OTCQ": ("OTCQX",),
