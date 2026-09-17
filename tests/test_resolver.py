@@ -2458,16 +2458,15 @@ def test_v087_ootc_preferred_empty_type_public_exact_isin_admission(tmp_path):
 class OFPrivateOOTCV087(OFEmptyOOTCV087):
     def map_jobs(self,jobs):
         from tv_market_identity.models import OpenFigiIdentity
-        return [[OpenFigiIdentity("OF_EPREF","COMP",None,"EPREF","EMPTY TYPE PREF","PRIVATE","Preferred Stock","US")] if j.get("micCode") == "OOTC" else [] for j in jobs]
+        return [[OpenFigiIdentity("OF_EPREF","COMP",None,"ES 4.5 PERP 1963","EMPTY TYPE PREF","PRIVATE","Preferred Stock","OTC US")] if j.get("micCode") == "OOTC" else [] for j in jobs]
 
-def test_v087_ootc_empty_type_private_preferred_stays_rejected(tmp_path):
-    db=CacheDB(tmp_path / "v087-private.sqlite")
+def test_v432_ootc_empty_type_private_preferred_same_source_rescued(tmp_path):
+    db=CacheDB(tmp_path / "v432-private.sqlite")
     r=BatchResolver(db,FHEmptyOOTCV087(),OFPrivateOOTCV087(),YHEmptyOOTCV087())
     row=TvRow("OTC:EPREF","OTC","EPREF",None,"USD","stock",("preferred",),None,None,10.0,"US0000000871")
     got=r.resolve([row])[row.tv_id]
-    assert got.status == "REJECTED"
-    assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:?"
-    assert r.stats["us_ootc_preferred_empty_type_rescue_matches"] == 0
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "US_OOTC_STOCK_PREFERRED_FINNHUB_UNKNOWN_TYPE_EXACT_ISIN"
     db.close()
 
 def test_v087_ootc_empty_type_common_stays_rejected(tmp_path):

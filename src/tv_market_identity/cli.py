@@ -3441,6 +3441,30 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+def _write_us_finnhub_unknown_type_preferred_dr_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
+    """v0.4.30 diagnostic-only audit for OOTC preferred/DR unknown-type residuals."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td) / "unknown.jsonl"
+        _write_us_finnhub_unknown_type_audit(base, rows, bindings, resolver)
+        records = [json.loads(line) for line in base.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    selected = []
+    for rec in records:
+        specs = {str(x).lower() for x in rec.get("tv_type_specs") or [] if x}
+        is_preferred = rec.get("tv_type") == "stock" and "preferred" in specs
+        is_dr = rec.get("tv_type_kind") == "dr" or rec.get("tv_type") == "dr"
+        if rec.get("source_mic") == "OOTC" and (is_preferred or is_dr):
+            rec["diagnostic_release"] = "0.4.30"
+            rec["v430_focus"] = "OOTC_STOCK_PREFERRED" if is_preferred else "OOTC_DR"
+            selected.append(rec)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for rec in selected:
+            f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+
+
 def _write_us_finnhub_unknown_type_residual_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
     """Diagnostic-only v0.3.90 audit of residual FINNHUB_TYPE_MISMATCH:? rows.
 
@@ -3874,6 +3898,10 @@ def cmd_run(args) -> int:
             audit_path = Path(args.us_finnhub_unknown_type_audit)
             _write_us_finnhub_unknown_type_audit(audit_path, rows, bindings, resolver)
             print(f"US Finnhub unknown-type audit: {audit_path.resolve()}")
+        if args.us_finnhub_unknown_type_preferred_dr_audit:
+            audit_path = Path(args.us_finnhub_unknown_type_preferred_dr_audit)
+            _write_us_finnhub_unknown_type_preferred_dr_audit(audit_path, rows, bindings, resolver)
+            print(f"US Finnhub unknown-type preferred/DR audit: {audit_path.resolve()}")
         if args.us_finnhub_unknown_type_residual_audit:
             audit_path = Path(args.us_finnhub_unknown_type_residual_audit)
             _write_us_finnhub_unknown_type_residual_audit(audit_path, rows, bindings, resolver)
@@ -4246,6 +4274,11 @@ def parser() -> argparse.ArgumentParser:
         "--us-finnhub-unknown-type-audit",
         default=None,
         help="Write v0.4.28 diagnostic-only full-cohort decomposition JSONL for US FINNHUB_TYPE_MISMATCH:? rejects",
+    )
+    r.add_argument(
+        "--us-finnhub-unknown-type-preferred-dr-audit",
+        default=None,
+        help="Write v0.4.30 diagnostic-only OOTC stock/preferred and DR evidence JSONL for FINNHUB_TYPE_MISMATCH:? rejects",
     )
     r.add_argument(
         "--us-finnhub-unknown-type-residual-audit",

@@ -20,7 +20,7 @@ def test_v0424_unit_audit_current_release_and_normalized_scoped_fields(tmp_path)
     out=tmp_path/'unit.jsonl'
     cli._write_us_finnhub_unit_audit(out,[row],{row.tv_id:b},R())
     rec=json.loads(out.read_text().strip())
-    assert rec['diagnostic_release']=='0.4.29'
+    assert rec['diagnostic_release']=='0.4.32'
     assert rec['source_scoped_openfigi_status']=='UNIQUE_FIGI'
     assert rec['source_scoped_share_class_figis']==['SC1']
     assert rec['classification']=='UNIQUE_SHARE_CLASS_AND_ONE_SAME_SOURCE_EQUITY_CANDIDATE'

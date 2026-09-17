@@ -1,6 +1,6 @@
-# tv-market-identity-prototype v0.4.29
+# tv-market-identity-prototype v0.4.30
 
-Functional release for the audited OOTC `stock/common` residual with `FINNHUB_TYPE_MISMATCH:?`. Adds `US_OOTC_STOCK_COMMON_FINNHUB_UNKNOWN_TYPE_EXACT_ISIN`: exact TV ISIN, OOTC-scoped unique OpenFIGI `Common Stock / Common Stock`, non-null shareClassFIGI, exact ticker, and exactly one strict Yahoo exact-ISIN OOTC/USD/EQUITY route. No generic unknown-type compatibility is introduced. Resolver policy is `0.4.29-policy429`; prior VERIFIED `0.4.26-policy426` cache remains compatible while prior REJECTED rows are reprocessed.
+Diagnostic-only release for focused analysis of residual OOTC `FINNHUB_TYPE_MISMATCH:?` rows in the `stock/preferred` and DR taxonomies. Adds `--us-finnhub-unknown-type-preferred-dr-audit`; admission is unchanged and resolver policy remains `0.4.29-policy429`.
 
 # tv-market-identity-prototype v0.4.28
 

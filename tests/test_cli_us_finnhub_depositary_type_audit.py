@@ -10,4 +10,4 @@ def test_nvdr_and_sdr_audit_flags_are_available_without_policy_change():
     ])
     assert args.us_finnhub_nvdr_audit == "nvdr.jsonl"
     assert args.us_finnhub_sdr_audit == "sdr.jsonl"
-    assert RESOLVER_VERSION == "0.4.29-policy429"
+    assert RESOLVER_VERSION == "0.4.32-policy432"
