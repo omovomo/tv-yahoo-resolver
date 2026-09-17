@@ -31,7 +31,8 @@
     evidence;
 5.  testing/reproducibility policy;
 6.  Git/pwsh workflow;
-7.  architecture bookmarks, которые ещё НЕ являются production policy.
+7.  правила работы с tracked project backlog `todo.md`; сами текущие
+    bookmarks/tasks находятся в `todo.md`, а не дублируются здесь.
 
 Не смешивать эти категории.
 
@@ -78,6 +79,7 @@ Tracked project state включает фактические source/tests/confi
 -   `config/`;
 -   `pyproject.toml`;
 -   README;
+-   `todo.md`;
 -   другие tracked project files.
 
 В том же repository существует ignored local production/runtime state:
@@ -124,11 +126,15 @@ HEAD
 
 Не смешивать приложенный archive со старыми snapshots.
 
+Если archive содержит root `todo.md`, он является актуальным backlog/bookmark
+state этой сессии. Перед обсуждением отложенных задач читать actual `todo.md`;
+не восстанавливать его содержимое из памяти.
+
 Память о проекте используется для:
 
 -   invariants;
 -   history;
--   architecture bookmarks;
+-   workflow/backlog semantics;
 -   expected/reference state;
 -   workflow;
 
@@ -1455,264 +1461,35 @@ policy/cache compatibility.
 Не bump-ить package или policy только потому, что начался новый чат.
 
 ======================================================================
-49. ARCHITECTURE BOOKMARK --- IDENTITY REGISTRY
-=============================================
-
-ЭТО ОТЛОЖЕННАЯ АРХИТЕКТУРНАЯ ЗАКЛАДКА.
-
-Она НЕ является текущей implemented policy.
-
-Не реализовывать автоматически во время обычного rejection cleanup.
-
-Будущая отдельная architecture phase:
-
-IDENTITY REGISTRY
-
-Главная идея:
-
-разделить
-
-IDENTITY VALIDITY
-
-и
-
-PROVIDER / LISTING REFRESH LIFECYCLE.
-
-======================================================================
-50. IDENTITY REGISTRY --- ЗАДАЧИ ==============================
-
-Будущий Registry должен помочь корректно обрабатывать:
-
--   corporate actions;
-
--   ticker changes;
-
--   venue changes;
-
--   exchange migrations;
-
--   delisting;
-
--   uplisting;
-
--   stale provider IDs;
-
--   stale symbols;
-
--   inactive symbols;
-
--   provider metadata drift;
-
--   TradingView universe drift;
-
--   temporary provider outages;
-
--   re-verification;
-
--   resolver policy migrations.
-
-Доказанная stable identity не должна обязательно требовать полного
-дорогого identity resolution при каждом provider refresh.
-
-Но provider/listing state должен обновляться независимо.
-
-======================================================================
-51. IDENTITY REGISTRY --- POTENTIAL FIELDS
-========================================
-
-Potential lifecycle fields:
-
-first_verified_at
-
-last_verified_at
-
-last_seen_tv_at
-
-last_provider_check_at
-
-resolver_policy
-
-Это design candidates, а не утверждённая schema.
-
-======================================================================
-52. IDENTITY REGISTRY --- TTL HYPOTHESES
-======================================
-
-Предварительные architectural hypotheses:
-
-TradingView universe \~ 1 day
-
-REJECTED retry \~ 1 day
-
-Yahoo/Finnhub metadata \~ 7 days
-
-VERIFIED identity \~ 30 days
-
-OpenFIGI identity \~ 90 days
-
-ЭТО НЕ УТВЕРЖДЁННАЯ POLICY.
-
-Не реализовывать эти значения как constants без отдельного design
-review.
-
-======================================================================
-53. IDENTITY REGISTRY --- STALE-WHILE-REVALIDATE
-==============================================
-
-Отдельно рассмотреть:
-
-stale-while-revalidate
-
-Идея потенциально полезна для stable VERIFIED identity.
-
-Но stale state не должен скрывать:
-
--   delisting;
-
--   corporate action;
-
--   venue migration;
-
--   identity conflict;
-
--   incompatible resolver policy.
-
-Это отдельная architecture problem.
-
-======================================================================
-54. IDENTITY REGISTRY --- ПЕРЕД IMPLEMENTATION
-============================================
-
-Перед реализацией отдельно спроектировать:
-
--   schema;
-
--   migration;
-
--   cache compatibility;
-
--   policy compatibility;
-
--   invalidation;
-
--   delisting handling;
-
--   uplisting handling;
-
--   ticker migration;
-
--   venue migration;
-
--   corporate actions;
-
--   stale identity detection;
-
--   provider failure handling;
-
--   re-verification;
-
--   regression tests.
-
-Не смешивать Identity Registry migration с небольшим resolver rescue
-patch.
-
-======================================================================
-55. ARCHITECTURE BOOKMARK --- CACHE LIFECYCLE
+49-58. PROJECT TODO / ARCHITECTURE BOOKMARKS
 ===========================================
 
-Отдельно различать:
+Отложенные architecture bookmarks и research backlog вынесены из MASTER
+PROMPT в tracked файл корня repository:
 
-stable identity
+`todo.md`
 
-provider metadata
+Правила работы с ним:
 
-universe snapshot
+- при наличии current source archive считать приложенный `todo.md` актуальным
+  backlog этой сессии;
+- не восстанавливать TODO из памяти поверх actual file;
+- TODO/bookmark НЕ является implemented production policy;
+- не начинать TODO автоматически: пользователь может явно выбрать задачу,
+  либо current evidence должна показать необходимость её открыть;
+- перед implementation проверить actual source и актуальность evidence;
+- новые отложенные задачи/bookmarks записывать в `todo.md`, а не раздувать
+  MASTER PROMPT;
+- изменение `todo.md` является обычным tracked source change и передаётся
+  через Git patch;
+- completed/obsolete entries должны быть явно обновлены/удалены, чтобы
+  backlog не превращался в historical dump.
 
-runtime quote
-
-rejection evidence
-
-У них не обязательно одинаковые TTL/invalidation semantics.
-
-Не использовать один глобальный TTL как универсальное решение.
-
-Identity Registry и cache optimization связаны,
-
-но НЕ являются одной задачей.
-
-======================================================================
-56. ARCHITECTURE BOOKMARK --- COMPREHENSIVE DIAGNOSTICS
-=====================================================
-
-Не возвращаться к циклу:
-
-diagnostic release → один новый boolean → production → ещё одна release
-→ ещё один boolean
-
-без необходимости.
-
-Целевое направление:
-
-один comprehensive rejection audit,
-
-который позволяет исследовать большинство cohorts offline.
+MASTER PROMPT определяет workflow и invariants. `todo.md` определяет
+текущий backlog/bookmarks. Не смешивать эти роли.
 
 ======================================================================
-57. ARCHITECTURE BOOKMARK --- REPRODUCIBILITY
-===========================================
 
-Постоянная цель:
-
-SOURCE / TEST REPRODUCIBILITY.
-
-Для этого:
-
-Git HEAD = source of truth
-
-git archive HEAD = inter-chat source transport
-
-Git patch = modification transport
-
-tests = self-contained
-
-runtime state = отдельно
-
-generated artifacts = not tracked
-
-Не возвращаться к source ZIP overlay workflow.
-
-======================================================================
-58. ARCHITECTURE BOOKMARK --- PROVIDER LIFECYCLE
-==============================================
-
-Будущая lifecycle architecture должна отличать:
-
-security disappeared from provider
-
-от
-
-security identity invalid
-
-и:
-
-temporary provider outage
-
-от
-
-delisting / venue migration.
-
-Это важно для:
-
--   cache;
--   retries;
--   rejection semantics;
--   Identity Registry;
--   provider refresh policy.
-
-Не реализовывать эту architecture неявно через отдельные rescue
-exceptions.
-
-======================================================================
 59. PRODUCTION VERIFICATION RESPONSIBILITY
 ==========================================
 
@@ -1969,7 +1746,7 @@ DESIGN
 IMPLEMENTATION.
 
 Для DESIGN можно работать концептуально на основе confirmed invariants и
-architecture bookmarks.
+актуального `todo.md`, если он приложен.
 
 Для IMPLEMENTATION сначала проверить actual source.
 
@@ -2672,7 +2449,7 @@ IMPLEMENTATION.
 
 DESIGN:
 
-можно использовать confirmed invariants + bookmarks.
+можно использовать confirmed invariants + актуальный `todo.md`, если он приложен.
 
 IMPLEMENTATION:
 
@@ -2681,32 +2458,16 @@ IMPLEMENTATION:
 Не выдавать architecture hypothesis за уже implemented behavior.
 
 ======================================================================
-89. CURRENT ARCHITECTURE PRIORITIES ===================================
+89. CURRENT PROJECT BACKLOG =========================================
 
-Не считать этот список обязательным roadmap.
+Current architecture priorities, research follow-ups и другие отложенные
+задачи находятся в root `todo.md`.
 
-Это bookmarks.
-
-Основные будущие направления:
-
-1.  Identity Registry / lifecycle;
-
-2.  separation identity validity vs provider freshness;
-
-3.  comprehensive rejection diagnostics;
-
-4.  cache lifecycle / stale-while-revalidate;
-
-5.  provider/universe drift handling;
-
-6.  source/test reproducibility;
-
-7.  keeping resolver complexity bounded.
-
-Начинать их только по отдельному запросу или когда текущая evidence
-показывает необходимость.
+Не дублировать backlog здесь. Если задача выбрана для работы, сначала
+проверить её против actual source/evidence.
 
 ======================================================================
+
 90. ТЕКУЩИЙ STOP POINT RESOLVER RESEARCH
 ========================================
 
@@ -2836,7 +2597,7 @@ git archive HEAD
 
 38. Production JSONL запрашивать только когда он действительно нужен.
 
-39. Identity Registry --- architecture bookmark, не current policy.
+39. `todo.md` хранит architecture bookmarks/backlog; TODO не является current policy.
 
 40. TTL values --- hypotheses, не constants/policy.
 
@@ -2867,7 +2628,7 @@ Resolver должен оставаться доказательным и fail-cl
 
 Не терять накопленные regression boundaries при cleanup.
 
-Не принимать architecture bookmarks за production policy.
+Не принимать entries из `todo.md` за production policy.
 
 Не принимать historical reference state за actual state без проверки.
 
