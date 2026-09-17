@@ -1,3 +1,4 @@
+import pytest
 from tv_market_identity.cache import CacheDB
 from tv_market_identity.models import Binding, TvRow, YahooQuote
 from tv_market_identity.resolver import BatchResolver
@@ -2903,4 +2904,229 @@ def test_us_same_venue_mic_mismatch_rejects_share_class_conflict(tmp_path):
     r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(source_share='SC_OTHER'),YHMicMismatchSameVenue())
     got=r.resolve([_nva_row()])['AMEX:NVA']
     assert got.status == 'REJECTED' and got.rejection_reason == 'FINNHUB_MIC_MISMATCH:XNAS'
+    db.close()
+
+
+class OFIrelandIsinAlias:
+    batch_size = 100
+
+    def __init__(self, unscoped_rows=None):
+        self.unscoped_rows = unscoped_rows
+
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+
+        default = [
+            OpenFigiIdentity(
+                figi="BBG_A5G_FRA", composite_figi="BBG_A5G_COMP",
+                share_class_figi="BBG_AIB_SHARE", ticker="A5G",
+                name="AIB GROUP PLC", security_type="Common Stock",
+                security_type2="Common Stock", exch_code="GF",
+            ),
+            OpenFigiIdentity(
+                figi="BBG_AIBG_ID", composite_figi="BBG_AIBG_COMP",
+                share_class_figi="BBG_AIB_SHARE", ticker="AIBG",
+                name="AIB GROUP PLC", security_type="Common Stock",
+                security_type2="Common Stock", exch_code="ID",
+            ),
+            # Missing shareClassFIGI is non-evidence and must not create a
+            # second security identity.
+            OpenFigiIdentity(
+                figi="BBG_AIBG_X1", composite_figi="BBG_AIBG_X1_COMP",
+                share_class_figi=None, ticker="AIBGGBP",
+                name="AIB GROUP PLC", security_type="Common Stock",
+                security_type2="Common Stock", exch_code="X1",
+            ),
+        ]
+        out = []
+        for job in jobs:
+            if job.get("idType") == "ID_ISIN" and job.get("idValue") == "IE00BF0L3536" and "micCode" not in job:
+                out.append(self.unscoped_rows if self.unscoped_rows is not None else default)
+            else:
+                out.append([])
+        return out
+
+
+class YHIrelandA5G:
+    batch_size = 75
+
+    def quotes(self, symbols):
+        if "A5G.IR" not in symbols:
+            return {}
+        return {"A5G.IR": YahooQuote(
+            "A5G.IR", "ISE", "Irish", "EUR", "EQUITY",
+            "ie_market", "AIB GROUP PLC", None, 11.6, 15,
+        )}
+
+
+def _ireland_a5g_row(*, isin="IE00BF0L3536", tv_type="stock", type_specs=("common",)):
+    return TvRow(
+        "EURONEXT:A5G", "EURONEXT", "A5G", "AIB GROUP PLC", "EUR",
+        tv_type, type_specs, "Finance", 1e10, 11.6, isin, True,
+    )
+
+
+def test_ireland_exact_isin_unique_dublin_listing_can_bridge_ticker_alias(tmp_path):
+    db = CacheDB(tmp_path / "ireland-isin-xdub.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(), YHIrelandA5G())
+    row = _ireland_a5g_row()
+    got = r.resolve([row], market="ireland")[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "IRELAND_ISIN_UNIQUE_XDUB_LISTING"
+    assert got.yahoo_symbol == "A5G.IR"
+    assert got.resolved_mic == "XDUB"
+    assert got.source_mic == "XDUB"
+    assert got.source_venue_code == "ID"
+    assert got.share_class_figi == "BBG_AIB_SHARE"
+    assert got.venue_figi == "BBG_AIBG_ID"
+    assert r.stats["ireland_isin_unscoped_jobs"] == 1
+    assert r.stats["ireland_isin_unscoped_matches"] == 1
+    db.close()
+
+
+def test_ireland_isin_bridge_rejects_two_dublin_listings(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    rows = [
+        OpenFigiIdentity("ID1", "C1", "SC1", "AIBG", "AIB", "Common Stock", "Common Stock", "ID"),
+        OpenFigiIdentity("ID2", "C2", "SC1", "AIB2", "AIB", "Common Stock", "Common Stock", "ID"),
+    ]
+    db = CacheDB(tmp_path / "ireland-two-id.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(rows), YHIrelandA5G())
+    got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    assert r.stats["ireland_isin_unscoped_no_match"] == 1
+    db.close()
+
+
+def test_ireland_isin_bridge_rejects_multiple_share_classes(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    rows = [
+        OpenFigiIdentity("ID1", "C1", "SC1", "AIBG", "AIB", "Common Stock", "Common Stock", "ID"),
+        OpenFigiIdentity("F1", "C2", "SC2", "A5G", "AIB", "Common Stock", "Common Stock", "GF"),
+    ]
+    db = CacheDB(tmp_path / "ireland-two-share.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(rows), YHIrelandA5G())
+    got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    db.close()
+
+
+def test_ireland_isin_bridge_is_not_enabled_for_other_market(tmp_path):
+    db = CacheDB(tmp_path / "ireland-other-market.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(), YHIrelandA5G())
+    got = r.resolve([_ireland_a5g_row()], market="france")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "MIC_UNKNOWN"
+    assert r.stats["ireland_isin_unscoped_jobs"] == 0
+    db.close()
+
+
+def test_ireland_isin_bridge_requires_isin(tmp_path):
+    db = CacheDB(tmp_path / "ireland-no-isin.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(), YHIrelandA5G())
+    got = r.resolve([_ireland_a5g_row(isin=None)], market="ireland")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    assert r.stats["ireland_isin_unscoped_jobs"] == 0
+    db.close()
+
+
+def test_ireland_isin_bridge_rejects_type_conflict_or_wrong_source_venue(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    cases = [
+        [OpenFigiIdentity("ID1", "C1", "SC1", "AIBG", "AIB", "Corporate Bond", "Corporate Bond", "ID")],
+        [OpenFigiIdentity("F1", "C1", "SC1", "A5G", "AIB", "Common Stock", "Common Stock", "GF")],
+    ]
+    for idx, rows in enumerate(cases):
+        db = CacheDB(tmp_path / f"ireland-guard-{idx}.sqlite")
+        r = BatchResolver(db, None, OFIrelandIsinAlias(rows), YHIrelandA5G())
+        got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
+        assert got.status == "REJECTED"
+        assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+        db.close()
+
+
+def test_ireland_isin_bridge_requires_complete_matching_yahoo_venue(tmp_path):
+    class YHWrongIrelandVenue:
+        batch_size = 75
+        def quotes(self, symbols):
+            if "A5G.IR" not in symbols:
+                return {}
+            return {"A5G.IR": YahooQuote(
+                "A5G.IR", "NYQ", "NYSE", "EUR", "EQUITY",
+                "us_market", "AIB GROUP PLC", None, 11.6, 0,
+            )}
+
+    db = CacheDB(tmp_path / "ireland-yahoo-guard.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(), YHWrongIrelandVenue())
+    got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason.startswith("YAHOO_VENUE_MISMATCH:XDUB")
+    db.close()
+
+@pytest.mark.parametrize(
+    "isin,ticker,security_type,security_type2",
+    [
+        ("IE00BLP58571", "IR5B", "Unit", "Unit"),
+        ("IE00BF2NR112", "GRP", "Closed-End Fund", "Mutual Fund"),
+    ],
+)
+def test_ireland_isin_bridge_accepts_reviewed_xdub_taxonomy(
+    tmp_path, isin, ticker, security_type, security_type2
+):
+    from tv_market_identity.models import OpenFigiIdentity
+
+    class OFReviewedIreland:
+        batch_size = 100
+        def map_jobs(self, jobs):
+            out = []
+            for job in jobs:
+                if job.get("idType") == "ID_ISIN" and job.get("idValue") == isin and "micCode" not in job:
+                    out.append([OpenFigiIdentity(
+                        f"FIGI_{ticker}", f"COMP_{ticker}", f"SC_{ticker}", ticker,
+                        ticker, security_type, security_type2, "ID",
+                    )])
+                else:
+                    out.append([])
+            return out
+
+    class YHReviewedIreland:
+        batch_size = 75
+        def quotes(self, symbols):
+            symbol = f"{ticker}.IR"
+            if symbol not in symbols:
+                return {}
+            return {symbol: YahooQuote(
+                symbol, "ISE", "Irish", "EUR", "EQUITY",
+                "ie_market", ticker, None, 10.0, 0,
+            )}
+
+    row = TvRow(
+        f"EURONEXT:{ticker}", "EURONEXT", ticker, ticker, "EUR",
+        "stock", ("common",), "", 1e9, 10.0, isin, True,
+    )
+    db = CacheDB(tmp_path / f"ireland-reviewed-{ticker}.sqlite")
+    r = BatchResolver(db, None, OFReviewedIreland(), YHReviewedIreland())
+    got = r.resolve([row], market="ireland")[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "IRELAND_ISIN_UNIQUE_XDUB_LISTING"
+    assert got.yahoo_symbol == f"{ticker}.IR"
+    assert got.source_venue_code == "ID"
+    db.close()
+
+
+def test_ireland_isin_bridge_does_not_generalize_reviewed_taxonomy(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+
+    rows = [OpenFigiIdentity(
+        "ID1", "C1", "SC1", "OTHER", "OTHER",
+        "Closed-End Fund", "Mutual Fund", "ID",
+    )]
+    db = CacheDB(tmp_path / "ireland-unreviewed-taxonomy.sqlite")
+    r = BatchResolver(db, None, OFIrelandIsinAlias(rows), YHIrelandA5G())
+    got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
     db.close()

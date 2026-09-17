@@ -3767,7 +3767,7 @@ def cmd_run(args) -> int:
     cache = CacheDB(args.cache)
     try:
         resolver = _make_resolver(cache, args)
-        bindings = resolver.resolve(rows, refresh=args.refresh, refresh_rejected=args.refresh_rejected)
+        bindings = resolver.resolve(rows, refresh=args.refresh, refresh_rejected=args.refresh_rejected, market=cfg.market)
         resolver.refresh_cached_quotes(bindings)
         verified = sum(1 for b in bindings.values() if b.status == "VERIFIED")
         rejected = sum(1 for b in bindings.values() if b.status == "REJECTED")

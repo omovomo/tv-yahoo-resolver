@@ -1,8 +1,9 @@
+from version_expectations import CURRENT_RESOLVER_VERSION
 from tv_market_identity.policy import RESOLVER_VERSION
 
 
 def test_v048_policy_version():
-    assert RESOLVER_VERSION == "0.4.38-policy438"
+    assert RESOLVER_VERSION == CURRENT_RESOLVER_VERSION
 
 
 def test_v048_method_is_wired():

@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.38-policy438"
+RESOLVER_VERSION = "0.4.43-policy443"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -52,6 +52,22 @@ TV_PREFIX_TO_MIC = {
     "LS": None,
     "EURONEXT": None,
 }
+
+# Provider prefixes that are ambiguous globally but unambiguous inside a
+# TradingView market universe.  This is routing metadata only; normal
+# OpenFIGI/Yahoo identity proof is still required for admission.
+TV_MARKET_PREFIX_TO_MIC = {
+    ("ireland", "EURONEXT"): "XDUB",
+}
+
+
+def tv_prefix_mic(prefix: str, market: str | None = None) -> str | None:
+    prefix_key = (prefix or "").upper()
+    market_key = (market or "").lower()
+    scoped = TV_MARKET_PREFIX_TO_MIC.get((market_key, prefix_key))
+    if scoped:
+        return scoped
+    return TV_PREFIX_TO_MIC.get(prefix_key)
 
 
 # Non-US venues for which Yahoo exposes a different primary/listing venue.
@@ -202,6 +218,8 @@ MIC_TO_YAHOO_SUFFIX = {
     "XMUN": ".MU",
     "XHAN": ".HA",
     "XHKG": ".HK",
+    # Yahoo Finance documents Euronext Dublin listings with the .IR suffix.
+    "XDUB": ".IR",
     "XTKS": ".T",
     "XASX": ".AX",
 }
@@ -478,6 +496,8 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XHAN": {"HAN"},
         # Yahoo represents Hong Kong Stock Exchange listings as HKG / HKSE.
         "XHKG": {"HKG"},
+        # Yahoo represents Euronext Dublin listings as ISE / Irish.
+        "XDUB": {"ISE"},
         # Cboe BZX equity MIC / Yahoo exchange code.
         "BATS": {"BTS"},
         # OTCM is the ISO 10383 operating MIC for OTC Markets. Yahoo exposes
@@ -521,6 +541,7 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XMUN": ("MUNICH", "MUENCHEN", "MÜNCHEN"),
         "XHAN": ("HANNOVER", "HANOVER"),
         "XHKG": ("HKSE", "HONG KONG STOCK EXCHANGE", "HONG KONG"),
+        "XDUB": ("IRISH", "EURONEXT DUBLIN", "IRISH STOCK EXCHANGE"),
         "BATS": ("CBOE US", "CBOE BZX", "BZX"),
         "OTCM": ("OTC MARKETS OTCQX", "OTC MARKETS OTCQB", "OTC MARKETS OTCPK", "OTCQX", "OTCQB", "OTCPK"),
         "OTCQ": ("OTCQX",),

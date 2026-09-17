@@ -22,6 +22,7 @@ from .policy import (
     TV_PREFIX_ALLOWED_MICS,
     TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES,
     TV_PREFIX_TO_MIC,
+    tv_prefix_mic,
     YAHOO_HOME_EXCHANGE_TO_MIC,
     bounded_symbol_variants,
     currency_compatible,
@@ -45,7 +46,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.42-policy442", "0.4.41-policy441", "0.4.40-policy440", "0.4.39-policy439", "0.4.38-policy438", "0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -206,15 +207,70 @@ def _select_isin_bridge_target(
     return None, False
 
 
+_IRELAND_XDUB_REVIEWED_OPENFIGI_TAXONOMY = {
+    # Irish Continental Group: Euronext Dublin DOL describes the instrument as
+    # units comprising an ordinary share; OpenFIGI reports Unit / Unit.
+    "IE00BLP58571": {("unit", "unit")},
+    # Greencoat Renewables: Euronext Dublin lists ordinary shares, while
+    # OpenFIGI classifies the investment company as Closed-End Fund / Mutual Fund.
+    "IE00BF2NR112": {("closed-end fund", "mutual fund")},
+}
+
+
+def _ireland_xdub_reviewed_type_compatible(row: TvRow, identity: OpenFigiIdentity) -> bool:
+    if (row.tv_type or "").strip().lower() != "stock":
+        return False
+    isin = (row.isin or "").strip().upper()
+    allowed = _IRELAND_XDUB_REVIEWED_OPENFIGI_TAXONOMY.get(isin, set())
+    observed = (
+        (identity.security_type or "").strip().lower(),
+        (identity.security_type2 or "").strip().lower(),
+    )
+    return observed in allowed
+
+
+def _select_ireland_isin_xdub_listing(
+    row: TvRow, identities: list[OpenFigiIdentity]
+) -> OpenFigiIdentity | None:
+    """Select one Dublin listing from an unscoped exact-ISIN response.
+
+    This is deliberately narrower than a generic UNIQUE_SHARE_CLASS rescue.
+    The exact ISIN may return many venue rows; rows with missing shareClassFIGI
+    are non-evidence, while all observed non-null share classes must agree.
+    Admission then requires exactly one type-compatible Dublin (OpenFIGI
+    ``exchCode=ID``) listing carrying that same shareClassFIGI and a venue FIGI.
+    """
+    compatible = [
+        x for x in identities
+        if openfigi_type_compatible(row, x)
+        or _ireland_xdub_reviewed_type_compatible(row, x)
+    ]
+    shares = {x.share_class_figi for x in compatible if x.share_class_figi}
+    if len(shares) != 1:
+        return None
+    share_class = next(iter(shares))
+    dublin = [
+        x for x in compatible
+        if (x.exch_code or "").upper() == "ID"
+        and x.share_class_figi == share_class
+        and bool(x.figi)
+    ]
+    if len(dublin) != 1:
+        return None
+    return dublin[0]
+
+
 def _strict_yahoo_mapping(mapping_method: str | None) -> bool:
     """Whether Yahoo must explicitly confirm currency, type and venue.
 
-    These paths lack a provider-scoped OpenFIGI venue proof. They remain
-    admissible only when Yahoo returns complete, non-conflicting metadata.
+    These paths lack an ordinary provider-scoped OpenFIGI mapping or use a
+    bounded alternate listing proof. They remain admissible only when Yahoo
+    returns complete, non-conflicting metadata.
     """
     return mapping_method in {
         "TARGET_PROVIDER_STRICT_FALLBACK",
         "REVIEWED_ISIN_SECURITY_FALLBACK",
+        "IRELAND_ISIN_UNIQUE_XDUB_LISTING",
     }
 
 
@@ -598,8 +654,10 @@ class BatchResolver:
         self,
         rows: list[TvRow],
         refresh: bool = False,
+        market: str | None = None,
         refresh_rejected: bool = False,
     ) -> dict[str, Binding]:
+        self.market = market
         reset_openfigi_run_cache = getattr(self.openfigi, "reset_run_cache", None)
         if callable(reset_openfigi_run_cache):
             reset_openfigi_run_cache()
@@ -842,7 +900,7 @@ class BatchResolver:
         for r in rows:
             b = by_id.get(r.tv_id)
             reason = b.rejection_reason if b else None
-            source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
+            source_mic = tv_prefix_mic(r.prefix, self.market)
             specs = {str(x).lower() for x in r.type_specs if x}
             if not reason or not reason.startswith("FINNHUB_MIC_MISMATCH:"):
                 continue
@@ -861,7 +919,7 @@ class BatchResolver:
 
         jobs = []
         for r in eligible:
-            source_mic = "XASE" if r.prefix == "AMEX" else TV_PREFIX_TO_MIC[r.prefix]
+            source_mic = "XASE" if r.prefix == "AMEX" else tv_prefix_mic(r.prefix, self.market)
             jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
             jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": source_mic})
         try:
@@ -873,7 +931,7 @@ class BatchResolver:
 
         proven: dict[str, tuple[str, OpenFigiIdentity]] = {}
         for i, r in enumerate(eligible):
-            source_mic = "XASE" if r.prefix == "AMEX" else TV_PREFIX_TO_MIC[r.prefix]
+            source_mic = "XASE" if r.prefix == "AMEX" else tv_prefix_mic(r.prefix, self.market)
             unscoped = [x for x in mapped[2 * i] if openfigi_type_compatible(r, x)]
             source = [x for x in mapped[2 * i + 1] if openfigi_type_compatible(r, x)]
             shares = {x.share_class_figi for x in unscoped if x.share_class_figi}
@@ -972,14 +1030,14 @@ class BatchResolver:
                 continue
             if tv_type_kind(r) != "PREFERRED" or "preferred" not in specs or not r.isin:
                 continue
-            if not TV_PREFIX_TO_MIC.get(r.prefix):
+            if not tv_prefix_mic(r.prefix, self.market):
                 continue
             eligible.append(r)
         if not eligible:
             return bindings
 
         jobs = [
-            {"idType": "ID_ISIN", "idValue": r.isin, "micCode": TV_PREFIX_TO_MIC[r.prefix]}
+            {"idType": "ID_ISIN", "idValue": r.isin, "micCode": tv_prefix_mic(r.prefix, self.market)}
             for r in eligible
         ]
         try:
@@ -1050,7 +1108,7 @@ class BatchResolver:
             of = proven.get(r.tv_id)
             if of is None:
                 continue
-            source_mic = TV_PREFIX_TO_MIC[r.prefix]
+            source_mic = tv_prefix_mic(r.prefix, self.market)
             cs = searches.get(str(r.isin).upper().strip(), [])
             admitted: list[YahooQuote] = []
             for c in cs:
@@ -3295,7 +3353,7 @@ class BatchResolver:
             if r.prefix in EXCHCODE_SHARE_CLASS_BRIDGES:
                 exchcode_bridge_rows.append(r)
                 continue
-            mic = TV_PREFIX_TO_MIC.get(r.prefix)
+            mic = tv_prefix_mic(r.prefix, self.market)
             if not mic:
                 rejected.append(self._reject(r, "MIC_UNKNOWN"))
                 continue
@@ -3339,7 +3397,7 @@ class BatchResolver:
                 method_override: str | None = None,
                 mic_override: str | None = None,
             ) -> None:
-                mic = mic_override or TV_PREFIX_TO_MIC[r.prefix]
+                mic = mic_override or tv_prefix_mic(r.prefix, self.market)
                 suffix = MIC_TO_YAHOO_SUFFIX.get(mic)
                 if suffix is None:
                     rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{mic}"))
@@ -3380,7 +3438,7 @@ class BatchResolver:
                 """
                 if r.prefix not in TARGET_PROVIDER_STRICT_FALLBACK_PREFIXES:
                     return False
-                mic = TV_PREFIX_TO_MIC.get(r.prefix)
+                mic = tv_prefix_mic(r.prefix, self.market)
                 if not mic or MIC_TO_YAHOO_SUFFIX.get(mic) is None:
                     return False
                 pending.append({
@@ -3415,7 +3473,7 @@ class BatchResolver:
                         continue
                     rejected.append(self._reject(r, reason))
                     continue
-                mic = TV_PREFIX_TO_MIC[r.prefix]
+                mic = tv_prefix_mic(r.prefix, self.market)
                 retry_rows.append(r)
                 retry_jobs.append({
                     "idType": "ID_EXCH_SYMBOL",
@@ -3508,6 +3566,8 @@ class BatchResolver:
                 currency_retry_jobs: list[dict] = []
                 secondary_mic_layout: list[tuple[TvRow, tuple[str, ...], int]] = []
                 secondary_mic_jobs: list[dict] = []
+                ireland_isin_rows: list[TvRow] = []
+                ireland_isin_jobs: list[dict] = []
                 for r, identities in zip(retry_rows, retry_mapped):
                     of, collapsed, reason = _select_openfigi_identity(r, identities)
                     if of is not None:
@@ -3532,13 +3592,26 @@ class BatchResolver:
                     # exact ticker + MIC and keeping Yahoo price validation in
                     # GBX/GBp. This is not a generic currency fallback.
                     if r.prefix in {"LSE", "LSIN"} and (r.currency or "").upper() == "GBX":
-                        mic = TV_PREFIX_TO_MIC[r.prefix]
+                        mic = tv_prefix_mic(r.prefix, self.market)
                         currency_retry_rows.append(r)
                         currency_retry_jobs.append({
                             "idType": "ID_EXCH_SYMBOL",
                             "idValue": r.symbol,
                             "micCode": mic,
                             "currency": "GBP",
+                        })
+                        continue
+                    if (
+                        (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
+                        and (self.market or "").lower() == "ireland"
+                        and r.prefix == "EURONEXT"
+                        and tv_prefix_mic(r.prefix, self.market) == "XDUB"
+                        and r.isin
+                    ):
+                        ireland_isin_rows.append(r)
+                        ireland_isin_jobs.append({
+                            "idType": "ID_ISIN",
+                            "idValue": r.isin,
                         })
                         continue
                     if ((reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
@@ -3548,12 +3621,45 @@ class BatchResolver:
                         direct_isin_jobs.append({
                             "idType": "ID_ISIN",
                             "idValue": r.isin,
-                            "micCode": TV_PREFIX_TO_MIC[r.prefix],
+                            "micCode": tv_prefix_mic(r.prefix, self.market),
                         })
                         continue
                     if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH" and add_target_provider_strict_fallback(r):
                         continue
                     rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
+
+                if ireland_isin_jobs:
+                    try:
+                        ireland_isin_mapped = self.openfigi.map_jobs(ireland_isin_jobs)
+                        self.stats["openfigi_jobs"] += len(ireland_isin_jobs)
+                        self.stats["ireland_isin_unscoped_jobs"] += len(ireland_isin_jobs)
+                        self.stats["openfigi_http_batches"] += (len(ireland_isin_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in ireland_isin_rows)
+                        ireland_isin_mapped = [[] for _ in ireland_isin_rows]
+
+                    for r, identities in zip(ireland_isin_rows, ireland_isin_mapped):
+                        target_of = _select_ireland_isin_xdub_listing(r, identities)
+                        if target_of is None:
+                            self.stats["ireland_isin_unscoped_no_match"] += 1
+                            rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
+                            continue
+                        # The exact ISIN + unique share class + unique Dublin
+                        # listing proves the source listing independently of the
+                        # provider ticker alias. Yahoo must then prove the exact
+                        # TradingView symbol and complete XDUB venue metadata.
+                        pending.append({
+                            "row": r,
+                            "identity": target_of,
+                            "source_identity": target_of,
+                            "target_identity": target_of,
+                            "source_mic": "XDUB",
+                            "source_venue_code": "ID",
+                            "target_mic": "XDUB",
+                            "yahoo_symbol": yahoo_listing_symbol(r.symbol, "XDUB", r.prefix, tv_type_kind(r)),
+                            "mapping_method": "IRELAND_ISIN_UNIQUE_XDUB_LISTING",
+                        })
+                        self.stats["ireland_isin_unscoped_matches"] += 1
 
                 if direct_isin_jobs:
                     try:
@@ -3694,7 +3800,7 @@ class BatchResolver:
                             no_currency_jobs.append({
                                 "idType": "ID_EXCH_SYMBOL",
                                 "idValue": r.symbol,
-                                "micCode": TV_PREFIX_TO_MIC[r.prefix],
+                                "micCode": tv_prefix_mic(r.prefix, self.market),
                             })
                             continue
                         add_direct_pending(r, of, collapsed, type_fallback=True)
@@ -4980,7 +5086,7 @@ class BatchResolver:
                     item.get("mapping_method") == "TARGET_PROVIDER_STRICT_FALLBACK"
                     and r.prefix in direct_german_prefixes
                     and r.isin
-                    and item.get("source_mic") == TV_PREFIX_TO_MIC.get(r.prefix)
+                    and item.get("source_mic") == tv_prefix_mic(r.prefix, self.market)
                 ):
                     # OpenFIGI could not prove the direct source listing, but
                     # TradingView supplied an exact ISIN and the direct prefix has
@@ -5171,7 +5277,7 @@ class BatchResolver:
         seen_probe_keys: set[tuple[str, str]] = set()
         for r in candidate_rows:
             source_mics: list[str] = []
-            direct = TV_PREFIX_TO_MIC.get(r.prefix)
+            direct = tv_prefix_mic(r.prefix, self.market)
             if direct:
                 source_mics.append(direct)
             bridge = ISIN_SHARE_CLASS_BRIDGES.get(r.prefix)

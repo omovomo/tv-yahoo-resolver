@@ -154,6 +154,7 @@ def test_xlon_yahoo_symbol_punctuation_is_bounded():
     assert yahoo_listing_symbol("939", "XHKG", "HKEX", "STOCK") == "0939.HK"
     assert yahoo_listing_symbol("9988", "XHKG", "HKEX", "STOCK") == "9988.HK"
     assert yahoo_listing_symbol("12345", "XHKG", "HKEX", "STOCK") == "12345.HK"
+    assert yahoo_listing_symbol("A5G", "XDUB", "EURONEXT", "STOCK") == "A5G.IR"
 
 
 def test_openfigi_broad_equity_type_is_compatible_after_exact_listing_constraints():
@@ -236,3 +237,42 @@ def test_yahoo_hongkong_venue_contract_rejects_other_exchange():
         price=600.0, delayed_by=15,
     )
     assert not yahoo_venue_compatible("XHKG", q)
+
+
+
+def test_yahoo_ireland_venue_contract_accepts_reviewed_ise_irish_representation():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="A5G.IR", exchange="ISE", full_exchange_name="Irish",
+        currency="EUR", quote_type="EQUITY", market="ie_market",
+        short_name="AIB Group", long_name="AIB Group plc",
+        price=7.0, delayed_by=15,
+    )
+    assert yahoo_venue_compatible("XDUB", q)
+
+
+def test_yahoo_ireland_venue_contract_rejects_other_exchange():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="A5G.IR", exchange="NMS", full_exchange_name="NasdaqGS",
+        currency="EUR", quote_type="EQUITY", market="us_market",
+        short_name="AIB Group", long_name="AIB Group plc",
+        price=7.0, delayed_by=15,
+    )
+    assert not yahoo_venue_compatible("XDUB", q)
+
+def test_market_scoped_euronext_ireland_mic():
+    from tv_market_identity.policy import tv_prefix_mic
+    assert tv_prefix_mic("EURONEXT", "ireland") == "XDUB"
+    assert tv_prefix_mic("euronext", "IRELAND") == "XDUB"
+
+
+def test_euronext_is_not_globally_collapsed_to_dublin():
+    from tv_market_identity.policy import tv_prefix_mic
+    assert tv_prefix_mic("EURONEXT") is None
+    assert tv_prefix_mic("EURONEXT", "france") is None
+    assert tv_prefix_mic("EURONEXT", "netherlands") is None
+    assert tv_prefix_mic("EURONEXT", "belgium") is None
+    assert tv_prefix_mic("EURONEXT", "portugal") is None
