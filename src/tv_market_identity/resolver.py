@@ -3396,10 +3396,56 @@ class BatchResolver:
                         self.stats["korea_krx_segment_probe_matches"] += 1
                         self.stats[f"korea_krx_segment_probe_matches_{proven[0]}"] += 1
                     elif len(proven) > 1:
-                        rejected.append(self._reject(
-                            r, "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:" + ",".join(proven)
-                        ))
-                        self.stats["korea_krx_segment_probe_ambiguous"] += 1
+                        # A security can legitimately have exact ISIN mappings on more
+                        # than one Korean segment (for example during a venue transition).
+                        # Resolve that listing ambiguity only when every OpenFIGI branch
+                        # points at the same share class and Yahoo's exact-ISIN discovery
+                        # independently identifies one exact local ticker whose validated
+                        # quote belongs to exactly one of those already-proven MICs.
+                        resolved_mic = None
+                        identities = [
+                            korea_identity_overrides.get(f"{r.tv_id}|{mic}")
+                            for mic in proven
+                        ]
+                        shares = {x.share_class_figi for x in identities if x and x.share_class_figi}
+                        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+                        if len(shares) == 1 and all(x and x.share_class_figi for x in identities) and callable(search_fn):
+                            try:
+                                candidates = list(search_fn(r.isin.strip().upper()))
+                                self.stats["korea_krx_segment_ambiguity_yahoo_searches"] += 1
+                            except ProviderError:
+                                candidates = []
+                                self.stats["korea_krx_segment_ambiguity_yahoo_search_unavailable"] += 1
+                            if len(candidates) == 1:
+                                candidate = candidates[0]
+                                keys = _yahoo_symbol_identity_keys(candidate.symbol)
+                                if (
+                                    punctuation_key(r.symbol) in keys
+                                    and str(candidate.quote_type or "").upper() == "EQUITY"
+                                ):
+                                    try:
+                                        quotes = self.yahoo.quotes([candidate.symbol])
+                                    except ProviderError:
+                                        quotes = {}
+                                    q = quotes.get(candidate.symbol)
+                                    if (
+                                        q is not None
+                                        and yahoo_type_compatible(r, q.quote_type)
+                                        and (not r.currency or not q.currency or currency_compatible(r.currency, q.currency))
+                                    ):
+                                        venue_matches = [mic for mic in proven if yahoo_venue_compatible(mic, q)]
+                                        if len(venue_matches) == 1:
+                                            resolved_mic = venue_matches[0]
+                        if resolved_mic is not None:
+                            mic_overrides[r.tv_id] = resolved_mic
+                            self.stats["korea_krx_segment_probe_matches"] += 1
+                            self.stats[f"korea_krx_segment_probe_matches_{resolved_mic}"] += 1
+                            self.stats["korea_krx_segment_ambiguity_yahoo_resolved"] += 1
+                        else:
+                            rejected.append(self._reject(
+                                r, "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:" + ",".join(proven)
+                            ))
+                            self.stats["korea_krx_segment_probe_ambiguous"] += 1
                     else:
                         rejected.append(self._reject(
                             r, "OPENFIGI_KOREA_SEGMENT_NO_MATCH"

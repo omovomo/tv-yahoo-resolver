@@ -3504,3 +3504,98 @@ def test_korea_krx_segment_probe_fails_closed_on_both_or_neither(tmp_path):
     assert got["KRX:222222"].status == "REJECTED"
     assert got["KRX:222222"].rejection_reason.startswith("OPENFIGI_KOREA_SEGMENT_NO_MATCH")
     db.close()
+
+class YHKoreaAmbiguity(YHKoreaSegments):
+    def __init__(self, *, search_candidates=None, quote=None):
+        self.search_candidates = search_candidates if search_candidates is not None else []
+        self.quote = quote
+
+    def search_exact_isin(self, isin, max_results=10):
+        return list(self.search_candidates)
+
+    def quotes(self, symbols):
+        if self.quote is not None and self.quote.symbol in symbols:
+            return {self.quote.symbol: self.quote}
+        return super().quotes(symbols)
+
+
+def _korea_search_candidate(symbol="03481K.KQ", exchange="KOE", quote_type="EQUITY"):
+    from tv_market_identity.models import YahooSearchCandidate
+    return YahooSearchCandidate(symbol, exchange, quote_type, "HaeSung(1P)", "Haesung Industrial Co., Ltd.")
+
+
+def _korea_quote(symbol="03481K.KQ", exchange="KOE", currency="KRW", quote_type="EQUITY", full_exchange_name=None):
+    full_name = full_exchange_name or ("KOSDAQ" if exchange == "KOE" else "KSE")
+    return YahooQuote(symbol, exchange, full_name, currency, quote_type, "kr_market", "HaeSung(1P)", None, 6030.0, 20)
+
+
+def test_korea_ambiguous_exact_isin_resolves_with_unique_yahoo_exact_isin_venue(tmp_path):
+    db = CacheDB(tmp_path / "kr_amb_resolve.sqlite")
+    isin = "KR703481K019"
+    of = OFKoreaSegments({isin: ("03481K", {"XKRX", "XKOS"})})
+    y = YHKoreaAmbiguity(search_candidates=[_korea_search_candidate()], quote=_korea_quote())
+    r = BatchResolver(db, FH(), of, y)
+    got = r.resolve([_korea_row("03481K", isin)], market="korea")["KRX:03481K"]
+    assert got.status == "VERIFIED"
+    assert got.source_mic == "XKOS"
+    assert got.resolved_mic == "XKOS"
+    assert got.yahoo_symbol == "03481K.KQ"
+    assert r.stats["korea_krx_segment_ambiguity_yahoo_resolved"] == 1
+    db.close()
+
+
+def test_korea_ambiguous_exact_isin_can_resolve_xkrx(tmp_path):
+    db = CacheDB(tmp_path / "kr_amb_xkrx.sqlite")
+    isin = "KR703481K019"
+    of = OFKoreaSegments({isin: ("03481K", {"XKRX", "XKOS"})})
+    y = YHKoreaAmbiguity(
+        search_candidates=[_korea_search_candidate("03481K.KS", "KSC")],
+        quote=_korea_quote("03481K.KS", "KSC"),
+    )
+    r = BatchResolver(db, FH(), of, y)
+    got = r.resolve([_korea_row("03481K", isin)], market="korea")["KRX:03481K"]
+    assert got.status == "VERIFIED"
+    assert got.resolved_mic == "XKRX"
+    db.close()
+
+
+@pytest.mark.parametrize("candidates,quote", [
+    ([], None),
+    ([_korea_search_candidate(), _korea_search_candidate("03481K.KS", "KSC")], _korea_quote()),
+    ([_korea_search_candidate("999999.KQ")], _korea_quote("999999.KQ")),
+    ([_korea_search_candidate(quote_type="MUTUALFUND")], _korea_quote(quote_type="MUTUALFUND")),
+    ([_korea_search_candidate()], _korea_quote(currency="USD")),
+    ([_korea_search_candidate()], _korea_quote(exchange="NMS", full_exchange_name="NasdaqGS")),
+])
+def test_korea_ambiguous_exact_isin_yahoo_evidence_fails_closed(tmp_path, candidates, quote):
+    db = CacheDB(tmp_path / "kr_amb_fail.sqlite")
+    isin = "KR703481K019"
+    of = OFKoreaSegments({isin: ("03481K", {"XKRX", "XKOS"})})
+    r = BatchResolver(db, FH(), of, YHKoreaAmbiguity(search_candidates=candidates, quote=quote))
+    got = r.resolve([_korea_row("03481K", isin)], market="korea")["KRX:03481K"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:XKRX,XKOS"
+    db.close()
+
+
+def test_korea_ambiguous_exact_isin_requires_same_non_null_share_class(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    class OFDifferentShares(OFKoreaSegments):
+        def map_jobs(self, jobs):
+            out = super().map_jobs(jobs)
+            changed = []
+            for job, identities in zip(jobs, out):
+                if identities and job["micCode"] == "XKOS":
+                    x = identities[0]
+                    identities = [OpenFigiIdentity(x.figi, x.composite_figi, "DIFFERENT_SHARE", x.ticker, x.name, x.security_type, x.security_type2, x.exch_code)]
+                changed.append(identities)
+            return changed
+    db = CacheDB(tmp_path / "kr_amb_share.sqlite")
+    isin = "KR703481K019"
+    of = OFDifferentShares({isin: ("03481K", {"XKRX", "XKOS"})})
+    y = YHKoreaAmbiguity(search_candidates=[_korea_search_candidate()], quote=_korea_quote())
+    r = BatchResolver(db, FH(), of, y)
+    got = r.resolve([_korea_row("03481K", isin)], market="korea")["KRX:03481K"]
+    assert got.status == "REJECTED"
+    assert r.stats["korea_krx_segment_ambiguity_yahoo_resolved"] == 0
+    db.close()
