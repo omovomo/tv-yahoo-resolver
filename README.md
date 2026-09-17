@@ -1,4 +1,8 @@
-# tv-market-identity-prototype v0.4.34
+# tv-market-identity-prototype v0.4.46
+
+Diagnostic cleanup/tooling release. Removes the temporary v0.4.44/v0.4.45 rejection-audit bridge probes `us_same_ticker_unique_share_class_bridge` and `source_mic_proven_unique_share_class_bridge` after the investigation established that explicit source-venue proof is required and the strict candidate cohort is empty. The comprehensive `--rejection-audit` remains the primary diagnostic workflow. Admission logic is unchanged; resolver policy remains `0.4.34-policy434`.
+
+# tv-market-identity-prototype v0.4.37
 
 Functional release adding `US_OOTC_DR_FINNHUB_UNKNOWN_TYPE_PUBLIC_PREFERRED_EXACT_ISIN`, a narrow same-source OOTC DR/ADR rescue for residual `FINNHUB_TYPE_MISMATCH:?`. Admission requires exact TV ISIN, OOTC source, TV DR/ADR taxonomy, unique OOTC-scoped OpenFIGI `PUBLIC / Preferred Stock` evidence on `OTC US`, and exactly one Yahoo exact-ISIN candidate for the exact TV ticker with OOTC-compatible USD/EQUITY quote evidence. Missing shareClassFIGI and OpenFIGI ticker mismatch are tolerated only inside this explicit same-source taxonomy-boundary path. Resolver policy is `0.4.34-policy434`; `0.4.32-policy432` is retained for compatible VERIFIED cache reuse.
 
@@ -1514,3 +1518,8 @@ policy remains `0.4.15-policy415`.
 ### v0.4.17 — Yahoo MUTUALFUND full-cohort diagnostic
 
 Diagnostic-only US release. Expands `--us-yahoo-mutualfund-audit` into a full-cohort decomposition of every `YAHOO_TYPE_MISMATCH:MUTUALFUND` rejection, including missing-ISIN rows. Records TV venue/taxonomy, source-scoped and unscoped exact-ISIN OpenFIGI evidence, source-proof strength, Yahoo direct quote/chart metadata, exact-ISIN discovery, and strict same-source EQUITY observations. No admission logic changes; resolver policy remains `0.4.15-policy415`.
+
+
+## v0.4.39 diagnostic-only
+
+Re-baselines residual US `FINNHUB_TYPE_MISMATCH:Preference` with `--us-finnhub-preference-audit`. Admission remains `0.4.34-policy434`.

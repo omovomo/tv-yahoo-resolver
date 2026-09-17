@@ -1906,7 +1906,7 @@ def _write_us_finnhub_ltd_part_audit(path: Path, rows, bindings: dict, resolver:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 def _write_us_finnhub_closed_end_fund_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.3.98 diagnostic-only exact-ISIN/source audit for Closed-End Fund rejects.
+    """v0.4.42 diagnostic-only re-baseline exact-ISIN/source audit for Closed-End Fund rejects.
 
     The audit deliberately does not treat Finnhub Closed-End Fund as compatible with
     ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
@@ -2031,7 +2031,7 @@ def _write_us_finnhub_closed_end_fund_audit(path: Path, rows, bindings: dict, re
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 def _write_us_finnhub_cdi_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.4.0 diagnostic-only exact-ISIN/source audit for CDI rejects.
+    """v0.4.41 diagnostic-only re-baseline exact-ISIN/source audit for CDI rejects.
 
     The audit deliberately does not treat Finnhub CDI as compatible with
     ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
@@ -2155,7 +2155,7 @@ def _write_us_finnhub_cdi_audit(path: Path, rows, bindings: dict, resolver: Batc
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 def _write_us_finnhub_stapled_security_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.4.1 diagnostic-only exact-ISIN/source audit for Stapled Security rejects.
+    """v0.4.40 diagnostic-only re-baseline exact-ISIN/source audit for Stapled Security rejects.
 
     The audit deliberately does not treat Finnhub Stapled Security as compatible with
     ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
@@ -2279,7 +2279,7 @@ def _write_us_finnhub_stapled_security_audit(path: Path, rows, bindings: dict, r
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 def _write_us_finnhub_preference_audit(path: Path, rows, bindings: dict, resolver: BatchResolver) -> None:
-    """v0.4.2 diagnostic-only exact-ISIN/source audit for Preference rejects.
+    """v0.4.39 diagnostic-only re-baseline exact-ISIN/source audit for Preference rejects.
 
     The audit deliberately does not treat Finnhub Preference as compatible with
     ordinary equity.  It records exact source-MIC OpenFIGI evidence and Yahoo
@@ -3068,7 +3068,7 @@ def _write_us_finnhub_public_audit(path: Path, rows, bindings: dict, resolver: B
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.27",
+            "diagnostic_only": True, "diagnostic_release": "0.4.39",
             "tv_id": r.tv_id, "tv_symbol": r.symbol,
             "tv_isin": r.isin, "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -4158,7 +4158,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--rejection-audit",
         default=None,
-        help="Write evidence-only JSONL for rejected rows (exact ISIN/OpenFIGI + bounded German Yahoo probes)",
+        help="Write comprehensive diagnostic-only JSONL for all rejected rows (TV/Finnhub/OpenFIGI/Yahoo evidence)",
     )
     r.add_argument(
         "--nyse-preferred-symbol-audit",
@@ -4198,22 +4198,22 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-finnhub-closed-end-fund-audit",
         default=None,
-        help="Write v0.3.98 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:Closed-End Fund rejects",
+        help="Write v0.4.42 diagnostic-only re-baseline JSONL for US FINNHUB_TYPE_MISMATCH:Closed-End Fund rejects",
     )
     r.add_argument(
         "--us-finnhub-cdi-audit",
         default=None,
-        help="Write v0.4.0 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:CDI rejects",
+        help="Write v0.4.41 diagnostic-only re-baseline JSONL for US FINNHUB_TYPE_MISMATCH:CDI rejects",
     )
     r.add_argument(
         "--us-finnhub-stapled-security-audit",
         default=None,
-        help="Write v0.4.1 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:Stapled Security rejects",
+        help="Write v0.4.40 diagnostic-only re-baseline JSONL for US FINNHUB_TYPE_MISMATCH:Stapled Security rejects",
     )
     r.add_argument(
         "--us-finnhub-preference-audit",
         default=None,
-        help="Write v0.4.2 diagnostic-only JSONL for US FINNHUB_TYPE_MISMATCH:Preference rejects",
+        help="Write v0.4.39 diagnostic-only re-baseline JSONL for US FINNHUB_TYPE_MISMATCH:Preference rejects",
     )
     r.add_argument(
         "--us-finnhub-gdr-audit",
