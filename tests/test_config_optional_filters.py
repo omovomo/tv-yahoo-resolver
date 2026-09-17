@@ -116,6 +116,7 @@ import pytest
         ("identity_coverage_ireland.ini", "ireland"),
         ("identity_coverage_hongkong.ini", "hongkong"),
         ("identity_coverage_japan.ini", "japan"),
+        ("identity_coverage_korea.ini", "korea"),
     ],
 )
 def test_regional_discovery_coverage_presets(filename, market):

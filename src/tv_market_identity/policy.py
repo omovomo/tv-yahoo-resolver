@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.51-policy451"
+RESOLVER_VERSION = "0.4.53-policy453"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -66,6 +66,10 @@ TV_PREFIX_TO_MIC = {
 TV_MARKET_PREFIX_TO_MIC = {
     ("ireland", "EURONEXT"): "XDUB",
 }
+
+# TradingView Korea collapses KOSPI and KOSDAQ into one KRX provider prefix.
+# Resolve the concrete source segment only from exact OpenFIGI symbol+MIC evidence.
+KOREA_KRX_CANDIDATE_MICS = ("XKRX", "XKOS")
 
 
 def tv_prefix_mic(prefix: str, market: str | None = None) -> str | None:
@@ -239,6 +243,9 @@ MIC_TO_YAHOO_SUFFIX = {
     "XNGO": ".N",
     "XFKA": ".F",
     "XSAP": ".S",
+    # Yahoo documents separate Korea Stock Exchange/KOSDAQ namespaces.
+    "XKRX": ".KS",
+    "XKOS": ".KQ",
     "XASX": ".AX",
 }
 
@@ -518,6 +525,9 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         # exchange metadata when using their venue-specific .F / .S symbols.
         "XFKA": {"FKA"},
         "XSAP": {"SAP"},
+        # Yahoo exchange metadata for Korea Stock Exchange / KOSDAQ.
+        "XKRX": {"KSC"},
+        "XKOS": {"KOE"},
         # Yahoo represents Hong Kong Stock Exchange listings as HKG / HKSE.
         "XHKG": {"HKG"},
         # Yahoo represents Euronext Dublin listings as ISE / Irish.
@@ -567,6 +577,8 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XTKS": ("TOKYO", "TOKYO STOCK EXCHANGE",),
         "XFKA": ("FUKUOKA", "FUKUOKA STOCK EXCHANGE",),
         "XSAP": ("SAPPORO", "SAPPORO STOCK EXCHANGE",),
+        "XKRX": ("KOREA STOCK EXCHANGE", "KSE",),
+        "XKOS": ("KOSDAQ",),
         "XHKG": ("HKSE", "HONG KONG STOCK EXCHANGE", "HONG KONG"),
         "XDUB": ("IRISH", "EURONEXT DUBLIN", "IRISH STOCK EXCHANGE"),
         "BATS": ("CBOE US", "CBOE BZX", "BZX"),

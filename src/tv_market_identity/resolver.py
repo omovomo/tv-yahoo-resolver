@@ -13,6 +13,7 @@ from .policy import (
     EXCHCODE_SHARE_CLASS_BRIDGES,
     ISIN_SHARE_CLASS_BRIDGES,
     GERMANY_REGIONAL_TARGET_MICS,
+    KOREA_KRX_CANDIDATE_MICS,
     MIC_TO_YAHOO_SUFFIX,
     RESOLVER_VERSION,
     REVIEWED_ISIN_FALLBACKS,
@@ -3339,6 +3340,73 @@ class BatchResolver:
         bridge_rows: list[TvRow] = []
         exchcode_bridge_rows: list[TvRow] = []
 
+        # TradingView's Korea universe exposes one provider prefix (KRX) for
+        # both KOSPI and KOSDAQ.  Do not infer the segment from the numeric
+        # ticker.  Probe the reviewed MIC candidates and admit routing only
+        # when exact ISIN+MIC evidence selects exactly one segment. TradingView
+        # supplies ISIN for the reviewed Korea universe; rows without it remain
+        # fail-closed rather than falling back to ticker-range inference.
+        mic_overrides: dict[str, str] = {}
+        korea_identity_overrides: dict[str, OpenFigiIdentity] = {}
+        korea_rows = [
+            r for r in rows
+            if (self.market or "").lower() == "korea" and r.prefix == "KRX"
+            and r.currency and r.isin
+        ]
+        if korea_rows:
+            korea_jobs = [
+                {
+                    "idType": "ID_ISIN",
+                    "idValue": r.isin.strip().upper(),
+                    "micCode": mic,
+                }
+                for r in korea_rows
+                for mic in KOREA_KRX_CANDIDATE_MICS
+            ]
+            try:
+                korea_mapped = self.openfigi.map_jobs(korea_jobs)
+                self.stats["openfigi_jobs"] += len(korea_jobs)
+                self.stats["korea_krx_segment_probe_jobs"] += len(korea_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(korea_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError as exc:
+                rejected.extend(
+                    self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}")
+                    for r in korea_rows
+                )
+                korea_mapped = []
+
+            if korea_mapped:
+                width = len(KOREA_KRX_CANDIDATE_MICS)
+                for idx, r in enumerate(korea_rows):
+                    proven: list[str] = []
+                    reasons: list[str] = []
+                    for offset, mic in enumerate(KOREA_KRX_CANDIDATE_MICS):
+                        identities = korea_mapped[idx * width + offset]
+                        of, _collapsed = _select_isin_bridge_target(r, identities)
+                        reason = None if of is not None else "OPENFIGI_NO_MATCH"
+                        if of is not None:
+                            proven.append(mic)
+                            korea_identity_overrides[f"{r.tv_id}|{mic}"] = of
+                        elif reason:
+                            reasons.append(f"{mic}:{reason}")
+                    if len(proven) == 1:
+                        mic_overrides[r.tv_id] = proven[0]
+                        self.stats["korea_krx_segment_probe_matches"] += 1
+                        self.stats[f"korea_krx_segment_probe_matches_{proven[0]}"] += 1
+                    elif len(proven) > 1:
+                        rejected.append(self._reject(
+                            r, "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:" + ",".join(proven)
+                        ))
+                        self.stats["korea_krx_segment_probe_ambiguous"] += 1
+                    else:
+                        rejected.append(self._reject(
+                            r, "OPENFIGI_KOREA_SEGMENT_NO_MATCH"
+                            + (":" + "|".join(reasons) if reasons else "")
+                        ))
+                        self.stats["korea_krx_segment_probe_no_match"] += 1
+
         for r in rows:
             if not r.currency:
                 rejected.append(self._reject(r, "CURRENCY_UNKNOWN"))
@@ -3355,6 +3423,14 @@ class BatchResolver:
             if r.prefix in EXCHCODE_SHARE_CLASS_BRIDGES:
                 exchcode_bridge_rows.append(r)
                 continue
+            if (self.market or "").lower() == "korea" and r.prefix == "KRX":
+                # Exact ISIN+MIC segment discovery above already produced the
+                # source listing identity. Reuse it below instead of issuing a
+                # redundant ID_EXCH_SYMBOL OpenFIGI request.
+                if not r.isin:
+                    rejected.append(self._reject(r, "TV_ISIN_UNKNOWN"))
+                # Otherwise a Korea-specific match/rejection was recorded above.
+                continue
             mic = tv_prefix_mic(r.prefix, self.market)
             if not mic:
                 rejected.append(self._reject(r, "MIC_UNKNOWN"))
@@ -3367,6 +3443,63 @@ class BatchResolver:
                 "currency": openfigi_currency(r.currency),
                 "securityType2": openfigi_security_type(r),
             })
+
+        # Queue Korea rows from the exact ISIN+MIC segment evidence above.
+        def add_direct_pending(
+            r: TvRow,
+            of: OpenFigiIdentity,
+            collapsed: bool,
+            type_fallback: bool = False,
+            method_override: str | None = None,
+            japan_regional_exact_listing: bool = False,
+            mic_override: str | None = None,
+        ) -> None:
+            mic = mic_override or tv_prefix_mic(r.prefix, self.market)
+            suffix = MIC_TO_YAHOO_SUFFIX.get(mic)
+            if suffix is None:
+                rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{mic}"))
+                return
+            yahoo_symbol = yahoo_listing_symbol(of.ticker or r.symbol, mic, r.prefix, tv_type_kind(r))
+            if method_override:
+                method = method_override
+            elif collapsed and type_fallback:
+                method = "SAME_VENUE_TYPE_FALLBACK_SHARE_CLASS_COLLAPSE"
+            elif collapsed:
+                method = "SAME_VENUE_SHARE_CLASS_COLLAPSE"
+            elif type_fallback:
+                method = "SAME_VENUE_TYPE_FALLBACK"
+            else:
+                method = "SAME_VENUE"
+            pending.append({
+                "row": r,
+                "identity": of,
+                "source_identity": of,
+                "target_identity": of,
+                "source_mic": mic,
+                "source_venue_code": None,
+                "target_mic": mic,
+                "yahoo_symbol": yahoo_symbol,
+                "mapping_method": method,
+                "japan_regional_exact_listing": japan_regional_exact_listing,
+            })
+            if collapsed:
+                self.stats["openfigi_share_class_collapses"] += 1
+            if type_fallback:
+                self.stats["openfigi_type_fallback_matches"] += 1
+
+        for r in korea_rows:
+            mic = mic_overrides.get(r.tv_id)
+            if not mic:
+                continue
+            of = korea_identity_overrides.get(f"{r.tv_id}|{mic}")
+            if of is None:
+                rejected.append(self._reject(r, f"OPENFIGI_KOREA_SEGMENT_IDENTITY_MISSING:{mic}"))
+                continue
+            add_direct_pending(
+                r, of, False,
+                method_override="KOREA_EXACT_ISIN_SEGMENT",
+                mic_override=mic,
+            )
 
         # Direct same-venue mappings. First use the strict provider taxonomy.
         # If that produces no match, retry only those rows without securityType2
@@ -3390,48 +3523,6 @@ class BatchResolver:
             isin_fallback_jobs: list[dict] = []
             isin_unscoped_rows: list[tuple[TvRow, str]] = []
             isin_unscoped_jobs: list[dict] = []
-
-            def add_direct_pending(
-                r: TvRow,
-                of: OpenFigiIdentity,
-                collapsed: bool,
-                type_fallback: bool = False,
-                method_override: str | None = None,
-                japan_regional_exact_listing: bool = False,
-                mic_override: str | None = None,
-            ) -> None:
-                mic = mic_override or tv_prefix_mic(r.prefix, self.market)
-                suffix = MIC_TO_YAHOO_SUFFIX.get(mic)
-                if suffix is None:
-                    rejected.append(self._reject(r, f"YAHOO_SUFFIX_UNKNOWN:{mic}"))
-                    return
-                yahoo_symbol = yahoo_listing_symbol(of.ticker or r.symbol, mic, r.prefix, tv_type_kind(r))
-                if method_override:
-                    method = method_override
-                elif collapsed and type_fallback:
-                    method = "SAME_VENUE_TYPE_FALLBACK_SHARE_CLASS_COLLAPSE"
-                elif collapsed:
-                    method = "SAME_VENUE_SHARE_CLASS_COLLAPSE"
-                elif type_fallback:
-                    method = "SAME_VENUE_TYPE_FALLBACK"
-                else:
-                    method = "SAME_VENUE"
-                pending.append({
-                    "row": r,
-                    "identity": of,
-                    "source_identity": of,
-                    "target_identity": of,
-                    "source_mic": mic,
-                    "source_venue_code": None,
-                    "target_mic": mic,
-                    "yahoo_symbol": yahoo_symbol,
-                    "mapping_method": method,
-                    "japan_regional_exact_listing": japan_regional_exact_listing,
-                })
-                if collapsed:
-                    self.stats["openfigi_share_class_collapses"] += 1
-                if type_fallback:
-                    self.stats["openfigi_type_fallback_matches"] += 1
 
             def add_target_provider_strict_fallback(r: TvRow) -> bool:
                 """Queue a lower-evidence same-venue Yahoo proof after OpenFIGI no-match.
@@ -3462,7 +3553,7 @@ class BatchResolver:
             for r, identities in zip(direct_rows, mapped):
                 of, collapsed, reason = _select_openfigi_identity(r, identities)
                 if of is not None:
-                    mic = tv_prefix_mic(r.prefix, self.market)
+                    mic = mic_overrides.get(r.tv_id) or tv_prefix_mic(r.prefix, self.market)
                     exact_source_candidates = [
                         x for x in identities
                         if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
@@ -3480,6 +3571,7 @@ class BatchResolver:
                     add_direct_pending(
                         r, of, collapsed,
                         japan_regional_exact_listing=japan_regional_exact_listing,
+                        mic_override=mic,
                     )
                     continue
                 if reason and reason.startswith("OPENFIGI_AMBIGUOUS"):

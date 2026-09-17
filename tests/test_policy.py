@@ -370,3 +370,19 @@ def test_yahoo_regional_japan_venue_contracts_reject_cross_venue_metadata():
     assert not yahoo_venue_compatible("XFKA", sapporo)
     assert not yahoo_venue_compatible("XNGO", fukuoka)
     assert not yahoo_venue_compatible("XNGO", sapporo)
+
+
+def test_korea_yahoo_suffixes_and_venue_contracts_are_segment_specific():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import KOREA_KRX_CANDIDATE_MICS, MIC_TO_YAHOO_SUFFIX, yahoo_venue_compatible
+
+    assert KOREA_KRX_CANDIDATE_MICS == ("XKRX", "XKOS")
+    assert MIC_TO_YAHOO_SUFFIX["XKRX"] == ".KS"
+    assert MIC_TO_YAHOO_SUFFIX["XKOS"] == ".KQ"
+
+    kospi = YahooQuote("005930.KS", "KSC", "Korea Stock Exchange", "KRW", "EQUITY", "kr_market", None, None, 100.0, 20)
+    kosdaq = YahooQuote("196170.KQ", "KOE", "KOSDAQ", "KRW", "EQUITY", "kr_market", None, None, 100.0, 20)
+    assert yahoo_venue_compatible("XKRX", kospi)
+    assert not yahoo_venue_compatible("XKOS", kospi)
+    assert yahoo_venue_compatible("XKOS", kosdaq)
+    assert not yahoo_venue_compatible("XKRX", kosdaq)

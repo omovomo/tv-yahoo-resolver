@@ -3415,3 +3415,92 @@ def test_japan_xfka_unreviewed_mutualfund_stays_rejected(tmp_path):
     assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:MUTUALFUND"
     assert r.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] == 0
     db.close()
+
+
+class OFKoreaSegments:
+    batch_size = 100
+
+    def __init__(self, modes):
+        self.modes = modes
+
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            assert job["idType"] == "ID_ISIN"
+            isin = job["idValue"]
+            mic = job["micCode"]
+            assert "currency" not in job
+            assert "securityType2" not in job
+            symbol, allowed = self.modes.get(isin, (None, set()))
+            if symbol is not None and mic in allowed:
+                out.append([OpenFigiIdentity(
+                    figi=f"FIGI_{symbol}_{mic}", composite_figi=f"COMP_{symbol}_{mic}",
+                    share_class_figi=f"SHARE_{symbol}", ticker=symbol,
+                    name="KOREA TEST", security_type="Common Stock",
+                    security_type2="Common Stock", exch_code="KP" if mic == "XKRX" else "KQ",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHKoreaSegments:
+    batch_size = 75
+
+    def quotes(self, symbols):
+        out = {}
+        if "005930.KS" in symbols:
+            out["005930.KS"] = YahooQuote("005930.KS", "KSC", "Korea Stock Exchange", "KRW", "EQUITY", "kr_market", None, None, 100.0, 20)
+        if "196170.KQ" in symbols:
+            out["196170.KQ"] = YahooQuote("196170.KQ", "KOE", "KOSDAQ", "KRW", "EQUITY", "kr_market", None, None, 100.0, 20)
+        return out
+
+
+def _korea_row(symbol, isin):
+    return TvRow(
+        f"KRX:{symbol}", "KRX", symbol, "KOREA TEST", "KRW", "stock",
+        ("common",), None, None, 100.0, isin=isin,
+    )
+
+
+def test_korea_krx_segment_probe_routes_kospi_and_kosdaq_without_ticker_heuristics(tmp_path):
+    db = CacheDB(tmp_path / "kr.sqlite")
+    of = OFKoreaSegments({
+        "KR7005930003": ("005930", {"XKRX"}),
+        "KR7196170005": ("196170", {"XKOS"}),
+    })
+    r = BatchResolver(db, FH(), of, YHKoreaSegments())
+    got = r.resolve([
+        _korea_row("005930", "KR7005930003"),
+        _korea_row("196170", "KR7196170005"),
+    ], market="korea")
+
+    assert got["KRX:005930"].status == "VERIFIED"
+    assert got["KRX:005930"].resolved_mic == "XKRX"
+    assert got["KRX:005930"].yahoo_symbol == "005930.KS"
+    assert got["KRX:196170"].status == "VERIFIED"
+    assert got["KRX:196170"].resolved_mic == "XKOS"
+    assert got["KRX:196170"].yahoo_symbol == "196170.KQ"
+    assert r.stats["korea_krx_segment_probe_matches_XKRX"] == 1
+    assert r.stats["korea_krx_segment_probe_matches_XKOS"] == 1
+    db.close()
+
+
+def test_korea_krx_segment_probe_fails_closed_on_both_or_neither(tmp_path):
+    db = CacheDB(tmp_path / "kr_fail.sqlite")
+    of = OFKoreaSegments({
+        "KR7111111111": ("111111", {"XKRX", "XKOS"}),
+        "KR7222222222": ("222222", set()),
+    })
+    r = BatchResolver(db, FH(), of, YHKoreaSegments())
+    got = r.resolve([
+        _korea_row("111111", "KR7111111111"),
+        _korea_row("222222", "KR7222222222"),
+    ], market="korea")
+
+    assert got["KRX:111111"].status == "REJECTED"
+    assert got["KRX:111111"].rejection_reason == "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:XKRX,XKOS"
+    assert got["KRX:222222"].status == "REJECTED"
+    assert got["KRX:222222"].rejection_reason.startswith("OPENFIGI_KOREA_SEGMENT_NO_MATCH")
+    db.close()
