@@ -1328,7 +1328,7 @@ def test_incompatible_chart_row_preserves_exact_rejection_reason(tmp_path):
         "LSIN:SDIC", "LSIN", "SDIC", "SDIC Power Holdings Co Ltd", "USD",
         "dr", ("",), "Utilities", 1e10, 12.0,
     )
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "YAHOO_CHART_CURRENCY_MISMATCH:GBP"
     assert r.stats["yahoo_incompatible_evidence_rows"] == 1
@@ -1617,7 +1617,7 @@ def test_reviewed_yahoo_mutualfund_registry_never_replaces_openfigi_identity(tmp
         "LSE:KAKU", "LSE", "KAKU", "KAKUZI LD", "GBX",
         "stock", ("common",), "Consumer Non-Durables", 1e7, 92.5,
     )
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:MUTUALFUND"
     assert r.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] == 0
@@ -1631,7 +1631,7 @@ def test_reviewed_yahoo_mutualfund_registry_requires_reviewed_issuer_name(tmp_pa
         "LSE:KAKU", "LSE", "KAKU", "UNRELATED ISSUER", "GBX",
         "stock", ("common",), "Consumer Non-Durables", 1e7, 92.5,
     )
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:MUTUALFUND"
     assert r.stats["reviewed_yahoo_mutualfund_taxonomy_candidates"] == 1
@@ -1722,7 +1722,7 @@ def test_cagp_bond_conflict_remains_fail_closed(tmp_path):
         "LSE:CAGP", "LSE", "CAGP", "LLOYDS BANK PLC", "GBP",
         "stock", ("preferred",), "Finance", None, 177.5,
     )
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:BOND"
     assert r.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] == 0
@@ -2001,7 +2001,7 @@ def test_us_preferred_same_venue_exact_isin_yahoo_admission(tmp_path):
     db = CacheDB(tmp_path / "pref_isin.sqlite")
     r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
     row = TvRow("NYSE:BMNP", "NYSE", "BMNP", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000001")
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "VERIFIED"
     assert got.mapping_method == "US_PREFERRED_SAME_VENUE_EXACT_ISIN_YAHOO"
     assert got.source_mic == got.target_mic == "XNYS"
@@ -2014,7 +2014,7 @@ def test_us_preferred_same_venue_exact_tv_symbol_fallback_admission(tmp_path):
     db = CacheDB(tmp_path / "pref_tv.sqlite")
     r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
     row = TvRow("NYSE:SOJE", "NYSE", "SOJE", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000002")
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "VERIFIED"
     assert got.yahoo_symbol == "SOJE"
     assert got.mapping_method == "US_PREFERRED_SAME_VENUE_EXACT_TV_SYMBOL"
@@ -2026,7 +2026,7 @@ def test_us_preferred_same_venue_requires_source_isin_mic_proof(tmp_path):
     db = CacheDB(tmp_path / "pref_fail.sqlite")
     r = BatchResolver(db, FHPreferredIncomplete(), OFPreferredSameVenue(), YHPreferredSameVenue())
     row = TvRow("NASDAQ:NASP", "NASDAQ", "NASP", None, "USD", "stock", ("preferred",), None, None, 25.0, "US0000000003")
-    got = r.resolve([row])[row.tv_id]
+    got = r.resolve([row], market="japan")[row.tv_id]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "FINNHUB_TYPE_MISMATCH:PUBLIC"
     db.close()
@@ -3129,4 +3129,289 @@ def test_ireland_isin_bridge_does_not_generalize_reviewed_taxonomy(tmp_path):
     got = r.resolve([_ireland_a5g_row()], market="ireland")["EURONEXT:A5G"]
     assert got.status == "REJECTED"
     assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    db.close()
+
+class OFJapanReitFallback:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            if job.get("idType") == "ID_ISIN" and job.get("idValue") == "JP3027670003" and job.get("micCode") == "XTKS":
+                out.append([OpenFigiIdentity(
+                    "BBG_REIT_XTKS", "BBG_REIT_COMP", "BBG_REIT_SHARE", "8951", "NIPPON BUILDING FUND INC",
+                    "REIT", "REIT", "JT",
+                )])
+            else:
+                out.append([])
+        return out
+
+class YHJapanReit:
+    batch_size = 75
+    def quotes(self, symbols):
+        if "8951.T" not in symbols:
+            return {}
+        return {"8951.T": YahooQuote(
+            "8951.T", "JPX", "Tokyo", "JPY", "EQUITY", "jp_market",
+            "NIPPON BUILDING FUND INC", None, 122600.0, 0,
+        )}
+
+def _japan_reit_row(isin="JP3027670003"):
+    return TvRow(
+        "TSE:8951", "TSE", "8951", "NIPPON BUILDING FUND INC", "JPY",
+        "stock", ("common",), "", 1e12, 122600.0, isin, True,
+    )
+
+def test_japan_xtks_reit_taxonomy_uses_exact_isin_and_venue(tmp_path):
+    db = CacheDB(tmp_path / "japan-reit.sqlite")
+    r = BatchResolver(db, None, OFJapanReitFallback(), YHJapanReit())
+    got = r.resolve([_japan_reit_row()], market="japan")["TSE:8951"]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "JAPAN_XTKS_REIT_TAXONOMY"
+    assert got.yahoo_symbol == "8951.T"
+    assert got.share_class_figi == "BBG_REIT_SHARE"
+    assert r.stats["japan_xtks_reit_isin_jobs"] == 1
+    assert r.stats["japan_xtks_reit_isin_matches"] == 1
+    db.close()
+
+def test_japan_xtks_reit_taxonomy_requires_reit_taxonomy(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    class OFWrongType(OFJapanReitFallback):
+        def map_jobs(self, jobs):
+            out=[]
+            for job in jobs:
+                if job.get("idType") == "ID_ISIN":
+                    out.append([OpenFigiIdentity("F","C","S","8951","X","Unit","Unit","JT")])
+                else: out.append([])
+            return out
+    db = CacheDB(tmp_path / "japan-reit-wrong.sqlite")
+    r = BatchResolver(db, None, OFWrongType(), YHJapanReit())
+    got = r.resolve([_japan_reit_row()], market="japan")["TSE:8951"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    db.close()
+
+def test_japan_xtks_reit_taxonomy_does_not_apply_outside_japan(tmp_path):
+    db = CacheDB(tmp_path / "japan-reit-scope.sqlite")
+    r = BatchResolver(db, None, OFJapanReitFallback(), YHJapanReit())
+    got = r.resolve([_japan_reit_row()], market="germany")["TSE:8951"]
+    assert got.status == "REJECTED"
+    assert r.stats["japan_xtks_reit_isin_jobs"] == 0
+    db.close()
+
+class OFJapanInfrastructureFundFallback:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            if job.get("idType") == "ID_ISIN" and job.get("idValue") == "JP3048360006" and job.get("micCode") == "XTKS":
+                out.append([OpenFigiIdentity(
+                    "BBG_UNIT_XTKS", "BBG_UNIT_COMP", "BBG_UNIT_SHARE", "9282", "ICHIGO GREEN INFRASTRUCTURE INVESTMENT CORP",
+                    "Unit", "Unit", "JT",
+                )])
+            else:
+                out.append([])
+        return out
+
+class YHJapanInfrastructureFund:
+    batch_size = 75
+    def quotes(self, symbols):
+        if "9282.T" not in symbols:
+            return {}
+        return {"9282.T": YahooQuote(
+            "9282.T", "JPX", "Tokyo", "JPY", "EQUITY", "jp_market",
+            "ICHIGO GREEN INFRASTRUCTURE INVESTMENT CORP", None, 50000.0, 0,
+        )}
+
+def _japan_infrastructure_fund_row(isin="JP3048360006"):
+    return TvRow(
+        "TSE:9282", "TSE", "9282", "ICHIGO GREEN INFRASTRUCTURE INVESTMENT CORP", "JPY",
+        "stock", ("common",), "", 1e11, 50000.0, isin, True,
+    )
+
+def test_japan_xtks_infrastructure_fund_taxonomy_uses_reviewed_isin_and_venue(tmp_path):
+    db = CacheDB(tmp_path / "japan-infrastructure.sqlite")
+    r = BatchResolver(db, None, OFJapanInfrastructureFundFallback(), YHJapanInfrastructureFund())
+    got = r.resolve([_japan_infrastructure_fund_row()], market="japan")["TSE:9282"]
+    assert got.status == "VERIFIED"
+    assert got.mapping_method == "JAPAN_XTKS_INFRASTRUCTURE_FUND_TAXONOMY"
+    assert got.yahoo_symbol == "9282.T"
+    assert got.share_class_figi == "BBG_UNIT_SHARE"
+    assert r.stats["japan_xtks_infrastructure_fund_isin_matches"] == 1
+    db.close()
+
+def test_japan_xtks_infrastructure_fund_taxonomy_rejects_unreviewed_unit_isin(tmp_path):
+    from tv_market_identity.models import OpenFigiIdentity
+    class OFUnreviewedUnit(OFJapanInfrastructureFundFallback):
+        def map_jobs(self, jobs):
+            out = []
+            for job in jobs:
+                if job.get("idType") == "ID_ISIN":
+                    out.append([OpenFigiIdentity(
+                        "F", "C", "S", "9282", "UNREVIEWED UNIT",
+                        "Unit", "Unit", "JT",
+                    )])
+                else:
+                    out.append([])
+            return out
+    db = CacheDB(tmp_path / "japan-infrastructure-unreviewed.sqlite")
+    r = BatchResolver(db, None, OFUnreviewedUnit(), YHJapanInfrastructureFund())
+    got = r.resolve([_japan_infrastructure_fund_row(isin="JP0000000001")], market="japan")["TSE:9282"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_NO_MATCH"
+    assert r.stats["japan_xtks_infrastructure_fund_isin_matches"] == 0
+    db.close()
+
+class OFJapanRegionalExact:
+    batch_size = 100
+    def __init__(self, *, duplicate=False, wrong_ticker=False, missing_share=False):
+        self.duplicate = duplicate
+        self.wrong_ticker = wrong_ticker
+        self.missing_share = missing_share
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            if job.get("micCode") in {"XNGO", "XFKA"} and job.get("idType") == "ID_EXCH_SYMBOL":
+                ticker = "9999" if self.wrong_ticker else job.get("idValue")
+                share = None if self.missing_share else "BBG_JP_SHARE"
+                rows = [OpenFigiIdentity(
+                    "BBG_JP_LISTING", "BBG_JP_COMP", share, ticker, "JAPAN REGIONAL CO",
+                    "Common Stock", "Common Stock", "JN" if job.get("micCode") == "XNGO" else "JF",
+                )]
+                if self.duplicate:
+                    rows.append(OpenFigiIdentity(
+                        "BBG_JP_LISTING_2", "BBG_JP_COMP_2", "BBG_JP_SHARE_2", ticker, "JAPAN REGIONAL CO",
+                        "Common Stock", "Common Stock", "JN" if job.get("micCode") == "XNGO" else "JF",
+                    ))
+                out.append(rows)
+            else:
+                out.append([])
+        return out
+
+class YHJapanRegionalMissing:
+    batch_size = 75
+    def quotes(self, symbols):
+        return {}
+    def chart_quotes(self, symbols):
+        return {}
+
+
+def _japan_regional_row(prefix="NAG", symbol="8306", isin="JP3902900004"):
+    return TvRow(
+        f"{prefix}:{symbol}", prefix, symbol, "JAPAN REGIONAL CO", "JPY",
+        "stock", ("common",), "", 1e12, 1000.0, isin, True,
+    )
+
+
+def test_japan_regional_exact_openfigi_listing_allows_known_yahoo_coverage_gap(tmp_path):
+    db = CacheDB(tmp_path / "japan-regional-exact.sqlite")
+    r = BatchResolver(db, None, OFJapanRegionalExact(), YHJapanRegionalMissing())
+    got = r.resolve([_japan_regional_row()], market="japan")["NAG:8306"]
+    assert got.status == "VERIFIED"
+    assert got.resolved_mic == "XNGO"
+    assert got.mapping_method == "JAPAN_REGIONAL_EXACT_OPENFIGI_LISTING"
+    assert got.share_class_figi == "BBG_JP_SHARE"
+    assert got.quote_status == "UNAVAILABLE"
+    assert r.stats["japan_regional_exact_openfigi_listing_matches"] == 1
+    db.close()
+
+
+def test_japan_regional_exact_openfigi_listing_applies_to_fukuoka(tmp_path):
+    db = CacheDB(tmp_path / "japan-regional-fukuoka.sqlite")
+    r = BatchResolver(db, None, OFJapanRegionalExact(), YHJapanRegionalMissing())
+    got = r.resolve([_japan_regional_row("FSE", "2164", "JP3167310006")], market="japan")["FSE:2164"]
+    assert got.status == "VERIFIED"
+    assert got.resolved_mic == "XFKA"
+    assert got.mapping_method == "JAPAN_REGIONAL_EXACT_OPENFIGI_LISTING"
+    db.close()
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"duplicate": True},
+    {"wrong_ticker": True},
+    {"missing_share": True},
+])
+def test_japan_regional_exact_openfigi_listing_requires_unique_exact_complete_source(tmp_path, kwargs):
+    db = CacheDB(tmp_path / ("japan-regional-negative-" + next(iter(kwargs)) + ".sqlite"))
+    r = BatchResolver(db, None, OFJapanRegionalExact(**kwargs), YHJapanRegionalMissing())
+    got = r.resolve([_japan_regional_row()], market="japan")["NAG:8306"]
+    assert got.status == "REJECTED"
+    assert r.stats["japan_regional_exact_openfigi_listing_matches"] == 0
+    db.close()
+
+
+def test_japan_regional_exact_openfigi_listing_requires_isin_and_japan_scope(tmp_path):
+    db = CacheDB(tmp_path / "japan-regional-scope.sqlite")
+    r = BatchResolver(db, None, OFJapanRegionalExact(), YHJapanRegionalMissing())
+    no_isin = r.resolve([_japan_regional_row(isin=None)], market="japan")["NAG:8306"]
+    assert no_isin.status == "REJECTED"
+    db.close()
+
+    db = CacheDB(tmp_path / "japan-regional-market.sqlite")
+    r = BatchResolver(db, None, OFJapanRegionalExact(), YHJapanRegionalMissing())
+    outside = r.resolve([_japan_regional_row()], market="germany")["NAG:8306"]
+    assert outside.status == "REJECTED"
+    db.close()
+
+
+class OFJapanTorigoeReviewedMutualFund:
+    batch_size = 100
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out = []
+        for job in jobs:
+            if (job.get("idType") == "ID_EXCH_SYMBOL"
+                    and job.get("idValue") == "2009"
+                    and job.get("micCode") == "XFKA"):
+                out.append([OpenFigiIdentity(
+                    "BBG000BCTL39", "BBG000BCTFS5", "BBG001S6C4X5",
+                    "2009", "TORIGOE CO LTD/THE",
+                    "Common Stock", "Common Stock", "JF",
+                )])
+            else:
+                out.append([])
+        return out
+
+
+class YHJapanTorigoeReviewedMutualFund:
+    batch_size = 75
+    def quotes(self, symbols):
+        if "2009.F" not in symbols:
+            return {}
+        return {"2009.F": YahooQuote(
+            "2009.F", "FKA", "Fukuoka", "JPY", "MUTUALFUND",
+            "jp_market", "TORIGOE CO LTD (THE)", None, 755.0, 15,
+        )}
+
+
+def test_japan_xfka_reviewed_torigoe_mutualfund_taxonomy(tmp_path):
+    db = CacheDB(tmp_path / "japan-torigoe-mf.sqlite")
+    r = BatchResolver(db, None, OFJapanTorigoeReviewedMutualFund(), YHJapanTorigoeReviewedMutualFund())
+    row = TvRow(
+        "FSE:2009", "FSE", "2009", "Torigoe Co., Ltd.", "JPY",
+        "stock", ("common",), "Process Industries", 1e10, 755.0,
+    )
+    got = r.resolve([row], market="japan")[row.tv_id]
+    assert got.status == "VERIFIED"
+    assert got.resolved_mic == "XFKA"
+    assert got.yahoo_symbol == "2009.F"
+    assert got.yahoo_quote_type == "MUTUALFUND"
+    assert r.stats["reviewed_yahoo_mutualfund_taxonomy_candidates"] == 1
+    assert r.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] == 1
+    db.close()
+
+
+def test_japan_xfka_unreviewed_mutualfund_stays_rejected(tmp_path):
+    db = CacheDB(tmp_path / "japan-torigoe-mf-unreviewed.sqlite")
+    r = BatchResolver(db, None, OFJapanTorigoeReviewedMutualFund(), YHJapanTorigoeReviewedMutualFund())
+    row = TvRow(
+        "FSE:9999", "FSE", "2009", "Torigoe Co., Ltd.", "JPY",
+        "stock", ("common",), "Process Industries", 1e10, 755.0,
+    )
+    got = r.resolve([row], market="japan")[row.tv_id]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:MUTUALFUND"
+    assert r.stats["reviewed_yahoo_mutualfund_taxonomy_matches"] == 0
     db.close()

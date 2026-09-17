@@ -46,7 +46,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.42-policy442", "0.4.41-policy441", "0.4.40-policy440", "0.4.39-policy439", "0.4.38-policy438", "0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.50-policy450", "0.4.49-policy449", "0.4.48-policy448", "0.4.47-policy447", "0.4.46-policy446", "0.4.45-policy445", "0.4.44-policy444", "0.4.43-policy443", "0.4.42-policy442", "0.4.41-policy441", "0.4.40-policy440", "0.4.39-policy439", "0.4.38-policy438", "0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -271,6 +271,8 @@ def _strict_yahoo_mapping(mapping_method: str | None) -> bool:
         "TARGET_PROVIDER_STRICT_FALLBACK",
         "REVIEWED_ISIN_SECURITY_FALLBACK",
         "IRELAND_ISIN_UNIQUE_XDUB_LISTING",
+        "JAPAN_XTKS_REIT_TAXONOMY",
+        "JAPAN_XTKS_INFRASTRUCTURE_FUND_TAXONOMY",
     }
 
 
@@ -3395,6 +3397,7 @@ class BatchResolver:
                 collapsed: bool,
                 type_fallback: bool = False,
                 method_override: str | None = None,
+                japan_regional_exact_listing: bool = False,
                 mic_override: str | None = None,
             ) -> None:
                 mic = mic_override or tv_prefix_mic(r.prefix, self.market)
@@ -3423,6 +3426,7 @@ class BatchResolver:
                     "target_mic": mic,
                     "yahoo_symbol": yahoo_symbol,
                     "mapping_method": method,
+                    "japan_regional_exact_listing": japan_regional_exact_listing,
                 })
                 if collapsed:
                     self.stats["openfigi_share_class_collapses"] += 1
@@ -3458,7 +3462,25 @@ class BatchResolver:
             for r, identities in zip(direct_rows, mapped):
                 of, collapsed, reason = _select_openfigi_identity(r, identities)
                 if of is not None:
-                    add_direct_pending(r, of, collapsed)
+                    mic = tv_prefix_mic(r.prefix, self.market)
+                    exact_source_candidates = [
+                        x for x in identities
+                        if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                        and openfigi_type_compatible(r, x)
+                        and bool(x.figi)
+                        and bool(x.share_class_figi)
+                    ]
+                    japan_regional_exact_listing = (
+                        self.market == "japan"
+                        and mic in {"XNGO", "XFKA"}
+                        and bool(r.isin)
+                        and len(exact_source_candidates) == 1
+                        and exact_source_candidates[0].figi == of.figi
+                    )
+                    add_direct_pending(
+                        r, of, collapsed,
+                        japan_regional_exact_listing=japan_regional_exact_listing,
+                    )
                     continue
                 if reason and reason.startswith("OPENFIGI_AMBIGUOUS"):
                     reviewed = REVIEWED_ISIN_FALLBACKS.get(r.tv_id)
@@ -3568,6 +3590,8 @@ class BatchResolver:
                 secondary_mic_jobs: list[dict] = []
                 ireland_isin_rows: list[TvRow] = []
                 ireland_isin_jobs: list[dict] = []
+                japan_reit_isin_rows: list[TvRow] = []
+                japan_reit_isin_jobs: list[dict] = []
                 for r, identities in zip(retry_rows, retry_mapped):
                     of, collapsed, reason = _select_openfigi_identity(r, identities)
                     if of is not None:
@@ -3603,6 +3627,21 @@ class BatchResolver:
                         continue
                     if (
                         (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
+                        and (self.market or "").lower() == "japan"
+                        and r.prefix == "TSE"
+                        and tv_prefix_mic(r.prefix, self.market) == "XTKS"
+                        and tv_type_kind(r) == "STOCK"
+                        and r.isin
+                    ):
+                        japan_reit_isin_rows.append(r)
+                        japan_reit_isin_jobs.append({
+                            "idType": "ID_ISIN",
+                            "idValue": r.isin,
+                            "micCode": "XTKS",
+                        })
+                        continue
+                    if (
+                        (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH"
                         and (self.market or "").lower() == "ireland"
                         and r.prefix == "EURONEXT"
                         and tv_prefix_mic(r.prefix, self.market) == "XDUB"
@@ -3627,6 +3666,75 @@ class BatchResolver:
                     if (reason or "OPENFIGI_NO_MATCH") == "OPENFIGI_NO_MATCH" and add_target_provider_strict_fallback(r):
                         continue
                     rejected.append(self._reject(r, reason or "OPENFIGI_NO_MATCH"))
+
+                if japan_reit_isin_jobs:
+                    try:
+                        japan_reit_mapped = self.openfigi.map_jobs(japan_reit_isin_jobs)
+                        self.stats["openfigi_jobs"] += len(japan_reit_isin_jobs)
+                        self.stats["japan_xtks_reit_isin_jobs"] += len(japan_reit_isin_jobs)
+                        self.stats["openfigi_http_batches"] += (len(japan_reit_isin_jobs) + self.openfigi.batch_size - 1) // self.openfigi.batch_size
+                    except ProviderError as exc:
+                        rejected.extend(self._reject(r, f"OPENFIGI_UNAVAILABLE: {exc}") for r in japan_reit_isin_rows)
+                        japan_reit_mapped = [[] for _ in japan_reit_isin_rows]
+
+                    for r, identities in zip(japan_reit_isin_rows, japan_reit_mapped):
+                        exact_ticker_identities = [
+                            x for x in identities
+                            if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                        ]
+                        reit_identities = [
+                            x for x in exact_ticker_identities
+                            if ((x.security_type or "").lower() in {"reit", "real estate investment trust"}
+                                or (x.security_type2 or "").lower() in {"reit", "real estate investment trust"})
+                        ]
+                        # These four JPX infrastructure funds are a reviewed, bounded
+                        # provider-taxonomy exception. TradingView exposes them as
+                        # stock/common while OpenFIGI models the exact XTKS listings as
+                        # Unit. Do not generalize stock<->Unit compatibility beyond the
+                        # reviewed ISINs.
+                        reviewed_infrastructure_fund_isins = {
+                            "JP3048360006",  # 9282
+                            "JP3048590008",  # 9284
+                            "JP3048780005",  # 9285
+                            "JP3048820009",  # 9286
+                        }
+                        unit_identities = [
+                            x for x in exact_ticker_identities
+                            if r.isin in reviewed_infrastructure_fund_isins
+                            and ((x.security_type or "").lower() == "unit"
+                                 or (x.security_type2 or "").lower() == "unit")
+                        ]
+                        selected = reit_identities or unit_identities
+                        shares = {x.share_class_figi for x in selected if x.share_class_figi}
+                        if not selected or len(shares) != 1 or not all(x.share_class_figi for x in selected):
+                            self.stats["japan_xtks_reit_isin_no_match"] += 1
+                            rejected.append(self._reject(r, "OPENFIGI_NO_MATCH"))
+                            continue
+                        first = selected[0]
+                        of = first if len(selected) == 1 else OpenFigiIdentity(
+                            figi=None,
+                            composite_figi=None,
+                            share_class_figi=next(iter(shares)),
+                            ticker=first.ticker or r.symbol,
+                            name=first.name,
+                            security_type=first.security_type,
+                            security_type2=first.security_type2,
+                            exch_code=None,
+                        )
+                        method = (
+                            "JAPAN_XTKS_REIT_TAXONOMY"
+                            if reit_identities
+                            else "JAPAN_XTKS_INFRASTRUCTURE_FUND_TAXONOMY"
+                        )
+                        add_direct_pending(
+                            r, of, len(selected) > 1,
+                            method_override=method,
+                            mic_override="XTKS",
+                        )
+                        if reit_identities:
+                            self.stats["japan_xtks_reit_isin_matches"] += 1
+                        else:
+                            self.stats["japan_xtks_infrastructure_fund_isin_matches"] += 1
 
                 if ireland_isin_jobs:
                     try:
@@ -4883,9 +4991,24 @@ class BatchResolver:
                         self.stats["yahoo_incompatible_symbol_rows"] += 1
                     rejected.append(self._reject(r, diagnostic_reason))
                 else:
-                    rejected.append(self._reject(r, "YAHOO_NO_MATCH"))
-                    if r.prefix in germany_probe_prefixes and r.isin:
-                        germany_yahoo_failure_probe_items.append((item, "YAHOO_NO_MATCH"))
+                    if item.get("japan_regional_exact_listing"):
+                        binding = self._verified(
+                            r, fh=None, of=item["identity"], y=None,
+                            mic=item["target_mic"],
+                            source_mic=item["source_mic"],
+                            target_mic=item["target_mic"],
+                            source_venue_code=item.get("source_venue_code"),
+                            mapping_method="JAPAN_REGIONAL_EXACT_OPENFIGI_LISTING",
+                            source_of=item["source_identity"],
+                            target_of=item["target_identity"],
+                        )
+                        binding.quote_status = "UNAVAILABLE"
+                        verified.append(binding)
+                        self.stats["japan_regional_exact_openfigi_listing_matches"] += 1
+                    else:
+                        rejected.append(self._reject(r, "YAHOO_NO_MATCH"))
+                        if r.prefix in germany_probe_prefixes and r.isin:
+                            germany_yahoo_failure_probe_items.append((item, "YAHOO_NO_MATCH"))
                 continue
             # Normal non-US mappings already have independent OpenFIGI proof, so
             # missing Yahoo metadata is absence of corroboration, not conflict.
@@ -6069,7 +6192,7 @@ class BatchResolver:
         r: TvRow,
         fh: FinnhubIdentity | None,
         of: OpenFigiIdentity | None,
-        y: YahooQuote,
+        y: YahooQuote | None,
         mic: str | None,
         source_mic: str | None = None,
         target_mic: str | None = None,
@@ -6099,10 +6222,10 @@ class BatchResolver:
             "venue_figi": source_of.figi if source_of else None,
             "source_venue_figi": source_of.figi if source_of else None,
             "target_venue_figi": target_of.figi if target_of else None,
-            "yahoo_symbol": y.symbol,
-            "yahoo_exchange": y.exchange,
-            "yahoo_market": y.market,
-            "yahoo_currency": y.currency,
+            "yahoo_symbol": y.symbol if y else None,
+            "yahoo_exchange": y.exchange if y else None,
+            "yahoo_market": y.market if y else None,
+            "yahoo_currency": y.currency if y else None,
             "policy": RESOLVER_VERSION,
         }
         fingerprint = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -6113,13 +6236,13 @@ class BatchResolver:
             tv_currency=r.currency,
             tv_type=r.tv_type,
             status="VERIFIED",
-            yahoo_symbol=y.symbol,
-            yahoo_exchange=y.exchange,
-            yahoo_market=y.market,
-            yahoo_quote_type=y.quote_type,
-            yahoo_currency=y.currency,
-            yahoo_price=y.price,
-            yahoo_delayed_by=y.delayed_by,
+            yahoo_symbol=y.symbol if y else None,
+            yahoo_exchange=y.exchange if y else None,
+            yahoo_market=y.market if y else None,
+            yahoo_quote_type=y.quote_type if y else None,
+            yahoo_currency=y.currency if y else None,
+            yahoo_price=y.price if y else None,
+            yahoo_delayed_by=y.delayed_by if y else None,
             quote_status="FRESH",
             resolved_mic=target_mic,
             source_mic=source_mic,

@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.43-policy443"
+RESOLVER_VERSION = "0.4.51-policy451"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -29,6 +29,13 @@ TV_PREFIX_TO_MIC = {
     # TradingView HKEX is Hong Kong Exchanges and Clearing / Stock Exchange of Hong Kong.
     # XHKG is the ISO 10383 operating MIC for the cash equity venue.
     "HKEX": "XHKG",
+    # Reviewed Japanese TradingView venue prefixes. Keep the regional exchanges
+    # distinct from Tokyo; routing identifies the source venue only and does not
+    # bypass normal OpenFIGI/Yahoo identity proof.
+    "TSE": "XTKS",
+    "NAG": "XNGO",
+    "FSE": "XFKA",
+    "SAPSE": "XSAP",
     # TradingView BX = BX Swiss. ISO 10383 operating MIC is XBRN.
     # BX Sponsored Shares includes foreign equities traded in CHF; Yahoo does
     # not expose an XBRN suffix, so exact-ISIN home-market rescue may reroute
@@ -179,6 +186,13 @@ REVIEWED_YAHOO_MUTUALFUND_TAXONOMY = {
         "kind": "STOCK", "mic": "XLON", "isin": "KYG382681016",
         "name_tokens": ("GENERATION ESSENTIALS",),
     },
+    # FSE: Torigoe ordinary shares on Fukuoka. OpenFIGI independently
+    # proves the exact XFKA/JF listing; Yahoo 2009.F currently reports the
+    # correct Fukuoka venue/currency but misclassifies the quote as MUTUALFUND.
+    "FSE:2009": {
+        "kind": "STOCK", "mic": "XFKA", "isin": "JP3636200002",
+        "name_tokens": ("TORIGOE",),
+    },
 }
 
 # TradingView LSIN spans more than one London ISO MIC. XLON remains the
@@ -221,6 +235,10 @@ MIC_TO_YAHOO_SUFFIX = {
     # Yahoo Finance documents Euronext Dublin listings with the .IR suffix.
     "XDUB": ".IR",
     "XTKS": ".T",
+    # Yahoo Finance Japan uses venue-specific suffixes for regional Japanese exchanges.
+    "XNGO": ".N",
+    "XFKA": ".F",
+    "XSAP": ".S",
     "XASX": ".AX",
 }
 
@@ -494,6 +512,12 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XSTU": {"STU"},
         "XMUN": {"MUN"},
         "XHAN": {"HAN"},
+        # Yahoo represents Tokyo Stock Exchange listings as JPX / Tokyo.
+        "XTKS": {"JPX"},
+        # Yahoo Japan exposes Fukuoka and Sapporo listings with dedicated
+        # exchange metadata when using their venue-specific .F / .S symbols.
+        "XFKA": {"FKA"},
+        "XSAP": {"SAP"},
         # Yahoo represents Hong Kong Stock Exchange listings as HKG / HKSE.
         "XHKG": {"HKG"},
         # Yahoo represents Euronext Dublin listings as ISE / Irish.
@@ -540,6 +564,9 @@ def yahoo_venue_compatible(mic: str | None, q: YahooQuote) -> bool:
         "XSTU": ("STUTTGART",),
         "XMUN": ("MUNICH", "MUENCHEN", "MÜNCHEN"),
         "XHAN": ("HANNOVER", "HANOVER"),
+        "XTKS": ("TOKYO", "TOKYO STOCK EXCHANGE",),
+        "XFKA": ("FUKUOKA", "FUKUOKA STOCK EXCHANGE",),
+        "XSAP": ("SAPPORO", "SAPPORO STOCK EXCHANGE",),
         "XHKG": ("HKSE", "HONG KONG STOCK EXCHANGE", "HONG KONG"),
         "XDUB": ("IRISH", "EURONEXT DUBLIN", "IRISH STOCK EXCHANGE"),
         "BATS": ("CBOE US", "CBOE BZX", "BZX"),

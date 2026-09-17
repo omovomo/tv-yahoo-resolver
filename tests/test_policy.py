@@ -276,3 +276,97 @@ def test_euronext_is_not_globally_collapsed_to_dublin():
     assert tv_prefix_mic("EURONEXT", "netherlands") is None
     assert tv_prefix_mic("EURONEXT", "belgium") is None
     assert tv_prefix_mic("EURONEXT", "portugal") is None
+
+
+def test_japan_tradingview_prefix_mics_are_distinct():
+    from tv_market_identity.policy import tv_prefix_mic
+    assert tv_prefix_mic("TSE", "japan") == "XTKS"
+    assert tv_prefix_mic("NAG", "japan") == "XNGO"
+    assert tv_prefix_mic("FSE", "japan") == "XFKA"
+    assert tv_prefix_mic("SAPSE", "japan") == "XSAP"
+
+
+def test_japan_regional_prefixes_do_not_collapse_to_tokyo():
+    from tv_market_identity.policy import tv_prefix_mic
+    assert tv_prefix_mic("NAG", "japan") != "XTKS"
+    assert tv_prefix_mic("FSE", "japan") != "XTKS"
+    assert tv_prefix_mic("SAPSE", "japan") != "XTKS"
+
+
+def test_yahoo_tokyo_venue_contract_accepts_reviewed_jpx_tokyo_representation():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="7203.T", exchange="JPX", full_exchange_name="Tokyo",
+        currency="JPY", quote_type="EQUITY", market="jp_market",
+        short_name="Toyota Motor", long_name="Toyota Motor Corporation",
+        price=3000.0, delayed_by=20,
+    )
+    assert yahoo_venue_compatible("XTKS", q)
+
+
+def test_yahoo_tokyo_venue_contract_rejects_other_exchange():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="7203.T", exchange="NMS", full_exchange_name="NasdaqGS",
+        currency="JPY", quote_type="EQUITY", market="us_market",
+        short_name="Toyota Motor", long_name="Toyota Motor Corporation",
+        price=3000.0, delayed_by=20,
+    )
+    assert not yahoo_venue_compatible("XTKS", q)
+
+
+def test_japan_regional_yahoo_suffixes_are_venue_specific():
+    from tv_market_identity.policy import MIC_TO_YAHOO_SUFFIX
+
+    assert MIC_TO_YAHOO_SUFFIX["XTKS"] == ".T"
+    assert MIC_TO_YAHOO_SUFFIX["XNGO"] == ".N"
+    assert MIC_TO_YAHOO_SUFFIX["XFKA"] == ".F"
+    assert MIC_TO_YAHOO_SUFFIX["XSAP"] == ".S"
+    assert len({MIC_TO_YAHOO_SUFFIX[mic] for mic in ("XTKS", "XNGO", "XFKA", "XSAP")}) == 4
+
+
+def test_yahoo_fukuoka_venue_contract_accepts_observed_representation():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="5401.F", exchange="FKA", full_exchange_name="Fukuoka",
+        currency="JPY", quote_type="EQUITY", market="jp_market",
+        short_name="Nippon Steel", long_name="Nippon Steel Corporation",
+        price=600.0, delayed_by=20,
+    )
+    assert yahoo_venue_compatible("XFKA", q)
+
+
+def test_yahoo_sapporo_venue_contract_accepts_observed_representation():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    q = YahooQuote(
+        symbol="5401.S", exchange="SAP", full_exchange_name="Sapporo",
+        currency="JPY", quote_type="EQUITY", market="jp_market",
+        short_name="Nippon Steel", long_name="Nippon Steel Corporation",
+        price=600.0, delayed_by=20,
+    )
+    assert yahoo_venue_compatible("XSAP", q)
+
+
+def test_yahoo_regional_japan_venue_contracts_reject_cross_venue_metadata():
+    from tv_market_identity.models import YahooQuote
+    from tv_market_identity.policy import yahoo_venue_compatible
+    fukuoka = YahooQuote(
+        symbol="5401.F", exchange="FKA", full_exchange_name="Fukuoka",
+        currency="JPY", quote_type="EQUITY", market="jp_market",
+        short_name="Nippon Steel", long_name="Nippon Steel Corporation",
+        price=600.0, delayed_by=20,
+    )
+    sapporo = YahooQuote(
+        symbol="5401.S", exchange="SAP", full_exchange_name="Sapporo",
+        currency="JPY", quote_type="EQUITY", market="jp_market",
+        short_name="Nippon Steel", long_name="Nippon Steel Corporation",
+        price=600.0, delayed_by=20,
+    )
+    assert not yahoo_venue_compatible("XSAP", fukuoka)
+    assert not yahoo_venue_compatible("XFKA", sapporo)
+    assert not yahoo_venue_compatible("XNGO", fukuoka)
+    assert not yahoo_venue_compatible("XNGO", sapporo)
