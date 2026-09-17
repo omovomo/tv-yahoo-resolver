@@ -8,4 +8,4 @@ def test_no_symbol_audit_flag_is_available_without_policy_change():
         "--us-finnhub-no-symbol-audit", "no-symbol.jsonl",
     ])
     assert args.us_finnhub_no_symbol_audit == "no-symbol.jsonl"
-    assert RESOLVER_VERSION == "0.4.26-policy426"
+    assert RESOLVER_VERSION == "0.4.29-policy429"

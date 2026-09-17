@@ -3068,7 +3068,7 @@ def _write_us_finnhub_public_audit(path: Path, rows, bindings: dict, resolver: B
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.16",
+            "diagnostic_only": True, "diagnostic_release": "0.4.27",
             "tv_id": r.tv_id, "tv_symbol": r.symbol,
             "tv_isin": r.isin, "tv_currency": r.currency, "tv_type": r.tv_type,
             "tv_type_specs": list(r.type_specs), "tv_type_kind": tv_type_kind(r),
@@ -3407,7 +3407,7 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
         else:
             classification = "IDENTITY_EVIDENCE_INCOMPLETE"
         records.append({
-            "diagnostic_only": True, "diagnostic_release": "0.4.16",
+            "diagnostic_only": True, "diagnostic_release": "0.4.28",
             "tv_id": r.tv_id, "tv_symbol": r.symbol, "tv_isin": r.isin,
             "tv_currency": r.currency, "tv_type": r.tv_type, "tv_type_specs": list(r.type_specs),
             "tv_type_kind": tv_type_kind(r), "source_mic": source_mic,
@@ -3422,6 +3422,18 @@ def _write_us_finnhub_unknown_type_audit(path: Path, rows, bindings: dict, resol
             "yahoo_exact_isin_candidate_count": len(cs),
             "yahoo_strict_same_source_equity_candidate_count": len(strict),
             "yahoo_exact_isin_candidates": candidates, "classification": classification,
+            "v428_cohort_key": {
+                "source_mic": source_mic,
+                "tv_type_kind": tv_type_kind(r),
+                "tv_type": r.tv_type,
+                "tv_type_specs": list(r.type_specs),
+                "openfigi_scoped_status": scoped_status,
+                "openfigi_scoped_taxonomy": sorted({
+                    f"{x.security_type or '?'}/{x.security_type2 or '?'}" for x in scoped
+                }),
+                "openfigi_unscoped_status": unscoped_status,
+                "yahoo_strict_same_source_equity_count": len(strict),
+            },
         })
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -4218,7 +4230,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-finnhub-public-audit",
         default=None,
-        help="Write v0.4.9 diagnostic-only full-cohort exact-ISIN/source-binding JSONL for US FINNHUB_TYPE_MISMATCH:PUBLIC rejects",
+        help="Write v0.4.27 diagnostic-only full-cohort exact-ISIN/source-binding JSONL for US FINNHUB_TYPE_MISMATCH:PUBLIC rejects",
     )
     r.add_argument(
         "--us-finnhub-public-xnas-segment-audit",
@@ -4233,7 +4245,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--us-finnhub-unknown-type-audit",
         default=None,
-        help="Write diagnostic-only exact-ISIN/source-binding JSONL for US FINNHUB_TYPE_MISMATCH:? rejects",
+        help="Write v0.4.28 diagnostic-only full-cohort decomposition JSONL for US FINNHUB_TYPE_MISMATCH:? rejects",
     )
     r.add_argument(
         "--us-finnhub-unknown-type-residual-audit",

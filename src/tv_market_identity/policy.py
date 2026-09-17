@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.26-policy426"
+RESOLVER_VERSION = "0.4.29-policy429"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {

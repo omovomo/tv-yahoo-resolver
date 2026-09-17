@@ -1,3 +1,11 @@
+# tv-market-identity-prototype v0.4.29
+
+Functional release for the audited OOTC `stock/common` residual with `FINNHUB_TYPE_MISMATCH:?`. Adds `US_OOTC_STOCK_COMMON_FINNHUB_UNKNOWN_TYPE_EXACT_ISIN`: exact TV ISIN, OOTC-scoped unique OpenFIGI `Common Stock / Common Stock`, non-null shareClassFIGI, exact ticker, and exactly one strict Yahoo exact-ISIN OOTC/USD/EQUITY route. No generic unknown-type compatibility is introduced. Resolver policy is `0.4.29-policy429`; prior VERIFIED `0.4.26-policy426` cache remains compatible while prior REJECTED rows are reprocessed.
+
+# tv-market-identity-prototype v0.4.28
+
+Diagnostic-only release for the residual `FINNHUB_TYPE_MISMATCH:?` US cohort. Admission is unchanged: resolver policy remains `0.4.26-policy426`. The `--us-finnhub-unknown-type-audit` output now records v0.4.28 metadata and a deterministic cohort key spanning source MIC, TradingView taxonomy, scoped/unscoped OpenFIGI evidence/taxonomy, and Yahoo strict same-source EQUITY contract evidence.
+
 ## v0.4.26 functional — OOTC Unit exact-ISIN rescues
 
 Adds two separately taxonomy-gated same-source OOTC rescues for the audited `FINNHUB_TYPE_MISMATCH:Unit` cohort: `US_OOTC_STOCK_COMMON_FINNHUB_UNIT_EXACT_ISIN` and `US_OOTC_FUND_UNIT_FINNHUB_UNIT_EXACT_ISIN`. Both require exact TV ISIN, `ID_ISIN + OOTC`, exactly one qualifying `Unit / Unit` FIGI with exact TV ticker and non-null shareClassFIGI, and exactly one qualifying Yahoo exact-ISIN route for the exact TV ticker whose quote is OOTC-compatible, explicitly USD, currency-compatible, and `EQUITY`. The TV taxonomy gates remain separate (`stock/common` vs `fund/unit`); no generic Unit admission is added. Resolver policy is `0.4.26-policy426`, with `0.4.23-policy423` retained for compatible VERIFIED cache reuse.

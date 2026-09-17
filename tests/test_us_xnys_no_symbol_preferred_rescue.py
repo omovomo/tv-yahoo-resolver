@@ -2,7 +2,7 @@ from tv_market_identity.policy import RESOLVER_VERSION
 
 
 def test_v048_policy_version():
-    assert RESOLVER_VERSION == "0.4.26-policy426"
+    assert RESOLVER_VERSION == "0.4.29-policy429"
 
 
 def test_v048_method_is_wired():
