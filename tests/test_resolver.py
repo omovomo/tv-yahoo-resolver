@@ -2830,3 +2830,77 @@ def test_v0411_xnas_public_segment_requires_scoped_xnas_no_match(tmp_path):
     assert got.mapping_method != "US_XNAS_FINNHUB_PUBLIC_PREFERRED_EXACT_ISIN_SEGMENT"
     assert r.stats["us_xnas_public_preferred_segment_rescue_matches"] == 0
     db.close()
+
+class FHMicMismatchSameVenue:
+    def us_symbols(self):
+        return [{"symbol":"NVA","currency":"USD","type":"Common Stock","mic":"XNAS","figi":"FH_NVA","shareClassFIGI":"SC_NVA"}]
+
+class OFMicMismatchSameVenue:
+    batch_size = 100
+    def __init__(self, *, source_mic="XASE", source_ticker="NVA", source_share="SC_NVA", ambiguous=False):
+        self.source_mic=source_mic; self.source_ticker=source_ticker; self.source_share=source_share; self.ambiguous=ambiguous
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        out=[]
+        for job in jobs:
+            if job.get("micCode") is None:
+                vals=[OpenFigiIdentity("OF_UN","COMP","SC_NVA","NVA",None,"Common Stock","Common Stock","US")]
+                if self.ambiguous:
+                    vals.append(OpenFigiIdentity("OF_UN2","COMP2","SC_OTHER","NVA",None,"Common Stock","Common Stock","US"))
+                out.append(vals)
+            elif job.get("micCode") == self.source_mic:
+                out.append([OpenFigiIdentity("OF_SRC","COMP",self.source_share,self.source_ticker,None,"Common Stock","Common Stock","UA")])
+            else:
+                out.append([])
+        return out
+
+class YHMicMismatchSameVenue:
+    batch_size=75
+    def __init__(self, *, symbol="NVA", exchange="ASE"):
+        self.symbol=symbol; self.exchange=exchange
+    def search_exact_isin(self, isin, max_results=10):
+        from tv_market_identity.models import YahooSearchCandidate
+        return [YahooSearchCandidate(self.symbol,self.exchange,"EQUITY",None,None)]
+    def quotes(self, symbols):
+        return {s: YahooQuote(s,self.exchange,"NYSE American" if self.exchange=="ASE" else "NasdaqGS","USD","EQUITY","us_market",None,None,6.0,0) for s in symbols}
+
+def _nva_row():
+    return TvRow("AMEX:NVA","AMEX","NVA","Nova Minerals Corp","USD","stock",("common",),None,None,6.0,"US66982H1059")
+
+def test_us_same_venue_mic_mismatch_exact_isin_admission(tmp_path):
+    db=CacheDB(tmp_path/'mic-rescue.sqlite')
+    r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(),YHMicMismatchSameVenue())
+    got=r.resolve([_nva_row()])['AMEX:NVA']
+    assert got.status == 'VERIFIED'
+    assert got.mapping_method == 'US_SAME_VENUE_MIC_MISMATCH_EXACT_ISIN'
+    assert got.source_mic == got.target_mic == 'XASE'
+    assert got.share_class_figi == 'SC_NVA'
+    db.close()
+
+def test_us_same_venue_mic_mismatch_rejects_wrong_yahoo_venue(tmp_path):
+    db=CacheDB(tmp_path/'mic-wrong-venue.sqlite')
+    r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(),YHMicMismatchSameVenue(exchange='NMS'))
+    got=r.resolve([_nva_row()])['AMEX:NVA']
+    assert got.status == 'REJECTED' and got.rejection_reason == 'FINNHUB_MIC_MISMATCH:XNAS'
+    db.close()
+
+def test_us_same_venue_mic_mismatch_rejects_ambiguous_share_class(tmp_path):
+    db=CacheDB(tmp_path/'mic-ambiguous.sqlite')
+    r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(ambiguous=True),YHMicMismatchSameVenue())
+    got=r.resolve([_nva_row()])['AMEX:NVA']
+    assert got.status == 'REJECTED' and got.rejection_reason == 'FINNHUB_MIC_MISMATCH:XNAS'
+    db.close()
+
+def test_us_same_venue_mic_mismatch_rejects_ticker_mismatch(tmp_path):
+    db=CacheDB(tmp_path/'mic-ticker.sqlite')
+    r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(source_ticker='OTHER'),YHMicMismatchSameVenue())
+    got=r.resolve([_nva_row()])['AMEX:NVA']
+    assert got.status == 'REJECTED' and got.rejection_reason == 'FINNHUB_MIC_MISMATCH:XNAS'
+    db.close()
+
+def test_us_same_venue_mic_mismatch_rejects_share_class_conflict(tmp_path):
+    db=CacheDB(tmp_path/'mic-share.sqlite')
+    r=BatchResolver(db,FHMicMismatchSameVenue(),OFMicMismatchSameVenue(source_share='SC_OTHER'),YHMicMismatchSameVenue())
+    got=r.resolve([_nva_row()])['AMEX:NVA']
+    assert got.status == 'REJECTED' and got.rejection_reason == 'FINNHUB_MIC_MISMATCH:XNAS'
+    db.close()

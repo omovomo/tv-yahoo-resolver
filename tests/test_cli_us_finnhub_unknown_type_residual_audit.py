@@ -10,7 +10,7 @@ def test_v428_unknown_type_audit_metadata_and_policy():
     from tv_market_identity.policy import RESOLVER_VERSION
     from pathlib import Path
     text = Path("src/tv_market_identity/cli.py").read_text(encoding="utf-8")
-    assert __version__ == "0.4.47"
-    assert RESOLVER_VERSION == "0.4.34-policy434"
+    assert __version__ == "0.4.48"
+    assert RESOLVER_VERSION == "0.4.35-policy435"
     assert '"diagnostic_only": True, "diagnostic_release": "0.4.28"' in text
     assert '"v428_cohort_key"' in text

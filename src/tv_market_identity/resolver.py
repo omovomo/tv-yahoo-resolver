@@ -45,7 +45,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -646,6 +646,7 @@ class BatchResolver:
         new_bindings: list[Binding] = []
         if us:
             us_bindings = self._resolve_us(us)
+            us_bindings = self._us_same_venue_mic_mismatch_rescue(us, us_bindings)
             us_bindings = self._us_same_venue_preferred_rescue(us, us_bindings)
             us_bindings = self._us_xnys_fund_unit_rescue(us, us_bindings)
             us_bindings = self._us_xnys_fund_unit_public_rescue(us, us_bindings)
@@ -820,6 +821,119 @@ class BatchResolver:
             verified.append(self._verified(r, fh=fh, of=None, y=admitted[0], mic=fh.mic))
 
         return verified + rejected
+
+    def _us_same_venue_mic_mismatch_rescue(
+        self,
+        rows: list[TvRow],
+        bindings: list[Binding],
+    ) -> list[Binding]:
+        """Rescue a US common-stock Finnhub MIC mismatch with exact source proof.
+
+        Finnhub venue metadata is not allowed to override independently proven
+        listing identity.  This path is same-venue only and requires exact TV
+        ISIN, a reviewed one-to-one source MIC, one unscoped shareClassFIGI, one
+        source-MIC OpenFIGI FIGI with the exact TV ticker and the same share
+        class, plus one Yahoo exact-ISIN result whose symbol is exactly the TV
+        symbol and whose quote satisfies currency/type/source-venue checks.
+        Any missing, conflicting, or ambiguous evidence remains fail-closed.
+        """
+        by_id = {b.tv_id: b for b in bindings}
+        eligible: list[TvRow] = []
+        for r in rows:
+            b = by_id.get(r.tv_id)
+            reason = b.rejection_reason if b else None
+            source_mic = TV_PREFIX_TO_MIC.get(r.prefix)
+            specs = {str(x).lower() for x in r.type_specs if x}
+            if not reason or not reason.startswith("FINNHUB_MIC_MISMATCH:"):
+                continue
+            if not r.isin or tv_type_kind(r) != "STOCK" or "common" not in specs:
+                continue
+            # Only a reviewed 1:1 prefix -> MIC is admissible here.  AMEX is
+            # intentionally special-cased to XASE: its normal allowed set also
+            # contains ARCX, so the rescue must prove the actual AMEX venue.
+            if r.prefix == "AMEX":
+                source_mic = "XASE"
+            elif not source_mic:
+                continue
+            eligible.append(r)
+        if not eligible:
+            return bindings
+
+        jobs = []
+        for r in eligible:
+            source_mic = "XASE" if r.prefix == "AMEX" else TV_PREFIX_TO_MIC[r.prefix]
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin})
+            jobs.append({"idType": "ID_ISIN", "idValue": r.isin, "micCode": source_mic})
+        try:
+            mapped = self.openfigi.map_jobs(jobs)
+            self.stats["us_same_venue_mic_mismatch_openfigi_jobs"] += len(jobs)
+        except ProviderError:
+            self.stats["us_same_venue_mic_mismatch_openfigi_unavailable"] += len(eligible)
+            return bindings
+
+        proven: dict[str, tuple[str, OpenFigiIdentity]] = {}
+        for i, r in enumerate(eligible):
+            source_mic = "XASE" if r.prefix == "AMEX" else TV_PREFIX_TO_MIC[r.prefix]
+            unscoped = [x for x in mapped[2 * i] if openfigi_type_compatible(r, x)]
+            source = [x for x in mapped[2 * i + 1] if openfigi_type_compatible(r, x)]
+            shares = {x.share_class_figi for x in unscoped if x.share_class_figi}
+            if len(shares) != 1:
+                self.stats["us_same_venue_mic_mismatch_share_unconfirmed"] += 1
+                continue
+            share = next(iter(shares))
+            source = [x for x in source if x.share_class_figi == share and str(x.ticker or "").upper() == r.symbol.upper()]
+            figis = {x.figi for x in source if x.figi}
+            if len(figis) != 1:
+                self.stats["us_same_venue_mic_mismatch_source_unconfirmed"] += 1
+                continue
+            of = next(x for x in source if x.figi == next(iter(figis)))
+            proven[r.tv_id] = (source_mic, of)
+
+        search_fn = getattr(self.yahoo, "search_exact_isin", None)
+        if not proven or not callable(search_fn):
+            return bindings
+
+        rescued: dict[str, Binding] = {}
+        for r in eligible:
+            proof = proven.get(r.tv_id)
+            if proof is None:
+                continue
+            source_mic, of = proof
+            try:
+                cs = list(search_fn(str(r.isin).upper().strip()))
+            except ProviderError:
+                continue
+            # Exact-ISIN discovery itself must be unique and identify the exact
+            # TradingView local symbol; quote filtering must not choose identity.
+            if (
+                len(cs) != 1
+                or str(cs[0].symbol or "").upper() != r.symbol.upper()
+                or str(cs[0].quote_type or "").upper() != "EQUITY"
+            ):
+                self.stats["us_same_venue_mic_mismatch_yahoo_search_unconfirmed"] += 1
+                continue
+            try:
+                quotes = self.yahoo.quotes([cs[0].symbol])
+            except ProviderError:
+                continue
+            q = quotes.get(cs[0].symbol)
+            if q is None or not yahoo_type_compatible(r, q.quote_type):
+                continue
+            if r.currency and q.currency and not currency_compatible(r.currency, q.currency):
+                continue
+            if not yahoo_venue_compatible(source_mic, q):
+                continue
+            rescued[r.tv_id] = self._verified(
+                r, fh=None, of=of, y=q, mic=source_mic,
+                source_mic=source_mic, target_mic=source_mic,
+                mapping_method="US_SAME_VENUE_MIC_MISMATCH_EXACT_ISIN",
+                source_of=of, target_of=of,
+            )
+            self.stats["us_same_venue_mic_mismatch_rescue_matches"] += 1
+
+        if not rescued:
+            return bindings
+        return [rescued.get(b.tv_id, b) for b in bindings]
 
     def _us_same_venue_preferred_rescue(
         self,

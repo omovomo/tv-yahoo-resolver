@@ -1,3 +1,7 @@
+# tv-market-identity-prototype v0.4.48
+
+Functional release adding `US_SAME_VENUE_MIC_MISMATCH_EXACT_ISIN`, a fail-closed rescue for US common-stock rows rejected only because Finnhub reports a conflicting MIC. Admission requires exact TradingView ISIN, a reviewed source MIC, one unique unscoped OpenFIGI shareClassFIGI, one exact-ISIN source-MIC OpenFIGI FIGI with the exact TradingView ticker and matching share class, and exactly one Yahoo exact-ISIN candidate for that exact ticker whose quote is currency/type/source-venue compatible. Ambiguous share classes, source-MIC/ticker conflicts, Yahoo ambiguity, and wrong Yahoo venue remain rejected. Resolver policy is `0.4.35-policy435`; `0.4.34-policy434` is retained for compatible VERIFIED cache reuse.
+
 # tv-market-identity-prototype v0.4.46
 
 Diagnostic cleanup/tooling release. Removes the temporary v0.4.44/v0.4.45 rejection-audit bridge probes `us_same_ticker_unique_share_class_bridge` and `source_mic_proven_unique_share_class_bridge` after the investigation established that explicit source-venue proof is required and the strict candidate cohort is empty. The comprehensive `--rejection-audit` remains the primary diagnostic workflow. Admission logic is unchanged; resolver policy remains `0.4.34-policy434`.
