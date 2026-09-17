@@ -1,3 +1,7 @@
+# tv-market-identity-prototype v0.4.34
+
+Functional release adding `US_OOTC_DR_FINNHUB_UNKNOWN_TYPE_PUBLIC_PREFERRED_EXACT_ISIN`, a narrow same-source OOTC DR/ADR rescue for residual `FINNHUB_TYPE_MISMATCH:?`. Admission requires exact TV ISIN, OOTC source, TV DR/ADR taxonomy, unique OOTC-scoped OpenFIGI `PUBLIC / Preferred Stock` evidence on `OTC US`, and exactly one Yahoo exact-ISIN candidate for the exact TV ticker with OOTC-compatible USD/EQUITY quote evidence. Missing shareClassFIGI and OpenFIGI ticker mismatch are tolerated only inside this explicit same-source taxonomy-boundary path. Resolver policy is `0.4.34-policy434`; `0.4.32-policy432` is retained for compatible VERIFIED cache reuse.
+
 # tv-market-identity-prototype v0.4.30
 
 Diagnostic-only release for focused analysis of residual OOTC `FINNHUB_TYPE_MISMATCH:?` rows in the `stock/preferred` and DR taxonomies. Adds `--us-finnhub-unknown-type-preferred-dr-audit`; admission is unchanged and resolver policy remains `0.4.29-policy429`.
