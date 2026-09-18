@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.54-policy454"
+RESOLVER_VERSION = "0.4.55-policy455"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -321,6 +321,11 @@ def tv_type_kind(row: TvRow) -> str:
     # REIT is an equity identity here, not an ETF/fund identity.
     if "reit" in specs:
         return "STOCK"
+    # TradingView exposes exchange-listed closed-end funds as type=fund with
+    # typespecs=[closedend].  Keep that taxonomy distinct from ETF: Finnhub
+    # reports these as Closed-End Fund and Yahoo commonly as EQUITY.
+    if t == "fund" and "closedend" in specs:
+        return "CLOSED_END_FUND"
     if t == "fund" or "etf" in specs:
         return "ETF"
     if "preferred" in specs or t in {"preferred", "preferred stock"}:
@@ -351,6 +356,8 @@ def finnhub_type_compatible(row: TvRow, fh_type: str | None) -> bool:
     v = (fh_type or "").lower()
     if kind == "ETF":
         return v in {"etp", "etf"}
+    if kind == "CLOSED_END_FUND":
+        return v == "closed-end fund"
     if kind == "PREFERRED":
         # Finnhub occasionally exposes listed preferred series with the coarse
         # security type ``PUBLIC``.  Accept that label only when TradingView
@@ -369,6 +376,8 @@ def yahoo_type_compatible(row: TvRow, quote_type: str | None) -> bool:
     q = (quote_type or "").upper()
     if kind == "ETF":
         return q in {"ETF", "MUTUALFUND"}
+    if kind == "CLOSED_END_FUND":
+        return q == "EQUITY"
     return q == "EQUITY"
 
 
@@ -740,6 +749,8 @@ def openfigi_type_compatible(row: TvRow, identity) -> bool:
     values = {t1, t2}
     if kind == "ETF":
         return bool(values & {"exchange traded product", "etp", "etf"})
+    if kind == "CLOSED_END_FUND":
+        return t1 == "closed-end fund" and t2 == "mutual fund"
     if kind == "PREFERRED":
         return bool(values & {"preference", "preferred", "preferred stock"})
     if kind == "ADR":

@@ -387,3 +387,28 @@ def test_korea_yahoo_suffixes_and_venue_contracts_are_segment_specific():
     assert not yahoo_venue_compatible("XKOS", kospi)
     assert yahoo_venue_compatible("XKOS", kosdaq)
     assert not yahoo_venue_compatible("XKRX", kosdaq)
+
+
+def test_closed_end_fund_has_distinct_provider_taxonomy_contract():
+    from types import SimpleNamespace
+    from tv_market_identity.policy import openfigi_type_compatible, tv_type_kind, yahoo_type_compatible
+    row = tv(symbol="ZTR", prefix="NYSE", tv_type="fund", specs=("closedend",))
+    assert tv_type_kind(row) == "CLOSED_END_FUND"
+    assert finnhub_type_compatible(row, "Closed-End Fund")
+    assert not finnhub_type_compatible(row, "ETP")
+    assert yahoo_type_compatible(row, "EQUITY")
+    assert not yahoo_type_compatible(row, "ETF")
+    assert not yahoo_type_compatible(row, "MUTUALFUND")
+    assert openfigi_type_compatible(row, SimpleNamespace(security_type="Closed-End Fund", security_type2="Mutual Fund"))
+    assert not openfigi_type_compatible(row, SimpleNamespace(security_type="Exchange Traded Product", security_type2="Mutual Fund"))
+
+
+def test_etf_taxonomy_remains_distinct_from_closed_end_fund():
+    from tv_market_identity.policy import tv_type_kind, yahoo_type_compatible
+    row = tv(symbol="VOO", prefix="AMEX", tv_type="fund", specs=("etf",))
+    assert tv_type_kind(row) == "ETF"
+    assert finnhub_type_compatible(row, "ETP")
+    assert not finnhub_type_compatible(row, "Closed-End Fund")
+    assert yahoo_type_compatible(row, "ETF")
+    assert yahoo_type_compatible(row, "MUTUALFUND")
+    assert not yahoo_type_compatible(row, "EQUITY")
