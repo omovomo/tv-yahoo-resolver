@@ -3752,6 +3752,8 @@ def cmd_run(args) -> int:
         filter_parts.append(f"sectors={len(cfg.sectors)}")
     if cfg.primary_only:
         filter_parts.append("primaryOnly=true")
+    if cfg.tickers:
+        filter_parts.append(f"tickers={len(cfg.tickers)}")
     print("Filters: " + (", ".join(filter_parts) if filter_parts else "market only"))
     try:
         total, df = fetch_screen(cfg)

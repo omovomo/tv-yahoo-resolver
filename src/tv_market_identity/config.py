@@ -17,6 +17,7 @@ class ScreenConfig:
     min_pe: float | None
     sectors: tuple[str, ...]
     primary_only: bool
+    tickers: tuple[str, ...] = ()
     paginate: bool = False
     pagination_retries: int = 1
     pagination_overlap: int = 256
@@ -65,6 +66,14 @@ def load_screen_config(path: str | Path) -> ScreenConfig:
             raise ValueError(f"Expected {field}|above|VALUE, got {expr!r}")
         return float(parts[2])
 
+    ticker_expr = _find_filter(filters, "ticker", required=False)
+    tickers: tuple[str, ...] = ()
+    if ticker_expr is not None:
+        parts = ticker_expr.split("|", 2)
+        if len(parts) != 3 or parts[1] != "isin":
+            raise ValueError(f"Expected ticker|isin|..., got {ticker_expr!r}")
+        tickers = tuple(x.strip().upper() for x in parts[2].split(",") if x.strip())
+
     sector_expr = _find_filter(filters, "sector", required=False)
     sectors: tuple[str, ...] = ()
     if sector_expr is not None:
@@ -84,6 +93,7 @@ def load_screen_config(path: str | Path) -> ScreenConfig:
         min_pe=above_optional("price_earnings_ttm"),
         sectors=sectors,
         primary_only=_bool(tv.get("PrimaryOnly", "false")),
+        tickers=tickers,
         paginate=_bool(tv.get("Paginate", "false")),
         pagination_retries=max(0, int(tv.get("PaginationRetries", "1"))),
         pagination_overlap=max(0, int(tv.get("PaginationOverlap", "256"))),

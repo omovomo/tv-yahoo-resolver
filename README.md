@@ -1,3 +1,11 @@
+# tv-market-identity-prototype v0.4.71
+
+Tooling/config release; admission policy remains `0.4.54-policy454`. Adds an optional exact TradingView ticker filter (`ticker|isin|EXCHANGE:SYMBOL,...`) for bounded production-equivalent smoke runs through the normal `tv-market-id run` path. Existing production presets are unchanged. The full-market acquisition fix from v0.4.70 remains: the implicit tradingview-screener `filter2` stock-taxonomy gate is removed so ETF/fund/closed-end securities are not silently excluded before resolution.
+
+# tv-market-identity-prototype v0.4.70
+
+Configuration/test-only release; admission policy remains `0.4.54-policy454`. Identity-coverage presets explicitly represent the complete TradingView market security universe and therefore no longer carry the misleading legacy `AssetType = STOCKS` metadata. Acquisition remains market-scoped and type-unfiltered: stocks, funds/ETFs, REITs, units, and other TradingView security types are collected and then subjected to their normal fail-closed identity/taxonomy/provider checks. GARP presets are unchanged.
+
 # tv-market-identity-prototype v0.4.69
 
 Korea/KONEX diagnostic refinement with unchanged admission policy `0.4.54-policy454`. Korea source-segment discovery now includes `XKON`, so exact-ISIN OpenFIGI evidence can distinguish a proven KONEX source listing from a generic Korea segment miss. No Yahoo target suffix is admitted for KONEX: there is intentionally no `XKON -> .KS/.KQ/.KN` mapping, and a unique XKON source listing therefore remains fail-closed as `YAHOO_SUFFIX_UNKNOWN:XKON`. An exact-ISIN `XKOS` + `XKON` source conflict remains fail-closed as `OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:XKOS,XKON`.

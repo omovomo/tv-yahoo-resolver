@@ -133,3 +133,26 @@ def test_regional_discovery_coverage_presets(filename, market):
     assert cfg.min_avg_volume_90d is None
     assert cfg.min_pe is None
     assert cfg.sectors == ()
+
+
+def test_identity_coverage_presets_do_not_claim_stock_only_scope():
+    config_dir = Path(__file__).resolve().parents[1] / "config"
+    for cfg_path in sorted(config_dir.glob("identity_coverage_*.ini")):
+        text = cfg_path.read_text(encoding="utf-8")
+        assert "AssetType" not in text, cfg_path.name
+
+
+def test_exact_ticker_filter_is_supported(tmp_path: Path):
+    p = tmp_path / "probe.ini"
+    p.write_text("""[TradingView]
+StockFilterSchema=2
+Limit=50
+OrderBy=name
+Ascending=true
+
+[Filters]
+market=market=america
+ticker|isin=ticker|isin|AMEX:VOO,NASDAQ:VXUS,AMEX:SPY,NASDAQ:AAPL
+""", encoding="utf-8")
+    cfg = load_screen_config(p)
+    assert cfg.tickers == ("AMEX:VOO", "NASDAQ:VXUS", "AMEX:SPY", "NASDAQ:AAPL")

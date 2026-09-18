@@ -41,8 +41,18 @@ def build_query(cfg: ScreenConfig, *, offset: int = 0, page_size: int | None = N
     # adds the filter below. Existing GARP presets already replaced the
     # library default through .where(...), so this also makes market-only
     # coverage presets consistent with filtered presets.
+    # Query() is initialized from tradingview-screener STOCKS_QUERY, which
+    # carries both an is_primary filter and a hidden filter2 taxonomy gate.
+    # The latter excludes ETF/mutual/closed-end funds. Coverage presets are
+    # intentionally market-universe acquisitions, so remove that library
+    # stock-screener taxonomy gate before adding our explicit config filters.
+    query.query.pop("filter2", None)
+
     if not cfg.primary_only:
         query.query["filter"] = []
+
+    if cfg.tickers:
+        query = query.set_tickers(*cfg.tickers)
 
     conditions = []
     if cfg.min_market_cap is not None:

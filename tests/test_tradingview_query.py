@@ -25,10 +25,13 @@ def cfg(**kwargs):
     return replace(base, **kwargs)
 
 
-def test_market_only_explicitly_clears_library_primary_default(monkeypatch):
+def test_market_only_full_security_universe_has_no_implicit_type_or_primary_filter(monkeypatch):
     class FakeQuery:
         def __init__(self):
-            self.query = {"filter": [{"left": "is_primary", "operation": "equal", "right": True}]}
+            self.query = {
+                "filter": [{"left": "is_primary", "operation": "equal", "right": True}],
+                "filter2": {"operator": "and", "operands": ["library-stock-taxonomy-default"]},
+            }
         def select(self, *a): return self
         def set_markets(self, *a): return self
         def where(self, *a):
@@ -40,6 +43,7 @@ def test_market_only_explicitly_clears_library_primary_default(monkeypatch):
     monkeypatch.setattr(tv, "Query", FakeQuery)
     q = tv.build_query(cfg(primary_only=False))
     assert q.query["filter"] == []
+    assert "filter2" not in q.query
 
 
 def test_fetch_screen_is_single_request_when_pagination_disabled(monkeypatch):
@@ -363,3 +367,25 @@ def test_identifier_probe_is_exact_ticker_and_optional_fields_fail_soft(monkeypa
     assert item["field_sources"] == {"cusip": "CUSIP", "figi": "figi"}
     assert all(filters == [] for _, _, filters in seen)
     assert all(tickers == ("GETTEX:OLD",) for _, tickers, _ in seen)
+
+
+def test_exact_ticker_filter_uses_tradingview_set_tickers(monkeypatch):
+    seen = {}
+    class FakeQuery:
+        def __init__(self):
+            self.query = {
+                "filter": [{"left": "is_primary", "operation": "equal", "right": True}],
+                "filter2": {"operator": "and", "operands": ["library-stock-taxonomy-default"]},
+            }
+        def select(self, *a): return self
+        def set_markets(self, *a): return self
+        def set_tickers(self, *a): seen["tickers"] = a; return self
+        def where(self, *a): self.query["filter"] = list(a); return self
+        def order_by(self, *a, **kw): return self
+        def offset(self, *a): return self
+        def limit(self, *a): return self
+    monkeypatch.setattr(tv, "Query", FakeQuery)
+    q = tv.build_query(cfg(tickers=("AMEX:VOO", "NASDAQ:VXUS", "AMEX:SPY", "NASDAQ:AAPL")))
+    assert seen["tickers"] == ("AMEX:VOO", "NASDAQ:VXUS", "AMEX:SPY", "NASDAQ:AAPL")
+    assert q.query["filter"] == []
+    assert "filter2" not in q.query
