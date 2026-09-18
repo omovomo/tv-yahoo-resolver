@@ -1,3 +1,14 @@
+# tv-market-identity-prototype v0.4.77
+
+Architecture/tooling release; admission policy remains `0.4.57-policy457`. Adds
+the Phase A `garp-cli` mapping-contract audit and the additive Phase B Identity
+Registry schema foundation. Opening `CacheDB` now creates normalized, empty
+Registry tables beside the existing `bindings`/Finnhub cache and records Registry
+schema version `1`; no legacy binding is promoted yet, resolver reads/writes remain
+on the legacy cache, and VERIFIED/REJECTED semantics are unchanged. The migration
+is intentionally non-destructive because legacy `Binding` payloads do not persist
+the exact TradingView ISIN needed for a safe canonical-security backfill.
+
 # tv-market-identity-prototype v0.4.76
 
 Functional Germany/Xetra ETF taxonomy refinement; admission policy `0.4.57-policy457`. For TradingView `XETR` `fund/etf` rows, Yahoo `EQUITY` is accepted only when the exact `.DE` quote corroborates Xetra venue/currency and a second scoped OpenFIGI `ID_ISIN + XETR` proof returns the same non-null shareClassFIGI as the normal source listing. Ambiguous/mismatched share class, wrong venue/currency, non-XETR rows, and non-ETF rows remain fail-closed. `0.4.56-policy456` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.

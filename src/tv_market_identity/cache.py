@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import Binding
+from .registry import ensure_registry_schema, registry_counts
 
 
 SCHEMA = """
@@ -51,6 +52,7 @@ class CacheDB:
         self.conn = sqlite3.connect(self.path)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        ensure_registry_schema(self.conn)
 
     def close(self) -> None:
         self.conn.close()
@@ -169,7 +171,14 @@ class CacheDB:
         b = self.conn.execute("SELECT COUNT(*) AS n FROM bindings").fetchone()["n"]
         valid = self.conn.execute("SELECT COUNT(*) AS n FROM bindings WHERE expires_at>?", (now,)).fetchone()["n"]
         fh = self.conn.execute("SELECT COUNT(*) AS n FROM finnhub_symbols").fetchone()["n"]
-        return {"bindings": b, "valid_bindings": valid, "finnhub_symbols": fh, "finnhub_age_seconds": self.finnhub_age_seconds()}
+        out = {
+            "bindings": b,
+            "valid_bindings": valid,
+            "finnhub_symbols": fh,
+            "finnhub_age_seconds": self.finnhub_age_seconds(),
+        }
+        out.update(registry_counts(self.conn))
+        return out
 
     def clear(self) -> None:
         with self.conn:
