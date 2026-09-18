@@ -3778,3 +3778,82 @@ def test_germany_xetr_etf_yahoo_equity_rejects_wrong_yahoo_venue(tmp_path):
     assert got.rejection_reason.startswith("YAHOO_")
     assert resolver.stats["yahoo_germany_xetr_etf_equity_matches"] == 0
     db.close()
+
+
+class OFUkLseEtfEquityDiagnostic:
+    batch_size = 100
+    def __init__(self, *, scoped_ambiguous=False):
+        self.jobs = []
+        self.scoped_ambiguous = scoped_ambiguous
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        self.jobs.extend(jobs)
+        out = []
+        for job in jobs:
+            if job.get("micCode") != "XLON":
+                out.append([])
+                continue
+            if job.get("idType") == "ID_EXCH_SYMBOL" and job.get("idValue") == "NGAS":
+                out.append([])
+            elif job.get("idType") == "ID_ISIN" and job.get("idValue") == "JE00BN7KB334":
+                identities = [OpenFigiIdentity(
+                    figi="BBG_UK_XLON_ISIN", composite_figi="BBG_UK_XLON_COMP",
+                    share_class_figi="BBG_UK_SHARE", ticker="NGAS",
+                    name="WT NATURAL GAS", security_type="ETP",
+                    security_type2="Mutual Fund", exch_code="LN",
+                )]
+                if self.scoped_ambiguous:
+                    identities.append(OpenFigiIdentity(
+                        figi="BBG_UK_XLON_ALT", composite_figi="BBG_UK_XLON_ALT_COMP",
+                        share_class_figi="BBG_UK_SHARE_ALT", ticker="NGAS",
+                        name="WT NATURAL GAS", security_type="ETP",
+                        security_type2="Mutual Fund", exch_code="LN",
+                    ))
+                out.append(identities)
+            else:
+                out.append([])
+        return out
+
+
+class YHUkLseEtfEquityDiagnostic:
+    batch_size = 75
+    def quotes(self, symbols):
+        if "NGAS.L" not in symbols:
+            return {}
+        return {"NGAS.L": YahooQuote(
+            "NGAS.L", "LSE", "LSE", "USD",
+            "EQUITY", "gb_market", "WT NATURAL GAS", None, 1.0, 15,
+        )}
+
+
+def _uk_lse_etf_diagnostic_row():
+    return TvRow(
+        "LSE:NGAS", "LSE", "NGAS", "WT NATURAL GAS",
+        "USD", "fund", ("etf",), None, None, 1.0,
+        isin="JE00BN7KB334", active_symbol=True,
+    )
+
+
+def test_uk_lse_etf_equity_diagnostic_scoped_isin_is_telemetry_only(tmp_path):
+    db = CacheDB(tmp_path / "uk-lse-etf-equity-diagnostic.sqlite")
+    of = OFUkLseEtfEquityDiagnostic()
+    resolver = BatchResolver(db, None, of, YHUkLseEtfEquityDiagnostic())
+    got = resolver.resolve([_uk_lse_etf_diagnostic_row()], market="uk")["LSE:NGAS"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:EQUITY"
+    assert resolver.stats["openfigi_uk_lse_etf_equity_diagnostic_source_proven"] == 1
+    assert any(j.get("idType") == "ID_ISIN" and j.get("idValue") == "JE00BN7KB334" and j.get("micCode") == "XLON" for j in of.jobs)
+    db.close()
+
+
+def test_uk_lse_etf_equity_diagnostic_ambiguous_scoped_isin_stays_unconfirmed(tmp_path):
+    db = CacheDB(tmp_path / "uk-lse-etf-equity-diagnostic-ambiguous.sqlite")
+    resolver = BatchResolver(
+        db, None, OFUkLseEtfEquityDiagnostic(scoped_ambiguous=True),
+        YHUkLseEtfEquityDiagnostic(),
+    )
+    got = resolver.resolve([_uk_lse_etf_diagnostic_row()], market="uk")["LSE:NGAS"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:EQUITY"
+    assert resolver.stats["openfigi_uk_lse_etf_equity_diagnostic_source_unconfirmed"] == 1
+    db.close()

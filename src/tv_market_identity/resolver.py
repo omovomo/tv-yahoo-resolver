@@ -5000,6 +5000,76 @@ class BatchResolver:
                 item["mapping_method"] = "GERMANY_XETR_ISIN_YAHOO_EQUITY"
                 self.stats["openfigi_germany_xetr_etf_equity_source_proven"] += 1
 
+        # TEMPORARY DIAGNOSTIC ONLY: measure whether LSE ETF rows whose
+        # exact Yahoo .L quote is tagged EQUITY can be independently proven by
+        # OpenFIGI using the venue-scoped contract ID_ISIN + micCode=XLON.
+        # This block intentionally does NOT mutate the production item and does
+        # NOT affect admission; it only emits bounded telemetry for the probe.
+        uk_lse_etf_equity_items: list[dict] = []
+        uk_lse_etf_equity_jobs: list[dict] = []
+        for item in pending:
+            r = item["row"]
+            ys = item["yahoo_symbol"]
+            q0 = yahoo_quotes.get(ys)
+            cq0 = chart_quotes.get(ys)
+            q_candidate = q0 if (
+                q0 is not None
+                and q0.symbol == ys
+                and (q0.quote_type or "").upper() == "EQUITY"
+                and q0.currency is not None
+                and currency_compatible(r.currency, q0.currency)
+                and yahoo_venue_compatible("XLON", q0)
+            ) else cq0 if (
+                cq0 is not None
+                and cq0.symbol == ys
+                and (cq0.quote_type or "").upper() == "EQUITY"
+                and cq0.currency is not None
+                and currency_compatible(r.currency, cq0.currency)
+                and yahoo_venue_compatible("XLON", cq0)
+            ) else None
+            if not (
+                r.prefix == "LSE"
+                and item.get("target_mic") == "XLON"
+                and tv_type_kind(r) == "ETF"
+                and "etf" in {str(x).lower() for x in r.type_specs if x}
+                and r.isin
+                and q_candidate is not None
+            ):
+                continue
+            uk_lse_etf_equity_items.append(item)
+            uk_lse_etf_equity_jobs.append({
+                "idType": "ID_ISIN",
+                "idValue": r.isin,
+                "micCode": "XLON",
+            })
+
+        if uk_lse_etf_equity_jobs:
+            try:
+                uk_lse_scoped = self.openfigi.map_jobs(uk_lse_etf_equity_jobs)
+                self.stats["openfigi_uk_lse_etf_equity_diagnostic_jobs"] += len(uk_lse_etf_equity_jobs)
+                self.stats["openfigi_jobs"] += len(uk_lse_etf_equity_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(uk_lse_etf_equity_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError:
+                uk_lse_scoped = [[] for _ in uk_lse_etf_equity_jobs]
+                self.stats["openfigi_uk_lse_etf_equity_diagnostic_unavailable"] += len(uk_lse_etf_equity_jobs)
+            for item, identities in zip(uk_lse_etf_equity_items, uk_lse_scoped):
+                r = item["row"]
+                exact = [
+                    x for x in identities
+                    if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                    and openfigi_type_compatible(r, x)
+                    and bool(x.figi)
+                    and bool(x.share_class_figi)
+                ]
+                figis = {x.figi for x in exact if x.figi}
+                shares = {x.share_class_figi for x in exact if x.share_class_figi}
+                if len(figis) == 1 and len(shares) == 1:
+                    self.stats["openfigi_uk_lse_etf_equity_diagnostic_source_proven"] += 1
+                else:
+                    self.stats["openfigi_uk_lse_etf_equity_diagnostic_source_unconfirmed"] += 1
+
         # Bounded Yahoo alternatives. LSIN may use .IL or .L, but an ADR may
         # try .L only when OpenFIGI already supplied independent identity/venue
         # evidence; Yahoo-only fallback cannot distinguish XLON from XLOM. A
