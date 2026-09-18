@@ -37,6 +37,95 @@
 Не смешивать эти категории.
 
 ======================================================================
+0A. MANDATORY PRE-FLIGHT --- ПРОВЕРЯТЬ ПЕРЕД КАЖДЫМ ДЕЙСТВИЕМ
+======================================================================
+
+Этот блок --- operational gate. Он не заменяет подробные правила ниже,
+а заставляет проверить их до создания patch/probe, изменения source,
+запуска tests или выдачи пользователю команд. Convenience не является
+основанием обходить этот gate.
+
+Перед КАЖДЫМ repository/source action проверить:
+
+1. SOURCE BASELINE
+
+- current committed Git HEAD пользователя --- source of truth;
+- если в сессии передан `git archive HEAD`, именно он является current
+  source baseline;
+- не реконструировать source из памяти и не overlay-ить snapshots.
+
+2. PATCH-ONLY ДЛЯ REPOSITORY CHANGES
+
+- любое добавление/изменение/удаление файла ВНУТРИ repository, которое
+  должен выполнить пользователь, передавать Git patch;
+- не просить пользователя вручную создавать, копировать, вставлять или
+  редактировать repository files;
+- permanent patch и temporary diagnostic patch до передачи обязательно
+  проверять через `git apply --check` против current session baseline;
+- temporary repository patch должен иметь явный rollback через
+  `git apply -R`, когда experiment завершён.
+
+3. ARTIFACT LOCATION CONTRACT
+
+Разделять три разных класса artifacts:
+
+- `$HOME\Downloads\` --- доставляемые ассистентом внешние artifacts:
+  `.patch`, standalone probe/config, которые НЕ являются repository files;
+- `./out/` --- ВСЕ generated runtime/diagnostic outputs: JSON, JSONL, CSV,
+  logs, reports, dumps, probe results, intermediate generated data;
+- repository tree --- только tracked project source/tests/config/docs и
+  временные files, добавленные ИСКЛЮЧИТЕЛЬНО temporary Git patch.
+
+Generated runtime output НЕ писать в Git root. Probe/tool должен сам
+создать `./out/`, если directory отсутствует.
+
+4. TEMPORARY PROBE DECISION
+
+- если probe полностью standalone и не требует появления файла внутри
+  repository, допустим downloadable artifact в `$HOME\Downloads\`;
+- если probe добавляет/меняет repository file или является частью
+  project source/test surface, использовать temporary Git patch;
+- temporary patch не превращается в permanent source автоматически;
+- после evidence collection сначала удалить temporary patch, затем при
+  необходимости создавать отдельный permanent implementation patch.
+
+5. TEST / PROVIDER COST
+
+- iteration: targeted tests;
+- assistant выполняет local tests сам;
+- перед permanent functional patch: targeted positive + adversarial
+  tests → один full pytest → compileall → diff/repository hygiene review
+  → patch check;
+- новый/изменённый provider contract: bounded REAL-provider smoke до
+  full-universe production;
+- не использовать full universe как probe, если достаточно representative
+  cohort.
+
+6. FAIL-CLOSED ADMISSION
+
+- не превращать REJECTED в VERIFIED ради coverage;
+- security identity, source listing identity и target-provider listing
+  identity --- отдельные claims;
+- новый rescue требует generic + deterministic + independently evidenced
+  contract и adversarial negative boundary.
+
+7. BEFORE SENDING USER COMMANDS
+
+Проверить checklist:
+
+- [ ] repository change доставляется patch, а не manual edit;
+- [ ] patch проверен против current baseline;
+- [ ] generated outputs направлены в `./out/`;
+- [ ] temporary patch имеет rollback;
+- [ ] probe/smoke bounded;
+- [ ] full-universe run не предложен преждевременно;
+- [ ] команды валидны для PowerShell 7;
+- [ ] запрашивается только минимально необходимый feedback.
+
+Если любой пункт не выполнен --- сначала исправить workflow, затем
+отвечать пользователю.
+
+======================================================================
 0. СРЕДА ПОЛЬЗОВАТЕЛЯ =====================
 
 Среда:
@@ -1850,9 +1939,10 @@ rejection reason movement
 
 14. проверить отсутствие generated/stale artifacts;
 
-15. создать Git patch;
+15. создать Git patch; любые repository changes, включая temporary
+    probe files, передавать patch, а не manual file copy/edit;
 
-16. `git apply --check`;
+16. `git apply --check` против current session baseline;
 
 17. вернуть patch + changelog + commit message;
 
@@ -1910,28 +2000,34 @@ rejection reason movement
 
 -   считать universe drift resolver regression;
 
--   считать отсутствие metadata positive evidence.
+-   считать отсутствие metadata positive evidence;
+
+-   просить пользователя вручную создавать/копировать/редактировать
+    repository files вместо Git patch;
+
+-   писать generated probe/diagnostic output в Git root вместо `./out/`.
 
 ======================================================================
 74A. TEMPORARY DIAGNOSTIC ARTIFACT WORKFLOW
 ===========================================
 
-Временные probe scripts/configs/diagnostic patches не должны загрязнять
-permanent Git repository.
+Временные probes не должны загрязнять permanent Git repository.
 
-Если пользователю нужен temporary probe:
+Сначала определить тип temporary artifact.
 
-ASSISTANT должен по возможности создать готовый downloadable artifact, а
-не заставлять пользователя вручную копировать большой Python/script
-block из чата.
+A. STANDALONE EXTERNAL ARTIFACT
 
-Пользователь сохраняет downloaded temporary artifact в:
+Если probe/config может жить вне repository и не требует добавления или
+изменения repository file, ASSISTANT по возможности создаёт готовый
+downloadable artifact вместо большого manual copy/paste block.
+
+Пользователь сохраняет такой artifact в:
 
 `$HOME\Downloads\`
 
-Если probe должен использовать project environment, `.env`, editable
-package или current source, пользователь запускает его ИЗ Git root, но
-сам artifact остаётся в Downloads.
+Он может запускаться ИЗ Git root, чтобы использовать project environment,
+`.env`, editable package или current source, но сам artifact остаётся вне
+repository.
 
 Пример:
 
@@ -1939,7 +2035,65 @@ package или current source, пользователь запускает ег�
 python "$HOME\Downloads\probe-korea-openfigi.py"
 ```
 
-Если нужен temporary config:
+B. REPOSITORY-COUPLED TEMPORARY PROBE
+
+Если experiment требует появления нового файла В repository, изменения
+source/tests/config/docs или иного repository-tree change, это repository
+change и он ДОЛЖЕН передаваться temporary Git patch. Не просить manual
+copy/create/edit такого файла.
+
+Применение:
+
+``` powershell
+git status
+git apply --check "$HOME\Downloads\<temporary-probe>.patch"
+git apply "$HOME\Downloads\<temporary-probe>.patch"
+```
+
+ASSISTANT до передачи обязан проверить этот temporary patch через
+`git apply --check` против current session baseline.
+
+После evidence collection и до permanent implementation, если temporary
+patch больше не нужен:
+
+``` powershell
+git status
+git apply -R "$HOME\Downloads\<temporary-probe>.patch"
+git status
+```
+
+Перед reverse apply проверить рабочее дерево и не уничтожать unrelated
+user changes. Если probe создал ignored runtime outputs, reverse apply их
+не удаляет; они должны находиться в `./out/`.
+
+C. GENERATED OUTPUT CONTRACT
+
+Все runtime/diagnostic outputs независимо от способа доставки probe
+записывать под:
+
+`./out/`
+
+Это относится, в частности, к:
+
+-   JSON / JSONL;
+-   CSV;
+-   logs;
+-   reports;
+-   dumps;
+-   probe result files;
+-   intermediate generated data.
+
+Generated output не писать в Git root. Probe должен создавать `./out/`
+автоматически, если directory отсутствует.
+
+`$HOME\Downloads\` и `./out/` имеют разные роли:
+
+-   Downloads = artifact, ДОСТАВЛЕННЫЙ ассистентом пользователю;
+-   out = artifact, СГЕНЕРИРОВАННЫЙ запуском проекта/probe.
+
+Не смешивать эти назначения.
+
+Пример temporary config + project-generated outputs:
 
 ``` powershell
 tv-market-id `
@@ -1949,25 +2103,6 @@ tv-market-id `
   --output .\out\identity_coverage_korea_smoke.csv `
   --rejection-audit .\out\identity_coverage_korea_smoke_rejections.jsonl
 ```
-
-Если diagnostic experiment требует временного source change,
-предпочтителен temporary Git patch.
-
-Применение:
-
-``` powershell
-git apply --check "$HOME\Downloads\<temporary-probe>.patch"
-git apply "$HOME\Downloads\<temporary-probe>.patch"
-```
-
-После эксперимента, если patch не должен остаться:
-
-``` powershell
-git apply -R "$HOME\Downloads\<temporary-probe>.patch"
-```
-
-Перед reverse apply проверить рабочее дерево и не уничтожать unrelated
-user changes.
 
 Temporary artifact не становится permanent project source автоматически.
 
@@ -2605,7 +2740,20 @@ git archive HEAD
 
 42. Все user commands должны быть `pwsh`.
 
-43. Первый ответ нового чата должен быть operational:
+43. Любой user-applied repository change --- permanent или temporary ---
+    передавать Git patch; manual repository file editing/copying не является
+    normal workflow.
+
+44. `$HOME\Downloads\` используется для delivered artifacts; `./out/` ---
+    для generated runtime/diagnostic outputs. Generated outputs не писать
+    в Git root.
+
+45. Repository-coupled temporary probe передавать reversible Git patch;
+    standalone external probe может оставаться в Downloads.
+
+46. Перед выдачей user commands проходить §0A pre-flight checklist.
+
+47. Первый ответ нового чата должен быть operational:
 
 INPUTS / BASELINE → PROCESS → PWSH COMMANDS → ONE NEXT STEP.
 
