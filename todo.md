@@ -20,15 +20,15 @@
 
 ## Closed / waiting for new evidence
 
-Исследованные рынки:
+Исследованные рынки (production baselines от 2026-09-18; provider universe может дрейфовать):
 
-- **US / America** — CLOSED / WAITING FOR NEW EVIDENCE; основные residual cohorts и generic rescue hypotheses уже исследованы, повторять закрытые US cohorts без нового independent evidence не нужно.
-- **Germany** — CLOSED / WAITING FOR NEW EVIDENCE; regional/home-market routing, exact-ISIN bridges и связанные venue/provider edge cases уже проходили отдельные evidence-gated исследования.
-- **UK** — CLOSED / WAITING FOR NEW EVIDENCE; LSE/LSIN/AQSE/IOB, DR, currency, Yahoo taxonomy/venue и связанные ambiguity cases уже исследованы.
-- **Switzerland** — CLOSED / WAITING FOR NEW EVIDENCE; SIX/BX Swiss secondary-listing и primary-listing coverage paths уже исследованы.
-- **Korea** — CLOSED / WAITING FOR NEW EVIDENCE; последний закрытый residual — KONEX/XKON, подробности ниже.
+- **US / America** — CLOSED / WAITING FOR NEW EVIDENCE. Full universe: `19942`; `19142 VERIFIED`, `800 REJECTED`; verified subtypes included `5564 ETP` and `380 Closed-End Fund`. Residual Yahoo/Finnhub taxonomy, venue, currency and missing-listing cohorts уже исследованы; не открывать их заново без нового independent evidence.
+- **Germany** — CLOSED / WAITING FOR NEW EVIDENCE. Full universe после policy `0.4.57-policy457`: `37233`; `36964 VERIFIED`, `269 REJECTED`. Для исходного 409-row `XETR fund/etf + Yahoo EQUITY` cohort scoped `ID_ISIN + XETR` доказал source listing для `395`, и ровно эти `395` были safely rescued; оставшиеся `14` source-unconfirmed строк остались `YAHOO_TYPE_MISMATCH:EQUITY`. Не расширять XETR rule без нового evidence.
+- **UK** — CLOSED / WAITING FOR NEW EVIDENCE. Full universe: `9456`; `9152 VERIFIED`, `304 REJECTED`. Coverage config теперь использует `Limit = 10000` и `RequireCompleteUniverse = true`. Fresh-cache bounded diagnostic для LSE ETF Yahoo-`EQUITY` cohort дал `0/6` scoped `ID_ISIN + XLON` source proofs; Germany/XETR rule на UK не переносить.
+- **Switzerland** — CLOSED / WAITING FOR NEW EVIDENCE. Full universe: `3379`; `1836 VERIFIED`, `1543 REJECTED`. Основной residual — Yahoo listing-route coverage: `1255 YAHOO_NO_MATCH` и `234 YAHOO_SUFFIX_UNKNOWN:XBRN`. Fresh-cache BX probe подтвердил XBRN source identities при отсутствии reviewed Yahoo BX route; cross-venue SIX/Germany/London candidates не являются source-listing proof.
+- **Korea** — CLOSED / WAITING FOR NEW EVIDENCE. Full universe: `4312`; `4203 VERIFIED`, `109 REJECTED`. Из них `90 YAHOO_SUFFIX_UNKNOWN:XKON`; fresh-cache probe однозначно доказал `6 XKON`, `1 XKOS`, `1 XKRX`, при этом Yahoo route существовал только для KOSDAQ/KOSPI controls. KONEX/XKON считать provider-coverage limitation до нового independent Yahoo/listing evidence.
 
-Не считать наличие residual REJECTED само по себе основанием для повторного market research. Возвращаться к закрытому рынку только при новом generic provider evidence, новом reproducible regression или существенном изменении provider contract.
+Не считать наличие residual REJECTED само по себе основанием для повторного market research. Возвращаться к закрытому рынку только при новом generic provider evidence, новом reproducible regression или существенном изменении provider contract. Перед сравнением counts всегда сначала учитывать universe drift.
 
 
 ## Architecture bookmarks

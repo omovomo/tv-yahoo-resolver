@@ -111,19 +111,19 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    ("filename", "market"),
+    ("filename", "market", "limit"),
     [
-        ("identity_coverage_ireland.ini", "ireland"),
-        ("identity_coverage_hongkong.ini", "hongkong"),
-        ("identity_coverage_japan.ini", "japan"),
-        ("identity_coverage_korea.ini", "korea"),
+        ("identity_coverage_ireland.ini", "ireland", 4000),
+        ("identity_coverage_hongkong.ini", "hongkong", 4000),
+        ("identity_coverage_japan.ini", "japan", 4000),
+        ("identity_coverage_korea.ini", "korea", 10000),
     ],
 )
-def test_regional_discovery_coverage_presets(filename, market):
+def test_regional_discovery_coverage_presets(filename, market, limit):
     cfg_path = Path(__file__).resolve().parents[1] / "config" / filename
     cfg = load_screen_config(cfg_path)
     assert cfg.market == market
-    assert cfg.limit == 4000
+    assert cfg.limit == limit
     assert cfg.order_by == "market_cap_basic"
     assert cfg.ascending is False
     assert cfg.primary_only is False

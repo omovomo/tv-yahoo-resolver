@@ -2,6 +2,38 @@
 
 Functional Germany/Xetra ETF taxonomy refinement; admission policy `0.4.57-policy457`. For TradingView `XETR` `fund/etf` rows, Yahoo `EQUITY` is accepted only when the exact `.DE` quote corroborates Xetra venue/currency and a second scoped OpenFIGI `ID_ISIN + XETR` proof returns the same non-null shareClassFIGI as the normal source listing. Ambiguous/mismatched share class, wrong venue/currency, non-XETR rows, and non-ETF rows remain fail-closed. `0.4.56-policy456` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
 
+## Current full-universe validation baselines (2026-09-18)
+
+These are production validation snapshots, not hard-coded expectations. Provider
+universes can drift; compare future runs by universe delta before attributing
+count changes to resolver behavior.
+
+| Market | Universe | VERIFIED | REJECTED | Current disposition |
+| --- | ---: | ---: | ---: | --- |
+| US | 19,942 | 19,142 | 800 | Closed / wait for new provider evidence |
+| Germany | 37,233 | 36,964 | 269 | Closed; Xetra ETF Yahoo-`EQUITY` rule validated under policy457 |
+| UK | 9,456 | 9,152 | 304 | Closed; no XLON-scoped source proof for audited Yahoo-`EQUITY` ETF cohort |
+| Switzerland | 3,379 | 1,836 | 1,543 | Closed; BX/XBRN residual is primarily Yahoo listing-route coverage |
+| Korea | 4,312 | 4,203 | 109 | Closed; KONEX/XKON residual is a Yahoo route coverage limitation |
+
+Germany policy457 re-evaluated the 409-row Xetra `fund/etf` + Yahoo `EQUITY`
+cohort. Current provider evidence proved 395 exact `ID_ISIN + XETR` source
+listings and all 395 were admitted; the remaining 14 source-unconfirmed rows
+stayed rejected. The full-universe movement was internally consistent: universe
+`37,217 -> 37,233`, VERIFIED `36,553 -> 36,964`, and REJECTED `664 -> 269`.
+
+UK full-universe acquisition now uses `Limit = 10000` with
+`RequireCompleteUniverse = true`. A bounded fresh-cache diagnostic over LSE ETF
+rows found `0/6` scoped `ID_ISIN + XLON` source proofs, so the large
+`YAHOO_TYPE_MISMATCH:EQUITY` cohort remains fail-closed rather than inheriting
+the Germany rule.
+
+Switzerland BX/XBRN and Korea KONEX/XKON bounded fresh-cache probes confirmed
+that source/listing identity can be known while no reviewed Yahoo route exists
+for the source venue. Cross-venue Yahoo candidates are not treated as source
+listing proof. Re-open these cohorts only when new independent provider evidence
+or a reproducible provider-contract change appears.
+
 # tv-market-identity-prototype v0.4.71
 
 Tooling/config release; admission policy remains `0.4.54-policy454`. Adds an optional exact TradingView ticker filter (`ticker|isin|EXCHANGE:SYMBOL,...`) for bounded production-equivalent smoke runs through the normal `tv-market-id run` path. Existing production presets are unchanged. The full-market acquisition fix from v0.4.70 remains: the implicit tradingview-screener `filter2` stock-taxonomy gate is removed so ETF/fund/closed-end securities are not silently excluded before resolution.
