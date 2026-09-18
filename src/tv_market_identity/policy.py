@@ -3,7 +3,7 @@ from __future__ import annotations
 from .models import FinnhubIdentity, TvRow, YahooQuote
 
 
-RESOLVER_VERSION = "0.4.55-policy455"
+RESOLVER_VERSION = "0.4.56-policy456"
 
 # Direct mappings are used only when TradingView's prefix semantics are clear.
 TV_PREFIX_TO_MIC = {
@@ -377,7 +377,10 @@ def yahoo_type_compatible(row: TvRow, quote_type: str | None) -> bool:
     if kind == "ETF":
         return q in {"ETF", "MUTUALFUND"}
     if kind == "CLOSED_END_FUND":
-        return q == "EQUITY"
+        # Yahoo may expose exchange-listed closed-end funds as either EQUITY
+        # or ETF. Taxonomy compatibility does not relax symbol, currency,
+        # venue, source-listing, or ambiguity checks elsewhere in the resolver.
+        return q in {"EQUITY", "ETF"}
     return q == "EQUITY"
 
 

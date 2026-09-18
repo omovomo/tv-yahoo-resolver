@@ -1,3 +1,3 @@
 """Single source of truth for release versions expected by the test suite."""
-CURRENT_PACKAGE_VERSION = "0.4.72"
-CURRENT_RESOLVER_VERSION = "0.4.55-policy455"
+CURRENT_PACKAGE_VERSION = "0.4.73"
+CURRENT_RESOLVER_VERSION = "0.4.56-policy456"

@@ -1,6 +1,6 @@
-# tv-market-identity-prototype v0.4.72
+# tv-market-identity-prototype v0.4.73
 
-Functional taxonomy release; admission policy `0.4.55-policy455`. TradingView `type=fund` + `typespecs=[closedend]` is now a distinct CLOSED_END_FUND identity class instead of being conflated with ETF. The generic provider contract is fail-closed: Finnhub must report `Closed-End Fund`, OpenFIGI compatibility requires the exact `Closed-End Fund / Mutual Fund` pair when OpenFIGI is used, and Yahoo must report `EQUITY` while normal symbol, currency, venue, and ambiguity checks remain unchanged. ETF (`typespecs=[etf]`) and legacy stock/common Closed-End Fund rescue paths are unchanged. `0.4.54-policy454` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
+Functional taxonomy refinement; admission policy `0.4.56-policy456`. CLOSED_END_FUND keeps its strict TradingView/Finnhub/OpenFIGI taxonomy but now accepts Yahoo `ETF` as well as `EQUITY` because real same-venue CEF listings can be reported with either quote type. This is taxonomy-only compatibility: symbol, currency, venue, source-listing proof, and ambiguity checks remain unchanged, so OTC/wrong-venue near misses stay fail-closed. `0.4.55-policy455` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
 
 # tv-market-identity-prototype v0.4.71
 

@@ -397,11 +397,22 @@ def test_closed_end_fund_has_distinct_provider_taxonomy_contract():
     assert finnhub_type_compatible(row, "Closed-End Fund")
     assert not finnhub_type_compatible(row, "ETP")
     assert yahoo_type_compatible(row, "EQUITY")
-    assert not yahoo_type_compatible(row, "ETF")
+    assert yahoo_type_compatible(row, "ETF")
     assert not yahoo_type_compatible(row, "MUTUALFUND")
     assert openfigi_type_compatible(row, SimpleNamespace(security_type="Closed-End Fund", security_type2="Mutual Fund"))
     assert not openfigi_type_compatible(row, SimpleNamespace(security_type="Exchange Traded Product", security_type2="Mutual Fund"))
 
+
+
+def test_closed_end_fund_yahoo_etf_alias_does_not_relax_venue_boundary():
+    from tv_market_identity.policy import yahoo_type_compatible, yahoo_venue_compatible
+    row = tv(symbol="SWZ", prefix="NYSE", tv_type="fund", specs=("closedend",))
+    same_venue = YahooQuote("SWZ", "NYQ", "NYSE", "USD", "ETF", "us_market", None, None, 1.0, 0)
+    wrong_venue = YahooQuote("SWZ", "OQX", "OTC Markets OTCQX", "USD", "ETF", "us_market", None, None, 1.0, 15)
+    assert yahoo_type_compatible(row, same_venue.quote_type)
+    assert yahoo_venue_compatible("XNYS", same_venue)
+    assert yahoo_type_compatible(row, wrong_venue.quote_type)
+    assert not yahoo_venue_compatible("XNYS", wrong_venue)
 
 def test_etf_taxonomy_remains_distinct_from_closed_end_fund():
     from tv_market_identity.policy import tv_type_kind, yahoo_type_compatible
