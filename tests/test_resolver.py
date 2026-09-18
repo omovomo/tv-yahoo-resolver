@@ -3630,3 +3630,51 @@ def test_korea_ambiguous_exact_isin_requires_same_non_null_share_class(tmp_path)
     assert got.status == "REJECTED"
     assert r.stats["korea_krx_segment_ambiguity_yahoo_resolved"] == 0
     db.close()
+
+
+class YHCachedCefRuntime:
+    batch_size = 75
+    def __init__(self, quote_type):
+        self.quote_type = quote_type
+    def quotes(self, symbols):
+        if "FSSL" not in symbols:
+            return {}
+        return {"FSSL": YahooQuote(
+            "FSSL", "NYQ", "NYSE", "USD", self.quote_type,
+            "us_market", "FS Specialty Lending Fund", None, 11.94, 0,
+        )}
+
+
+def _cached_cef_binding():
+    return Binding(
+        tv_id="NYSE:FSSL", tv_symbol="FSSL", tv_prefix="NYSE",
+        tv_currency="USD", tv_type="fund", status="VERIFIED",
+        yahoo_symbol="FSSL", yahoo_exchange="NYQ", yahoo_market="us_market",
+        yahoo_quote_type="EQUITY", yahoo_currency="USD", yahoo_price=11.94,
+        quote_status="FRESH", resolved_mic="XNYS", source_mic="XNYS",
+        target_mic="XNYS", mapping_method="SAME_VENUE",
+        finnhub_symbol="FSSL", finnhub_type="Closed-End Fund",
+        resolver_version="0.4.56-policy456", cache_hit=True,
+    )
+
+
+@pytest.mark.parametrize("runtime_type", ["EQUITY", "ETF"])
+def test_closed_end_fund_warm_cache_refresh_accepts_policy456_yahoo_types(tmp_path, runtime_type):
+    db = CacheDB(tmp_path / f"cef-runtime-{runtime_type}.sqlite")
+    resolver = BatchResolver(db, None, OF(), YHCachedCefRuntime(runtime_type))
+    binding = _cached_cef_binding()
+    resolver.refresh_cached_quotes({binding.tv_id: binding})
+    assert binding.status == "VERIFIED"
+    assert binding.yahoo_quote_type == runtime_type
+    assert binding.quote_status == "FRESH"
+    db.close()
+
+
+def test_closed_end_fund_warm_cache_refresh_rejects_incompatible_yahoo_type(tmp_path):
+    db = CacheDB(tmp_path / "cef-runtime-mutualfund.sqlite")
+    resolver = BatchResolver(db, None, OF(), YHCachedCefRuntime("MUTUALFUND"))
+    binding = _cached_cef_binding()
+    resolver.refresh_cached_quotes({binding.tv_id: binding})
+    assert binding.status == "REJECTED"
+    assert binding.rejection_reason == "YAHOO_RUNTIME_MISMATCH:NYQ/USD/MUTUALFUND"
+    db.close()

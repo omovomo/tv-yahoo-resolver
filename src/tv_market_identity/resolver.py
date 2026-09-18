@@ -6262,6 +6262,18 @@ class BatchResolver:
                 # taxonomy anomaly, whose stronger OpenFIGI proof was checked
                 # before the binding entered the cache.
                 type_ok = True
+            elif b.yahoo_quote_type and quote_type == (b.yahoo_quote_type or "").upper():
+                # A warm-cache refresh must not invalidate a VERIFIED binding
+                # merely because the legacy cache validator has a coarser
+                # taxonomy table than the cold admission path.  The exact
+                # cached Yahoo type was already admitted under the binding's
+                # resolver policy, so an unchanged live type remains valid.
+                type_ok = True
+            elif (b.tv_type or "").lower() == "fund" and (b.finnhub_type or "").lower() == "closed-end fund":
+                # CLOSED_END_FUND is represented by Yahoo as either EQUITY or
+                # ETF.  Keep warm-cache validation aligned with
+                # yahoo_type_compatible() without weakening venue/currency.
+                type_ok = quote_type in {"EQUITY", "ETF"}
             else:
                 type_ok = ((b.tv_type or "").lower() == "fund" and quote_type in {"ETF", "MUTUALFUND"}) or \
                           ((b.tv_type or "").lower() != "fund" and quote_type == "EQUITY")

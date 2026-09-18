@@ -1,4 +1,4 @@
-# tv-market-identity-prototype v0.4.73
+# tv-market-identity-prototype v0.4.74
 
 Functional taxonomy refinement; admission policy `0.4.56-policy456`. CLOSED_END_FUND keeps its strict TradingView/Finnhub/OpenFIGI taxonomy but now accepts Yahoo `ETF` as well as `EQUITY` because real same-venue CEF listings can be reported with either quote type. This is taxonomy-only compatibility: symbol, currency, venue, source-listing proof, and ambiguity checks remain unchanged, so OTC/wrong-venue near misses stay fail-closed. `0.4.55-policy455` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
 
