@@ -1,3 +1,19 @@
+# tv-market-identity-prototype v0.4.78
+
+Architecture/performance release; admission policy remains `0.4.57-policy457`.
+Adds the first operational Registry path for `TV -> Yahoo`: freshly resolved
+VERIFIED `TvRow + Binding` pairs are written through into the normalized Registry,
+and compatible warm lookups are served from indexed Registry edges before the
+legacy JSON binding cache. Reuse is fail-closed on source fingerprint, resolver
+policy, lifecycle/ambiguity and the existing identity revalidation horizon; Yahoo
+quote freshness remains separate. Existing legacy bindings are deliberately not
+blindly promoted because they do not persist the source snapshot needed to prove
+that an old binding belongs to the current TV ISIN/type-spec state. Runtime Yahoo
+metadata contradictions deactivate the Registry edge as well as the legacy
+binding; a fresh non-transient cold-resolution REJECTED also deactivates any older
+Registry VERIFIED edge, while transient provider failures do not. Schema remains
+version `1`; VERIFIED/REJECTED admission and provider request contracts are unchanged.
+
 # tv-market-identity-prototype v0.4.77
 
 Architecture/tooling release; admission policy remains `0.4.57-policy457`. Adds

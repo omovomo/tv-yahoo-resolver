@@ -61,31 +61,42 @@ identifiers из import layer и определить минимальный д�
 
 ## Active architecture / product plan
 
-Главная следующая architecture phase --- **Identity Registry + garp-cli mapping
-contract**. Она имеет более высокий приоритет, чем дальнейшее уменьшение
-residual market-level REJECTED без нового evidence.
+Current standalone implementation state after package `0.4.78`
+(`0.4.57-policy457`, admission unchanged):
 
-Порядок работ:
+- **Phase A / contract audit — COMPLETE for this project**: documented product
+  objective, authority boundaries, TV/IBKR input semantics, mapping-result
+  semantics and batch telemetry. Concrete `garp-cli` adapter inspection remains
+  pending because its source is not in the current archive.
+- **Phase B / schema foundation — COMPLETE**: additive normalized Registry schema
+  v1 exists beside legacy `bindings`; legacy cache is preserved and is not
+  blindly promoted.
+- **Phase C / TV->Yahoo Registry core — CORE COMPLETE**: freshly resolved VERIFIED
+  bindings write through to Registry; warm compatible mappings are read from
+  indexed Registry edges before legacy JSON cache; source fingerprint, policy,
+  lifecycle, ambiguity and revalidation horizon are checked fail-closed; fresh
+  non-transient REJECTED/runtime contradiction deactivates stale Registry edges.
+- Public product-facing mapping DTO/service boundary is **not yet implemented**.
+- IBKR Registry ingest/reconciliation is **not yet implemented**.
 
-1. зафиксировать product mapping contracts и authority boundaries для
-   `TV -> Yahoo`, `IBKR -> Yahoo`, `IBKR <-> TV`;
-2. спроектировать persistent Identity Registry, отделяющий stable security
-   identity от listing/provider lifecycle;
-3. сделать batch-first lookup API/indexes для hot paths `garp-cli`;
-4. перенести текущие verified TV->Yahoo bindings в Registry/write-through model
-   без ухудшения fail-closed admission;
-5. добавить IBKR-side identity input (`conid`/ISIN/symbol + доступный context) и
-   deterministic reconciliation;
-6. измерить cold/warm mapping latency, cache/registry hit rate и число реально
-   выполненных provider calls; только после measurements задавать performance
-   targets/TTL;
-7. после стабилизации standalone contract интегрировать его в `garp-cli`
-   Screen/Portfolio/TLH boundaries и добавить cross-project integration tests.
+Следующий приоритет работ:
 
-Actual `garp-cli` source не входит в текущий archive, поэтому concrete adapter/API
-integration должна проектироваться по его фактическому source, когда он будет
-предоставлен. До этого здесь фиксируется contract, а не выдумывается реализация
-чужого project tree.
+1. получить и inspect relevant actual `garp-cli` source для Screen/Portfolio/TLH,
+   чтобы не выдумывать adapter contract;
+2. на основе уже реализованного Registry core добавить versioned batch-first
+   application API для `TV -> Yahoo`, который не exposes mutable internal
+   `Binding` и runtime Yahoo price;
+3. подтвердить API на realistic `garp-cli` TV batches и mixed hit/miss tails,
+   измеряя latency, Registry hit rate и provider calls avoided;
+4. **Phase D**: добавить IBKR identity ingest (`conid`/ISIN/symbol + доступный
+   import context), затем deterministic `IBKR -> Yahoo` и `IBKR -> TV`;
+5. **Phase E**: интегрировать bulk mapping boundary в `garp-cli` Screen и
+   Portfolio/TLH с cross-project tests;
+6. **Phase F**: lifecycle/performance hardening --- corporate actions, ticker/venue
+   migration, invalidation/reverification, concurrency/locking и schema migrations.
+
+Residual market-level REJECTED остаются вторичным приоритетом и открываются только
+при новом generic evidence/regression, а не ради уменьшения counts.
 
 ## Active research
 
@@ -109,12 +120,13 @@ integration должна проектироваться по его фактич
 49. ARCHITECTURE PRIORITY --- IDENTITY REGISTRY
 ==============================================
 
-Identity Registry теперь является основной planned architecture phase проекта,
-потому что directly обслуживает product goal `TV <-> Yahoo <-> IBKR` в
-`garp-cli`.
+Identity Registry является основной architecture line проекта, потому что directly
+обслуживает product goal `TV <-> Yahoo <-> IBKR` в `garp-cli`.
 
-Это всё ещё НЕ implemented production policy и не должно внедряться побочно в
-маленький rejection cleanup/rescue patch.
+После package `0.4.78` Registry уже не только bookmark: schema-v1 foundation и
+первый operational `TV -> Yahoo` read/write core реализованы. Это по-прежнему не
+означает, что IBKR/public `garp-cli` integration уже существует, и Registry work
+не должна смешиваться с unrelated rejection cleanup/rescue patch.
 
 Registry должен разделять минимум три разных claims:
 
@@ -162,53 +174,34 @@ identifiers, provenance/evidence, policy compatibility и lifecycle state.
 `garp-cli` source.
 
 ======================================================================
-51. IDENTITY REGISTRY --- SCHEMA CANDIDATES
-==========================================
+51. IDENTITY REGISTRY --- SCHEMA / CURRENT STATE
+==============================================
 
-Schema должна быть normalized around identity/evidence, а не одним JSON blob с
-единственным `tv_id` primary key. Возможные logical groups:
+Schema v1 реализована additively и хранится рядом с legacy cache:
 
-SECURITY
+- `registry_securities`;
+- `registry_security_identifiers`;
+- `registry_listings`;
+- `registry_provider_identifiers`;
+- `registry_mappings`;
+- `meta.identity_registry_schema_version = 1`.
 
-- canonical security record/internal id;
-- ISIN;
-- composite/share-class identifiers, где они доказаны и полезны.
+Текущий `TV -> Yahoo` write-through создаёт canonical security только при наличии
+сильного anchor из current resolution (`TV ISIN` и/или VERIFIED
+`shareClassFIGI`). Security/listing/provider-symbol identity остаются раздельными.
 
-TRADINGVIEW LISTING
+Legacy `bindings` не backfill-ятся вслепую: старый JSON не сохраняет source
+snapshot, достаточный для доказательства связи старого evidence с текущим TV
+ISIN/type-spec state. Lazy/explicit migration допускается только при наличии
+независимо проверяемого current source evidence.
 
-- `tv_id`;
-- prefix/symbol;
-- source MIC/venue;
-- currency/type;
-- source fingerprint / last seen state.
+Следующие schema/lifecycle задачи:
 
-YAHOO LISTING
-
-- Yahoo symbol;
-- exchange/MIC/market;
-- currency/quote type;
-- provider listing state.
-
-IBKR IDENTITY
-
-- `conid`;
-- broker symbol;
-- ISIN;
-- currency;
-- дополнительные broker identifiers только если реально доступны из import
-  contract.
-
-EVIDENCE / LIFECYCLE
-
-- mapping method/evidence provenance;
-- resolver/admission policy compatibility;
-- first/last verified timestamps;
-- last seen/check timestamps по provider;
-- active/inactive/stale/conflict state;
-- reason for unresolved/rejected mapping.
-
-Это design candidates, не утверждённая schema. Не мигрировать current DB до
-отдельного schema review и migration plan.
+- IBKR provider identifiers (`conid` в первую очередь);
+- explicit historical provider-id/ticker lifecycle;
+- corporate-action/listing migration semantics;
+- versioned schema migration/rollback tests;
+- public lookup projection, не зависящая от mutable legacy `Binding`.
 
 ======================================================================
 52. IDENTITY REGISTRY --- PERFORMANCE / CACHE PLAN
@@ -230,6 +223,17 @@ Performance goal должен измеряться на application-relevant wor
 - latency distribution для batch, а не только total runtime.
 
 Не задавать arbitrary millisecond SLO или TTL до measurements.
+
+Preliminary synthetic local measurement для schema-v1 TV->Yahoo core
+(package `0.4.78`; не production SLO и не provider benchmark):
+
+- `700` Registry rows: write-through ~`0.17 s`, warm lookup ~`0.06 s`;
+- `13,000` Registry rows: write-through ~`3.2 s`, warm lookup ~`1.2 s`.
+
+Первый naive SQL join давал почти quadratic warm lookup и был заменён staged
+indexed reads (`TV provider id -> mapping source index -> referenced targets`).
+Эти numbers использовать только как локальный regression/reference до measurements
+на actual `garp-cli` workloads.
 
 Основной design target:
 
@@ -278,37 +282,37 @@ Stable verified security identity не должна обязательно тр�
 54. IDENTITY REGISTRY --- IMPLEMENTATION PHASES / GATES
 =====================================================
 
-Рекомендуемая отдельная architecture sequence:
+PHASE A --- CONTRACT AUDIT --- **STANDALONE COMPLETE**
 
-PHASE A --- CONTRACT AUDIT
+- current `Binding`/SQLite/resolver flow audited;
+- product mapping/authority contract documented;
+- relevant `garp-cli` source inspection remains a prerequisite for the concrete
+  adapter/API integration layer.
 
-- описать current `Binding`/SQLite semantics и actual resolver lookup flow;
-- получить/inspect relevant `garp-cli` Screen/Portfolio/TLH integration source;
-- определить minimal public mapping API и required identifiers.
+PHASE B --- SCHEMA / MIGRATION FOUNDATION --- **COMPLETE**
 
-PHASE B --- SCHEMA / MIGRATION DESIGN
+- normalized Registry schema v1 + indexes;
+- additive coexistence with legacy cache;
+- idempotent creation/future-schema fail-closed tests;
+- no blind legacy backfill.
 
-- normalized Registry schema;
-- indexes для TV/Yahoo/IBKR lookup keys;
-- migration текущих verified bindings;
-- compatibility с current cache;
-- rollback/upgrade strategy.
+PHASE C --- TV/YAHOO REGISTRY CORE --- **CORE COMPLETE**
 
-PHASE C --- TV/YAHOO REGISTRY CORE
+- current fail-closed resolver is producer/write-through source;
+- indexed warm Registry reads precede legacy JSON cache;
+- exact source fingerprint + policy + lifecycle + age compatibility;
+- ambiguity/conflict fail closed;
+- fresh persistent REJECTED/runtime contradiction invalidates older Registry edge;
+- public application DTO/service boundary remains the next Phase-C deliverable.
 
-- current fail-closed resolver становится producer/write-through source
-  доказанных TV->Yahoo bindings;
-- warm reads обслуживаются Registry;
-- no admission weakening.
-
-PHASE D --- IBKR IDENTITY INGEST / RECONCILIATION
+PHASE D --- IBKR IDENTITY INGEST / RECONCILIATION --- **PENDING**
 
 - принимать broker identity record из existing import layer;
 - exact identifiers first (`conid`, ISIN);
 - symbol-based path только с достаточным context/evidence;
 - ambiguity/conflict остаются unresolved/REJECTED.
 
-PHASE E --- GARP-CLI INTEGRATION
+PHASE E --- GARP-CLI INTEGRATION --- **PENDING**
 
 - Stock screen: bulk `TV -> Yahoo` mapping после успешного TV assessment;
 - Portfolio/TLH: bulk `IBKR -> Yahoo`;
@@ -316,14 +320,14 @@ PHASE E --- GARP-CLI INTEGRATION
 - native TV_ETF mapping включать отдельно, когда будет определён его live-price
   contract; не наследовать Stock semantics автоматически.
 
-PHASE F --- PERFORMANCE / LIFECYCLE HARDENING
+PHASE F --- PERFORMANCE / LIFECYCLE HARDENING --- **PARTIAL / NEXT AFTER INTEGRATION**
 
-- cold/warm/mixed benchmarks;
-- provider-call telemetry;
-- invalidation/reverification;
-- corporate action/delisting/ticker-migration tests;
-- concurrency/locking/migration tests;
-- bounded real-provider validation для новых provider contracts.
+- preliminary synthetic Registry benchmark уже есть, но real `garp-cli` workload
+  measurements ещё нужны;
+- далее provider-call telemetry, invalidation/reverification, corporate action /
+  delisting / ticker migration, concurrency/locking/migration tests;
+- bounded real-provider validation нужен только для действительно нового/изменённого
+  provider contract.
 
 Каждая phase --- отдельный reviewable change. Не смешивать Registry migration,
 IBKR integration и unrelated resolver rescue в один patch.

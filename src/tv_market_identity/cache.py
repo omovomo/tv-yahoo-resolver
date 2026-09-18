@@ -6,8 +6,15 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-from .models import Binding
-from .registry import ensure_registry_schema, registry_counts
+from .models import Binding, TvRow
+from .registry import (
+    clear_registry,
+    ensure_registry_schema,
+    invalidate_tv_yahoo_mappings,
+    lookup_verified_tv_yahoo,
+    registry_counts,
+    write_verified_tv_yahoo,
+)
 
 
 SCHEMA = """
@@ -82,6 +89,30 @@ class CacheDB:
                 b.yahoo_price = None
                 out[b.tv_id] = b
         return out
+
+    def get_registry_tv_yahoo(
+        self,
+        rows: Iterable[TvRow],
+        *,
+        accepted_policies: Iterable[str],
+        max_age_seconds: int,
+    ):
+        return lookup_verified_tv_yahoo(
+            self.conn,
+            rows,
+            accepted_policies=accepted_policies,
+            max_age_seconds=max_age_seconds,
+        )
+
+    def put_registry_tv_yahoo(
+        self,
+        rows_by_id: dict[str, TvRow],
+        bindings: Iterable[Binding],
+    ) -> dict[str, int]:
+        return write_verified_tv_yahoo(self.conn, rows_by_id, bindings)
+
+    def invalidate_registry_tv_yahoo(self, tv_ids: Iterable[str]) -> int:
+        return invalidate_tv_yahoo_mappings(self.conn, tv_ids)
 
     def put_bindings(self, bindings: Iterable[Binding]) -> None:
         rows = []
@@ -181,7 +212,8 @@ class CacheDB:
         return out
 
     def clear(self) -> None:
+        clear_registry(self.conn)
         with self.conn:
             self.conn.execute("DELETE FROM bindings")
             self.conn.execute("DELETE FROM finnhub_symbols")
-            self.conn.execute("DELETE FROM meta")
+            self.conn.execute("DELETE FROM meta WHERE key<>?", ("identity_registry_schema_version",))

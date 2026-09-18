@@ -1,6 +1,6 @@
 # Identity Registry / garp-cli mapping contract — Phase A audit
 
-Status: **Phase A contract complete; Phase B schema v1 foundation implemented in package `0.4.77`; admission policy unchanged**.
+Status: **Phase A contract complete; Phase B schema v1 foundation and the first Phase C TV -> Yahoo read/write path are implemented through package `0.4.78`; admission policy unchanged**.
 
 Baseline inspected: package `0.4.76`, resolver policy `0.4.57-policy457`.
 
@@ -365,8 +365,11 @@ registry_mappings
 ```
 
 The schema version is stored in `meta` as `identity_registry_schema_version=1`.
-The tables are created empty beside the legacy cache. No resolver read/write path
-uses them yet, and no legacy Binding is backfilled without current source evidence.
+The tables are created beside the legacy cache. Package `0.4.78` adds write-through
+for freshly resolved VERIFIED TV -> Yahoo proofs and an indexed Registry read path
+before the legacy JSON cache. No legacy Binding is blindly backfilled: an old cache
+payload is still insufficient to prove that its evidence belongs to the current
+TV source snapshot.
 
 ## 6. Fingerprint and invalidation requirements
 
@@ -410,10 +413,35 @@ The following decisions are accepted for the next implementation phases:
     plumbing/migration unless a separately reviewed functional policy change is
     intentionally made.
 
-## 8. Phase B remaining work
+## 8. Phase C TV -> Yahoo Registry core implemented
 
-The schema-v1 foundation now exists. Remaining Phase B/C work should build migration/write-through/read semantics around these concrete access
-patterns, in priority order:
+Package `0.4.78` implements the first operational Registry path without changing
+admission policy:
+
+- fresh VERIFIED `TvRow + Binding` results write through to Registry;
+- canonical security creation requires at least exact TV ISIN or a VERIFIED
+  shareClassFIGI anchor; unanchored results remain in the legacy cache only;
+- exact TV source fingerprints cover qualified id, prefix/symbol, currency, type,
+  normalized type specs, ISIN and source active-state evidence;
+- warm Registry reads require accepted policy, matching source fingerprint, ACTIVE
+  lifecycle and verification age within the resolver identity TTL;
+- more than one active compatible Yahoo target fails closed as ambiguous;
+- an explicit runtime Yahoo metadata contradiction deactivates the Registry edge;
+- a fresh non-transient cold-resolution REJECTED deactivates any older Registry
+  VERIFIED edge for that TV id, while transient provider failures do not;
+- old legacy JSON hits are not promoted automatically;
+- many TV listings may share one proven Yahoo target/security; conflicting strong
+  security anchors, multiple active ISIN/shareClass identifiers for one current
+  security, or Yahoo-symbol ownership are skipped and counted as Registry conflicts
+  rather than weakening identity.
+
+Registry telemetry now distinguishes hits, misses, stale/incompatible rows,
+ambiguity, write-through counts/conflicts and runtime invalidations.
+
+## 9. Remaining Phase C/D work
+
+The Registry core now supports the first access pattern below. Remaining work
+should extend the same evidence/lifecycle model, in priority order:
 
 ```text
 TV qualified id -> verified mapping edge -> Yahoo listing
@@ -424,14 +452,15 @@ Yahoo symbol     -> Yahoo listing         -> reverse edges (diagnostic/unique on
 
 Remaining deliverables:
 
-- normalized SQLite schema and indexes;
-- coexistence/migration strategy for the current `bindings` table;
-- write-through path from current VERIFIED `Binding` to Registry;
-- read path that can project a Registry hit back into the current resolver/API
-  without weakening admission;
-- policy/evidence/source-fingerprint compatibility rules;
-- tests for many-to-one listings, ambiguity, stale/incompatible state, migration
-  idempotency and legacy-cache preservation;
+- versioned public batch mapping DTO/service boundary for `garp-cli`;
+- explicit product-facing mapping result/telemetry that does not expose mutable
+  internal `Binding` or runtime Yahoo prices;
+- IBKR `conid`/ISIN ingest plus `IBKR -> Yahoo` and `IBKR -> TV` lookups;
+- lifecycle handling for symbol/listing migration and historical provider ids;
+- bounded/lazy migration strategy for useful legacy bindings where current source
+  evidence can independently re-establish the edge;
+- performance measurements for real `garp-cli` screen/portfolio batch sizes and
+  mixed hit/miss tails;
 - no package policy bump unless VERIFIED/REJECTED semantics actually change.
 
 The concrete `garp-cli` adapter and cross-project integration tests remain gated

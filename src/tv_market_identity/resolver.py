@@ -704,12 +704,37 @@ class BatchResolver:
 
         current = {r.tv_id: (r.currency, r.tv_type) for r in rows}
         ids = [r.tv_id for r in rows]
-        cached = {} if refresh else self.cache.get_bindings(ids, RESOLVER_VERSION, current)
+        cached: dict[str, Binding] = {}
         if not refresh:
+            accepted_registry_policies = (
+                RESOLVER_VERSION,
+                *CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS,
+            )
+            registry_hits, registry_stats = self.cache.get_registry_tv_yahoo(
+                rows,
+                accepted_policies=accepted_registry_policies,
+                max_age_seconds=self.verified_ttl,
+            )
+            cached.update(registry_hits)
+            self.stats["registry_hits"] += registry_stats.hits
+            self.stats["registry_misses"] += registry_stats.misses
+            self.stats["registry_stale_or_incompatible"] += registry_stats.stale_or_incompatible
+            self.stats["registry_ambiguous"] += registry_stats.ambiguous
+
+            remaining_ids = [tv_id for tv_id in ids if tv_id not in cached]
+            legacy_current = self.cache.get_bindings(
+                remaining_ids, RESOLVER_VERSION, current
+            )
+            cached.update(legacy_current)
+            self.stats["legacy_cache_hits"] += len(legacy_current)
+
             for compatible_version in CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS:
                 if compatible_version == RESOLVER_VERSION:
                     continue
-                legacy = self.cache.get_bindings(ids, compatible_version, current)
+                remaining_ids = [tv_id for tv_id in ids if tv_id not in cached]
+                if not remaining_ids:
+                    break
+                legacy = self.cache.get_bindings(remaining_ids, compatible_version, current)
                 legacy_verified = {
                     tv_id: binding for tv_id, binding in legacy.items()
                     if binding.status == "VERIFIED" and tv_id not in cached
@@ -719,6 +744,7 @@ class BatchResolver:
                     if binding.status == "REJECTED" and tv_id not in cached
                 )
                 cached.update(legacy_verified)
+                self.stats["legacy_cache_hits"] += len(legacy_verified)
                 self.stats["cache_compatible_verified_hits"] += len(legacy_verified)
                 self.stats["cache_compatible_rejected_ignored"] += legacy_rejected
         if refresh_rejected and not refresh:
@@ -771,6 +797,18 @@ class BatchResolver:
 
         persistent = [b for b in new_bindings if not self._is_transient_rejection(b)]
         self.cache.put_bindings(persistent)
+        rejected_registry = self.cache.invalidate_registry_tv_yahoo(
+            binding.tv_id for binding in persistent if binding.status == "REJECTED"
+        )
+        self.stats["registry_resolution_invalidations"] += rejected_registry
+        registry_write = self.cache.put_registry_tv_yahoo(
+            {row.tv_id: row for row in missing},
+            [binding for binding in persistent if binding.status == "VERIFIED"],
+        )
+        self.stats["registry_write_attempted"] += registry_write["attempted"]
+        self.stats["registry_write_verified"] += registry_write["written"]
+        self.stats["registry_write_unanchored"] += registry_write["skipped_unanchored"]
+        self.stats["registry_write_conflicts"] += registry_write["conflicts"]
         self.stats["transient_rejections_not_cached"] += len(new_bindings) - len(persistent)
         out = dict(cached)
         out.update({b.tv_id: b for b in new_bindings})
@@ -6543,6 +6581,10 @@ class BatchResolver:
                 b.quote_status = "FRESH"
         if invalidated:
             self.cache.put_bindings(invalidated)
+            invalidated_registry = self.cache.invalidate_registry_tv_yahoo(
+                binding.tv_id for binding in invalidated
+            )
+            self.stats["registry_runtime_invalidations"] += invalidated_registry
 
     def _verified(
         self,
