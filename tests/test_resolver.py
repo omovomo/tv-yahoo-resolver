@@ -3438,7 +3438,8 @@ class OFKoreaSegments:
                     figi=f"FIGI_{symbol}_{mic}", composite_figi=f"COMP_{symbol}_{mic}",
                     share_class_figi=f"SHARE_{symbol}", ticker=symbol,
                     name="KOREA TEST", security_type="Common Stock",
-                    security_type2="Common Stock", exch_code="KP" if mic == "XKRX" else "KQ",
+                    security_type2="Common Stock",
+                    exch_code={"XKRX": "KP", "XKOS": "KQ", "XKON": "KE"}[mic],
                 )])
             else:
                 out.append([])
@@ -3487,6 +3488,19 @@ def test_korea_krx_segment_probe_routes_kospi_and_kosdaq_without_ticker_heuristi
     db.close()
 
 
+def test_korea_konex_source_is_recognized_but_rejected_without_yahoo_contract(tmp_path):
+    db = CacheDB(tmp_path / "kr_konex.sqlite")
+    isin = "KR7232530006"
+    of = OFKoreaSegments({isin: ("232530", {"XKON"})})
+    r = BatchResolver(db, FH(), of, YHKoreaSegments())
+    got = r.resolve([_korea_row("232530", isin)], market="korea")["KRX:232530"]
+
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "YAHOO_SUFFIX_UNKNOWN:XKON"
+    assert r.stats["korea_krx_segment_probe_matches_XKON"] == 1
+    db.close()
+
+
 def test_korea_krx_segment_probe_fails_closed_on_both_or_neither(tmp_path):
     db = CacheDB(tmp_path / "kr_fail.sqlite")
     of = OFKoreaSegments({
@@ -3527,6 +3541,23 @@ def _korea_search_candidate(symbol="03481K.KQ", exchange="KOE", quote_type="EQUI
 def _korea_quote(symbol="03481K.KQ", exchange="KOE", currency="KRW", quote_type="EQUITY", full_exchange_name=None):
     full_name = full_exchange_name or ("KOSDAQ" if exchange == "KOE" else "KSE")
     return YahooQuote(symbol, exchange, full_name, currency, quote_type, "kr_market", "HaeSung(1P)", None, 6030.0, 20)
+
+
+def test_korea_konex_and_kosdaq_same_share_class_remains_source_ambiguous(tmp_path):
+    db = CacheDB(tmp_path / "kr_konex_amb.sqlite")
+    isin = "KR7169670007"
+    of = OFKoreaSegments({isin: ("169670", {"XKON", "XKOS"})})
+    y = YHKoreaAmbiguity(
+        search_candidates=[_korea_search_candidate("169670.KQ", "KOE")],
+        quote=_korea_quote("169670.KQ", "KOE"),
+    )
+    r = BatchResolver(db, FH(), of, y)
+    got = r.resolve([_korea_row("169670", isin)], market="korea")["KRX:169670"]
+
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "OPENFIGI_KOREA_SEGMENT_AMBIGUOUS:XKOS,XKON"
+    assert r.stats["korea_krx_segment_ambiguity_yahoo_resolved"] == 0
+    db.close()
 
 
 def test_korea_ambiguous_exact_isin_resolves_with_unique_yahoo_exact_isin_venue(tmp_path):

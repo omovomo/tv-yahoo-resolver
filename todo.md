@@ -16,27 +16,20 @@
 
 ## Active research
 
-### Korea residual analysis
+Сейчас нет активных market-level admission-задач из уже исследованных рынков. Закрытые рынки не открывать заново без нового независимого provider evidence.
 
-Статус baseline после v0.4.68 / `0.4.54-policy454`:
+## Closed / waiting for new evidence
 
-- TradingView Korea universe: 2753;
-- VERIFIED: 2661;
-- REJECTED: 92;
-- 91 × `OPENFIGI_KOREA_SEGMENT_NO_MATCH:XKRX:OPENFIGI_NO_MATCH|XKOS:OPENFIGI_NO_MATCH`;
-- 1 × `YAHOO_TYPE_MISMATCH:MUTUALFUND`.
+Исследованные рынки:
 
-Следующая research-задача:
+- **US / America** — CLOSED / WAITING FOR NEW EVIDENCE; основные residual cohorts и generic rescue hypotheses уже исследованы, повторять закрытые US cohorts без нового independent evidence не нужно.
+- **Germany** — CLOSED / WAITING FOR NEW EVIDENCE; regional/home-market routing, exact-ISIN bridges и связанные venue/provider edge cases уже проходили отдельные evidence-gated исследования.
+- **UK** — CLOSED / WAITING FOR NEW EVIDENCE; LSE/LSIN/AQSE/IOB, DR, currency, Yahoo taxonomy/venue и связанные ambiguity cases уже исследованы.
+- **Switzerland** — CLOSED / WAITING FOR NEW EVIDENCE; SIX/BX Swiss secondary-listing и primary-listing coverage paths уже исследованы.
+- **Korea** — CLOSED / WAITING FOR NEW EVIDENCE; последний закрытый residual — KONEX/XKON, подробности ниже.
 
-- не считать 92 REJECTED автоматически окончательным результатом;
-- приоритетно исследовать ~90-row KONEX cohort;
-- искать generic, deterministic, independently evidenced target-resolution path для `XKON`;
-- source venue `XKON` уже подтверждён representative exact `ID_ISIN+MIC` probes;
-- `.KS` / `.KQ` НЕ являются доказанным Yahoo target contract для KONEX: representative probes возвращали `MUTUALFUND`;
-- не добавлять `XKON → .KS/.KQ` без нового provider evidence;
-- сначала discovery/probes, затем bounded REAL-provider smoke; admission change только после доказанного contract;
-- `094800` и `169670` сохранять fail-closed, пока не появится новый generic evidence;
-- не использовать per-ticker exceptions ради уменьшения REJECTED.
+Не считать наличие residual REJECTED само по себе основанием для повторного market research. Возвращаться к закрытому рынку только при новом generic provider evidence, новом reproducible regression или существенном изменении provider contract.
+
 
 ## Architecture bookmarks
 

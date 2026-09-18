@@ -3409,7 +3409,12 @@ class BatchResolver:
                         ]
                         shares = {x.share_class_figi for x in identities if x and x.share_class_figi}
                         search_fn = getattr(self.yahoo, "search_exact_isin", None)
-                        if len(shares) == 1 and all(x and x.share_class_figi for x in identities) and callable(search_fn):
+                        if (
+                            "XKON" not in proven
+                            and len(shares) == 1
+                            and all(x and x.share_class_figi for x in identities)
+                            and callable(search_fn)
+                        ):
                             try:
                                 candidates = list(search_fn(r.isin.strip().upper()))
                                 self.stats["korea_krx_segment_ambiguity_yahoo_searches"] += 1

@@ -376,7 +376,8 @@ def test_korea_yahoo_suffixes_and_venue_contracts_are_segment_specific():
     from tv_market_identity.models import YahooQuote
     from tv_market_identity.policy import KOREA_KRX_CANDIDATE_MICS, MIC_TO_YAHOO_SUFFIX, yahoo_venue_compatible
 
-    assert KOREA_KRX_CANDIDATE_MICS == ("XKRX", "XKOS")
+    assert KOREA_KRX_CANDIDATE_MICS == ("XKRX", "XKOS", "XKON")
+    assert "XKON" not in MIC_TO_YAHOO_SUFFIX
     assert MIC_TO_YAHOO_SUFFIX["XKRX"] == ".KS"
     assert MIC_TO_YAHOO_SUFFIX["XKOS"] == ".KQ"
 

@@ -67,9 +67,11 @@ TV_MARKET_PREFIX_TO_MIC = {
     ("ireland", "EURONEXT"): "XDUB",
 }
 
-# TradingView Korea collapses KOSPI and KOSDAQ into one KRX provider prefix.
-# Resolve the concrete source segment only from exact OpenFIGI symbol+MIC evidence.
-KOREA_KRX_CANDIDATE_MICS = ("XKRX", "XKOS")
+# TradingView Korea collapses KOSPI, KOSDAQ, and KONEX into one KRX provider
+# prefix. Resolve the concrete source segment only from exact OpenFIGI ISIN+MIC
+# evidence. XKON intentionally has no Yahoo suffix contract: source-listing proof
+# alone is insufficient for target-provider admission.
+KOREA_KRX_CANDIDATE_MICS = ("XKRX", "XKOS", "XKON")
 
 
 def tv_prefix_mic(prefix: str, market: str | None = None) -> str | None:
