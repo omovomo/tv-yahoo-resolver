@@ -1,6 +1,6 @@
-# tv-market-identity-prototype v0.4.74
+# tv-market-identity-prototype v0.4.76
 
-Functional taxonomy refinement; admission policy `0.4.56-policy456`. CLOSED_END_FUND keeps its strict TradingView/Finnhub/OpenFIGI taxonomy but now accepts Yahoo `ETF` as well as `EQUITY` because real same-venue CEF listings can be reported with either quote type. This is taxonomy-only compatibility: symbol, currency, venue, source-listing proof, and ambiguity checks remain unchanged, so OTC/wrong-venue near misses stay fail-closed. `0.4.55-policy455` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
+Functional Germany/Xetra ETF taxonomy refinement; admission policy `0.4.57-policy457`. For TradingView `XETR` `fund/etf` rows, Yahoo `EQUITY` is accepted only when the exact `.DE` quote corroborates Xetra venue/currency and a second scoped OpenFIGI `ID_ISIN + XETR` proof returns the same non-null shareClassFIGI as the normal source listing. Ambiguous/mismatched share class, wrong venue/currency, non-XETR rows, and non-ETF rows remain fail-closed. `0.4.56-policy456` remains compatible for previously VERIFIED cache reuse; prior REJECTED bindings are re-evaluated under the new policy.
 
 # tv-market-identity-prototype v0.4.71
 

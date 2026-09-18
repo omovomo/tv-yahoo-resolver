@@ -47,7 +47,7 @@ from .policy import (
 )
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
 
-CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.55-policy455", "0.4.54-policy454", "0.4.50-policy450", "0.4.49-policy449", "0.4.48-policy448", "0.4.47-policy447", "0.4.46-policy446", "0.4.45-policy445", "0.4.44-policy444", "0.4.43-policy443", "0.4.42-policy442", "0.4.41-policy441", "0.4.40-policy440", "0.4.39-policy439", "0.4.38-policy438", "0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
+CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS = ("0.4.56-policy456", "0.4.55-policy455", "0.4.54-policy454", "0.4.50-policy450", "0.4.49-policy449", "0.4.48-policy448", "0.4.47-policy447", "0.4.46-policy446", "0.4.45-policy445", "0.4.44-policy444", "0.4.43-policy443", "0.4.42-policy442", "0.4.41-policy441", "0.4.40-policy440", "0.4.39-policy439", "0.4.38-policy438", "0.4.37-policy437", "0.4.36-policy436", "0.4.35-policy435", "0.4.34-policy434", "0.4.32-policy432", "0.4.29-policy429", "0.4.26-policy426", "0.4.23-policy423", "0.4.22-policy422", "0.4.21-policy421", "0.4.20-policy420", "0.4.19-policy419", "0.4.15-policy415", "0.4.8-policy48", "0.3.99-policy99", "0.3.95-policy95", "0.3.87-policy87", "0.3.84-policy84", "0.3.81-policy81", "0.3.79-policy79", "0.3.77-policy77", "0.3.74-policy74", "0.3.71-policy71", "0.3.67-policy67", "0.3.66-policy66", "0.3.62-policy62", "0.3.61-policy61", "0.3.59-policy59", "0.3.58-policy58", "0.3.56-policy56", "0.3.55-policy55", "0.3.54-policy54", "0.3.53-policy53", "0.3.49-policy49", "0.3.44-policy44")
 
 
 def _telemetry_token(value: str | None) -> str:
@@ -274,6 +274,7 @@ def _strict_yahoo_mapping(mapping_method: str | None) -> bool:
         "IRELAND_ISIN_UNIQUE_XDUB_LISTING",
         "JAPAN_XTKS_REIT_TAXONOMY",
         "JAPAN_XTKS_INFRASTRUCTURE_FUND_TAXONOMY",
+        "GERMANY_XETR_ISIN_YAHOO_EQUITY",
     }
 
 
@@ -480,6 +481,39 @@ def _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
     if not yahoo_venue_compatible(target_mic, q):
         return False
     return openfigi_type_compatible(row, identity)
+
+
+def _germany_xetr_etf_yahoo_equity_compatible(
+    row: TvRow,
+    expected_symbol: str,
+    q: YahooQuote | None,
+    source_isin_identity: OpenFigiIdentity | None,
+) -> bool:
+    """Bounded Xetra ETF taxonomy anomaly for Yahoo ``EQUITY``.
+
+    TradingView supplies the exact ISIN and XETR namespace.  OpenFIGI must
+    independently return one exact-ticker, compatible identity from
+    ``ID_ISIN + micCode=XETR`` with a non-null shareClassFIGI.  Yahoo must then
+    corroborate the exact ``.DE`` symbol, Xetra venue and currency.  This path
+    deliberately does not depend on the ordinary ``ID_EXCH_SYMBOL`` mapping,
+    because the observed provider contract can return no row there while the
+    scoped ISIN contract succeeds.
+    """
+    if q is None or source_isin_identity is None:
+        return False
+    if row.prefix != "XETR":
+        return False
+    if tv_type_kind(row) != "ETF" or "etf" not in {str(x).lower() for x in row.type_specs if x}:
+        return False
+    if not row.isin or q.symbol != expected_symbol or (q.quote_type or "").upper() != "EQUITY":
+        return False
+    if q.currency is None or not currency_compatible(row.currency, q.currency):
+        return False
+    if not yahoo_venue_compatible("XETR", q):
+        return False
+    if not source_isin_identity.share_class_figi:
+        return False
+    return openfigi_type_compatible(row, source_isin_identity)
 
 
 def _germany_final_equity_like_yahoo_etf_taxonomy_compatible(
@@ -4882,6 +4916,90 @@ class BatchResolver:
             self.stats["yahoo_chart_fallback_jobs"] += len(chart_needed)
             self.stats["yahoo_chart_fallback_rows"] += len(chart_quotes)
 
+        # Bounded Xetra ETF Yahoo-EQUITY taxonomy proof.  The rejection audit
+        # established this exact provider contract: ID_ISIN + micCode=XETR.
+        # Probe only rows whose current Yahoo quote already corroborates the
+        # exact Xetra symbol, venue and currency; then require a unique scoped
+        # OpenFIGI source identity tied to the same shareClassFIGI as the normal
+        # source listing.
+        xetr_etf_equity_items: list[dict] = []
+        xetr_etf_equity_jobs: list[dict] = []
+        for item in pending:
+            r = item["row"]
+            ys = item["yahoo_symbol"]
+            q0 = yahoo_quotes.get(ys)
+            cq0 = chart_quotes.get(ys)
+            q_candidate = q0 if (
+                q0 is not None
+                and q0.symbol == ys
+                and (q0.quote_type or "").upper() == "EQUITY"
+                and q0.currency is not None
+                and currency_compatible(r.currency, q0.currency)
+                and yahoo_venue_compatible("XETR", q0)
+            ) else cq0 if (
+                cq0 is not None
+                and cq0.symbol == ys
+                and (cq0.quote_type or "").upper() == "EQUITY"
+                and cq0.currency is not None
+                and currency_compatible(r.currency, cq0.currency)
+                and yahoo_venue_compatible("XETR", cq0)
+            ) else None
+            if not (
+                r.prefix == "XETR"
+                and item.get("target_mic") == "XETR"
+                and tv_type_kind(r) == "ETF"
+                and "etf" in {str(x).lower() for x in r.type_specs if x}
+                and r.isin
+                and q_candidate is not None
+            ):
+                continue
+            xetr_etf_equity_items.append(item)
+            xetr_etf_equity_jobs.append({
+                "idType": "ID_ISIN",
+                "idValue": r.isin,
+                "micCode": "XETR",
+            })
+
+        xetr_etf_equity_source_by_tv_id: dict[str, OpenFigiIdentity] = {}
+        if xetr_etf_equity_jobs:
+            try:
+                xetr_scoped = self.openfigi.map_jobs(xetr_etf_equity_jobs)
+                self.stats["openfigi_germany_xetr_etf_equity_jobs"] += len(xetr_etf_equity_jobs)
+                self.stats["openfigi_jobs"] += len(xetr_etf_equity_jobs)
+                self.stats["openfigi_http_batches"] += (
+                    len(xetr_etf_equity_jobs) + self.openfigi.batch_size - 1
+                ) // self.openfigi.batch_size
+            except ProviderError:
+                xetr_scoped = [[] for _ in xetr_etf_equity_jobs]
+                self.stats["openfigi_germany_xetr_etf_equity_unavailable"] += len(xetr_etf_equity_jobs)
+            for item, identities in zip(xetr_etf_equity_items, xetr_scoped):
+                r = item["row"]
+                exact = [
+                    x for x in identities
+                    if punctuation_key(x.ticker or "") == punctuation_key(r.symbol)
+                    and openfigi_type_compatible(r, x)
+                    and bool(x.figi)
+                    and bool(x.share_class_figi)
+                ]
+                figis = {x.figi for x in exact if x.figi}
+                shares = {x.share_class_figi for x in exact if x.share_class_figi}
+                if len(figis) != 1 or len(shares) != 1:
+                    self.stats["openfigi_germany_xetr_etf_equity_source_unconfirmed"] += 1
+                    continue
+                source = exact[0]
+                xetr_etf_equity_source_by_tv_id[r.tv_id] = source
+                # Promote the independently scoped ISIN/XETR identity into the
+                # production item.  The ordinary direct OpenFIGI mapping can be
+                # absent for this provider taxonomy, which is why this bounded
+                # rescue exists.
+                item["identity"] = source
+                item["source_identity"] = source
+                item["target_identity"] = source
+                item["source_mic"] = "XETR"
+                item["target_mic"] = "XETR"
+                item["mapping_method"] = "GERMANY_XETR_ISIN_YAHOO_EQUITY"
+                self.stats["openfigi_germany_xetr_etf_equity_source_proven"] += 1
+
         # Bounded Yahoo alternatives. LSIN may use .IL or .L, but an ADR may
         # try .L only when OpenFIGI already supplied independent identity/venue
         # evidence; Yahoo-only fallback cannot distinguish XLON from XLOM. A
@@ -4996,13 +5114,24 @@ class BatchResolver:
             primary_germany_taxonomy_ok = _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
                 r, item["target_mic"], ys, q, item.get("identity"), item.get("mapping_method")
             )
+            primary_xetr_etf_equity_ok = _germany_xetr_etf_yahoo_equity_compatible(
+                r, ys, q, xetr_etf_equity_source_by_tv_id.get(r.tv_id),
+            )
             if (not primary_regular_ok and not primary_reviewed_taxonomy_ok
-                    and not primary_germany_taxonomy_ok
+                    and not primary_germany_taxonomy_ok and not primary_xetr_etf_equity_ok
                     and _germany_regional_yahoo_fund_taxonomy_anomaly_compatible(
                         r, item["target_mic"], ys, cq, item.get("identity"), item.get("mapping_method")
                     )):
                 q = cq
                 primary_germany_taxonomy_ok = True
+                self.stats["yahoo_chart_fallback_matches"] += 1
+            if (not primary_regular_ok and not primary_reviewed_taxonomy_ok
+                    and not primary_germany_taxonomy_ok and not primary_xetr_etf_equity_ok
+                    and _germany_xetr_etf_yahoo_equity_compatible(
+                        r, ys, cq, xetr_etf_equity_source_by_tv_id.get(r.tv_id),
+                    )):
+                q = cq
+                primary_xetr_etf_equity_ok = True
                 self.stats["yahoo_chart_fallback_matches"] += 1
             if (q is not None and (q.quote_type or "").upper() in {"MUTUALFUND", "ETF"}
                     and r.prefix in {"GETTEX", "LS", "LSX", "TRADEGATE", "FWB", "DUS", "HAM", "SWB", "MUN", "HAN"}
@@ -5016,6 +5145,9 @@ class BatchResolver:
                 self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(q.quote_type if q else None)}"] += 1
                 self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(r.prefix)}"] += 1
                 self.stats[f"yahoo_germany_regional_fund_taxonomy_matches_{_telemetry_token(item['target_mic'])}"] += 1
+            if primary_xetr_etf_equity_ok:
+                item["yahoo_type_anomaly"] = "GERMANY_XETR_ETF_EQUITY"
+                self.stats["yahoo_germany_xetr_etf_equity_matches"] += 1
             if (q is not None and (q.quote_type or "").upper() == "MUTUALFUND"
                     and r.tv_id in REVIEWED_YAHOO_MUTUALFUND_TAXONOMY):
                 reviewed_mutualfund_candidate_ids.add(r.tv_id)
@@ -5173,7 +5305,7 @@ class BatchResolver:
                 rejected.append(self._reject(r, "YAHOO_TYPE_UNREPORTED_TARGET_ONLY"))
                 continue
             if q.quote_type is not None and not yahoo_type_compatible(r, q.quote_type):
-                if item.get("yahoo_type_anomaly") not in {"LSIN_DR_MUTUALFUND", "REVIEWED_MUTUALFUND", "GERMANY_REGIONAL_FUND_TAXONOMY"}:
+                if item.get("yahoo_type_anomaly") not in {"LSIN_DR_MUTUALFUND", "REVIEWED_MUTUALFUND", "GERMANY_REGIONAL_FUND_TAXONOMY", "GERMANY_XETR_ETF_EQUITY"}:
                     reason = f"YAHOO_TYPE_MISMATCH:{q.quote_type}"
                     rejected.append(self._reject(r, reason))
                     if (

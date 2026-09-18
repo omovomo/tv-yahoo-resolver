@@ -3678,3 +3678,103 @@ def test_closed_end_fund_warm_cache_refresh_rejects_incompatible_yahoo_type(tmp_
     assert binding.status == "REJECTED"
     assert binding.rejection_reason == "YAHOO_RUNTIME_MISMATCH:NYQ/USD/MUTUALFUND"
     db.close()
+
+class OFGermanyXetrEtfEquity:
+    batch_size = 100
+    def __init__(self, *, scoped_ambiguous=False):
+        self.scoped_ambiguous = scoped_ambiguous
+        self.jobs = []
+    def map_jobs(self, jobs):
+        from tv_market_identity.models import OpenFigiIdentity
+        self.jobs.extend(jobs)
+        out = []
+        for job in jobs:
+            if job.get("micCode") != "XETR":
+                out.append([])
+                continue
+            if job.get("idType") == "ID_EXCH_SYMBOL" and job.get("idValue") == "B4NA":
+                # Production-equivalent behavior for this cohort: both strict
+                # and type-fallback exchange-symbol mappings can return no row.
+                out.append([])
+            elif job.get("idType") == "ID_ISIN" and job.get("idValue") == "DE000PB8ALU2":
+                identities = [OpenFigiIdentity(
+                    figi="BBG_XETR_ISIN", composite_figi="BBG_XETR_ISIN_COMP",
+                    share_class_figi="BBG_SHARE_XETR", ticker="B4NA",
+                    name="BNP PAR RICI ENH ALUMINIUM", security_type="ETP",
+                    security_type2="Mutual Fund", exch_code="GY",
+                )]
+                if self.scoped_ambiguous:
+                    identities.append(OpenFigiIdentity(
+                        figi="BBG_XETR_ISIN_ALT", composite_figi="BBG_XETR_ISIN_ALT_COMP",
+                        share_class_figi="BBG_SHARE_XETR_ALT", ticker="B4NA",
+                        name="BNP PAR RICI ENH ALUMINIUM", security_type="ETP",
+                        security_type2="Mutual Fund", exch_code="GY",
+                    ))
+                out.append(identities)
+            else:
+                out.append([])
+        return out
+
+
+class YHGermanyXetrEtfEquity:
+    batch_size = 75
+    def __init__(self, *, exchange="GER", full_exchange_name="XETRA", currency="USD"):
+        self.exchange = exchange
+        self.full_exchange_name = full_exchange_name
+        self.currency = currency
+    def quotes(self, symbols):
+        if "B4NA.DE" not in symbols:
+            return {}
+        return {"B4NA.DE": YahooQuote(
+            "B4NA.DE", self.exchange, self.full_exchange_name, self.currency,
+            "EQUITY", "de_market", "BNP PAR RICI ENH ALUMINIUM", None, 1.0, 15,
+        )}
+
+
+def _germany_xetr_etf_row():
+    return TvRow(
+        "XETR:B4NA", "XETR", "B4NA", "BNP PAR RICI ENH ALUMINIUM",
+        "USD", "fund", ("etf",), None, None, 1.0,
+        isin="DE000PB8ALU2", active_symbol=True,
+    )
+
+
+def test_germany_xetr_etf_yahoo_equity_requires_scoped_isin_same_share_class(tmp_path):
+    db = CacheDB(tmp_path / "de-xetr-etf-equity.sqlite")
+    of = OFGermanyXetrEtfEquity()
+    resolver = BatchResolver(db, None, of, YHGermanyXetrEtfEquity())
+    got = resolver.resolve([_germany_xetr_etf_row()], market="germany")["XETR:B4NA"]
+    assert got.status == "VERIFIED"
+    assert got.resolved_mic == "XETR"
+    assert got.yahoo_symbol == "B4NA.DE"
+    assert got.yahoo_quote_type == "EQUITY"
+    assert resolver.stats["openfigi_germany_xetr_etf_equity_source_proven"] == 1
+    assert resolver.stats["yahoo_germany_xetr_etf_equity_matches"] == 1
+    assert any(j.get("idType") == "ID_ISIN" and j.get("idValue") == "DE000PB8ALU2" and j.get("micCode") == "XETR" for j in of.jobs)
+    db.close()
+
+
+def test_germany_xetr_etf_yahoo_equity_rejects_ambiguous_scoped_isin(tmp_path):
+    db = CacheDB(tmp_path / "de-xetr-etf-equity-ambiguous-scoped.sqlite")
+    resolver = BatchResolver(
+        db, None, OFGermanyXetrEtfEquity(scoped_ambiguous=True),
+        YHGermanyXetrEtfEquity(),
+    )
+    got = resolver.resolve([_germany_xetr_etf_row()], market="germany")["XETR:B4NA"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason == "YAHOO_TYPE_MISMATCH:EQUITY"
+    assert resolver.stats["openfigi_germany_xetr_etf_equity_source_unconfirmed"] == 1
+    db.close()
+
+
+def test_germany_xetr_etf_yahoo_equity_rejects_wrong_yahoo_venue(tmp_path):
+    db = CacheDB(tmp_path / "de-xetr-etf-equity-wrong-venue.sqlite")
+    resolver = BatchResolver(
+        db, None, OFGermanyXetrEtfEquity(),
+        YHGermanyXetrEtfEquity(exchange="STU", full_exchange_name="Stuttgart"),
+    )
+    got = resolver.resolve([_germany_xetr_etf_row()], market="germany")["XETR:B4NA"]
+    assert got.status == "REJECTED"
+    assert got.rejection_reason.startswith("YAHOO_")
+    assert resolver.stats["yahoo_germany_xetr_etf_equity_matches"] == 0
+    db.close()
