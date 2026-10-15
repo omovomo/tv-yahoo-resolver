@@ -1,3 +1,16 @@
+# tv-market-identity-prototype v0.4.79
+
+Architecture/API release; admission policy remains `0.4.57-policy457`. Adds a
+versioned application-facing `TV -> Yahoo` batch mapping boundary in
+`tv_market_identity.api` and a `map-jsonl` CLI transport. The common warm path
+reads compatible Identity Registry edges directly and does not construct Yahoo,
+OpenFIGI or Finnhub provider clients; only Registry miss/stale/incompatible rows
+instantiate the existing fail-closed resolver. Results intentionally exclude
+runtime quote prices. This provides a process boundary suitable for `garp-cli`
+without forcing its pinned `yfinance==1.5.1` runtime to import the resolver's
+currently incompatible `yfinance>=1.7,<1.8` dependency. Provider/admission
+contracts are unchanged.
+
 # tv-market-identity-prototype v0.4.78
 
 Architecture/performance release; admission policy remains `0.4.57-policy457`.

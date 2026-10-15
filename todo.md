@@ -61,39 +61,51 @@ identifiers из import layer и определить минимальный д�
 
 ## Active architecture / product plan
 
-Current standalone implementation state after package `0.4.78`
+Current implementation state after package `0.4.79`
 (`0.4.57-policy457`, admission unchanged):
 
-- **Phase A / contract audit — COMPLETE for this project**: documented product
-  objective, authority boundaries, TV/IBKR input semantics, mapping-result
-  semantics and batch telemetry. Concrete `garp-cli` adapter inspection remains
-  pending because its source is not in the current archive.
+- **Phase A / contract audit — COMPLETE**: product authority boundaries and the
+  actual targeted `garp-cli` identity slice are inspected.
 - **Phase B / schema foundation — COMPLETE**: additive normalized Registry schema
-  v1 exists beside legacy `bindings`; legacy cache is preserved and is not
-  blindly promoted.
-- **Phase C / TV->Yahoo Registry core — CORE COMPLETE**: freshly resolved VERIFIED
-  bindings write through to Registry; warm compatible mappings are read from
-  indexed Registry edges before legacy JSON cache; source fingerprint, policy,
-  lifecycle, ambiguity and revalidation horizon are checked fail-closed; fresh
-  non-transient REJECTED/runtime contradiction deactivates stale Registry edges.
-- Public product-facing mapping DTO/service boundary is **not yet implemented**.
-- IBKR Registry ingest/reconciliation is **not yet implemented**.
+  v1 exists beside legacy cache; no blind promotion of old bindings.
+- **Phase C / TV->Yahoo Registry core — COMPLETE FOUNDATION**: verified mappings
+  write through to Registry and compatible warm reads are indexed/fail-closed.
+- **Application mapping boundary — IMPLEMENTED**: `tv_market_identity.api`,
+  lightweight `tv-market-id-map` process transport, plus `map-jsonl` compatibility
+  subcommand. Warm Registry hits do not construct provider clients/resolver.
+- **IBKR Registry ingest/reconciliation — not yet implemented**.
+
+Targeted `garp-cli` source inspection confirmed that its current
+`StockYahooSymbolRegistry` + `YahooMetadataVerifier` performs its own identity
+admission from deterministic ticker transformation and Yahoo metadata, including
+manual mappings. This layer is now planned for retirement from **identity
+authority**. Useful immutable `StockYahooLivePlan`/row-token/session safety stays
+on the application side; identity proof moves to `tv-market-id`.
+
+Confirmed integration constraints:
+
+- current `TVStockAssessment` does not yet carry all strict identity inputs
+  (`currency`, `type`, `typespecs`, `isin`, `active_symbol`);
+- `garp-cli` pins `yfinance==1.5.1`, while this package currently requires
+  `yfinance>=1.7,<1.8`; direct in-process dependency is therefore not the first
+  migration path;
+- first integration transport should use the isolated versioned batch process
+  boundary rather than copying resolver logic or weakening dependency contracts.
 
 Следующий приоритет работ:
 
-1. получить и inspect relevant actual `garp-cli` source для Screen/Portfolio/TLH,
-   чтобы не выдумывать adapter contract;
-2. на основе уже реализованного Registry core добавить versioned batch-first
-   application API для `TV -> Yahoo`, который не exposes mutable internal
-   `Binding` и runtime Yahoo price;
-3. подтвердить API на realistic `garp-cli` TV batches и mixed hit/miss tails,
-   измеряя latency, Registry hit rate и provider calls avoided;
-4. **Phase D**: добавить IBKR identity ingest (`conid`/ISIN/symbol + доступный
-   import context), затем deterministic `IBKR -> Yahoo` и `IBKR -> TV`;
-5. **Phase E**: интегрировать bulk mapping boundary в `garp-cli` Screen и
-   Portfolio/TLH с cross-project tests;
-6. **Phase F**: lifecycle/performance hardening --- corporate actions, ticker/venue
-   migration, invalidation/reverification, concurrency/locking и schema migrations.
+1. **Phase C2 / garp-cli authority migration**: carry TV identity-only fields in
+   the assessment sidecar, call `tv-market-id-map` in bulk, and build live plans
+   only from VERIFIED results;
+2. retire automatic/manual `StockYahooSymbolRegistry` admission after the new
+   path is covered by integration tests; compatibility state may exist only
+   temporarily during rollout;
+3. measure realistic Screen warm/mixed batches, Registry hit rate and provider
+   calls avoided;
+4. **Phase D**: add IBKR identity ingest (`conid`/ISIN/symbol + import context),
+   then deterministic `IBKR -> Yahoo` and `IBKR -> TV`;
+5. **Phase F**: lifecycle/performance hardening --- corporate actions, ticker/venue
+   migration, invalidation/reverification, concurrency/locking and schema migrations.
 
 Residual market-level REJECTED остаются вторичным приоритетом и открываются только
 при новом generic evidence/regression, а не ради уменьшения counts.
@@ -170,8 +182,9 @@ IBKR-side input должен использовать сильнейшие до�
 результат на каждую строку содержит VERIFIED/REJECTED(or unresolved), target
 identifiers, provenance/evidence, policy compatibility и lifecycle state.
 
-Конкретный Python API/CLI contract проектировать после inspection actual
-`garp-cli` source.
+Первый versioned contract реализован в package `0.4.79` через
+`tv_market_identity.api` и lightweight process command `tv-market-id-map`.
+Следующая работа --- application adapter и IBKR extension того же Registry.
 
 ======================================================================
 51. IDENTITY REGISTRY --- SCHEMA / CURRENT STATE
@@ -282,12 +295,11 @@ Stable verified security identity не должна обязательно тр�
 54. IDENTITY REGISTRY --- IMPLEMENTATION PHASES / GATES
 =====================================================
 
-PHASE A --- CONTRACT AUDIT --- **STANDALONE COMPLETE**
+PHASE A --- CONTRACT AUDIT --- **COMPLETE**
 
 - current `Binding`/SQLite/resolver flow audited;
 - product mapping/authority contract documented;
-- relevant `garp-cli` source inspection remains a prerequisite for the concrete
-  adapter/API integration layer.
+- targeted actual `garp-cli` Screen/Portfolio/TLH identity source inspected.
 
 PHASE B --- SCHEMA / MIGRATION FOUNDATION --- **COMPLETE**
 
@@ -296,14 +308,27 @@ PHASE B --- SCHEMA / MIGRATION FOUNDATION --- **COMPLETE**
 - idempotent creation/future-schema fail-closed tests;
 - no blind legacy backfill.
 
-PHASE C --- TV/YAHOO REGISTRY CORE --- **CORE COMPLETE**
+PHASE C --- TV/YAHOO REGISTRY CORE / PUBLIC BOUNDARY --- **COMPLETE FOUNDATION**
 
 - current fail-closed resolver is producer/write-through source;
 - indexed warm Registry reads precede legacy JSON cache;
 - exact source fingerprint + policy + lifecycle + age compatibility;
 - ambiguity/conflict fail closed;
 - fresh persistent REJECTED/runtime contradiction invalidates older Registry edge;
-- public application DTO/service boundary remains the next Phase-C deliverable.
+- package `0.4.79` exposes narrow application DTO/service contract;
+- lightweight `tv-market-id-map` loads resolver/providers only for unresolved tail.
+
+PHASE C2 --- GARP-CLI AUTHORITY MIGRATION --- **NEXT**
+
+- extend TV assessment query/sidecar with identity-only fields required by the
+  strict contract (`currency`, `type`, `typespecs`, `isin`, `active_symbol`);
+- add one bulk process adapter to `tv-market-id-map`;
+- construct `StockYahooLivePlan` only from VERIFIED authority results;
+- retire `StockYahooSymbolRegistry` and `YahooMetadataVerifier` from identity
+  authority, preserving only temporary compatibility/migration state if needed;
+- manual map may remain diagnostics/migration input but not live identity proof;
+- preserve existing row-token, generation, duplicate-target and session safety;
+- add cross-project warm/miss/reject/invalidation tests.
 
 PHASE D --- IBKR IDENTITY INGEST / RECONCILIATION --- **PENDING**
 

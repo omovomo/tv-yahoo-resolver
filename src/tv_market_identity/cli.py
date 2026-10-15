@@ -11,6 +11,7 @@ from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
 from . import __version__
+from .api import MappingInputError, TvYahooMappingRequest, open_mapping_service
 from .cache import CacheDB
 from .config import load_screen_config
 from .providers import FinnhubProvider, OpenFigiProvider, ProviderError, YahooProvider
@@ -3936,6 +3937,57 @@ def cmd_screen(args) -> int:
     return 0
 
 
+def cmd_map_jsonl(args) -> int:
+    """Resolve application TV identities from JSONL without emitting quote data."""
+    requests = []
+    input_handle = sys.stdin if args.input == "-" else open(args.input, "r", encoding="utf-8")
+    try:
+        for line_no, raw in enumerate(input_handle, 1):
+            text = raw.strip()
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+                requests.append(TvYahooMappingRequest.from_mapping(payload))
+            except (json.JSONDecodeError, MappingInputError, TypeError, ValueError) as exc:
+                print(f"ERROR: invalid mapping input line {line_no}: {exc}", file=sys.stderr)
+                return 2
+    finally:
+        if input_handle is not sys.stdin:
+            input_handle.close()
+
+    cache, service = open_mapping_service(
+        args.cache,
+        yahoo_batch=args.yahoo_batch,
+        verified_ttl_days=args.verified_ttl_days,
+        rejected_ttl_hours=args.rejected_ttl_hours,
+        finnhub_ttl_hours=args.finnhub_ttl_hours,
+    )
+    try:
+        batch = service.map_batch(
+            requests,
+            market=args.market,
+            refresh=args.refresh,
+            refresh_rejected=args.refresh_rejected,
+        )
+    finally:
+        cache.close()
+
+    output_handle = sys.stdout if args.output == "-" else open(args.output, "w", encoding="utf-8")
+    try:
+        for result in batch.results:
+            output_handle.write(json.dumps(result.as_dict(), ensure_ascii=False, sort_keys=True) + "\n")
+    finally:
+        if output_handle is not sys.stdout:
+            output_handle.close()
+
+    if args.telemetry:
+        print(json.dumps(dict(batch.telemetry), sort_keys=True), file=sys.stderr)
+    if args.strict_exit and any(not result.verified for result in batch.results):
+        return 3
+    return 0
+
+
 def cmd_cache_stats(args) -> int:
     cache = CacheDB(args.cache)
     try:
@@ -4303,6 +4355,24 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--rejected-ttl-hours", type=int, default=6)
     r.add_argument("--finnhub-ttl-hours", type=int, default=24)
     r.set_defaults(func=cmd_run)
+
+    m = sub.add_parser("map-jsonl", help="Resolve application TV identities from JSONL")
+    m.add_argument("--input", default="-", help="Input JSONL path or - for stdin")
+    m.add_argument("--output", default="-", help="Output JSONL path or - for stdout")
+    m.add_argument("--market", default=None, help="Optional TradingView market context")
+    m.add_argument("--refresh", action="store_true", help="Bypass Registry/cache and resolve again")
+    m.add_argument(
+        "--refresh-rejected",
+        action="store_true",
+        help="Reuse VERIFIED mappings but re-resolve cached REJECTED rows",
+    )
+    m.add_argument("--strict-exit", action="store_true", help="Return exit code 3 when any row is not VERIFIED")
+    m.add_argument("--telemetry", action="store_true", help="Write one telemetry JSON object to stderr")
+    m.add_argument("--yahoo-batch", type=int, default=75)
+    m.add_argument("--verified-ttl-days", type=int, default=60)
+    m.add_argument("--rejected-ttl-hours", type=int, default=6)
+    m.add_argument("--finnhub-ttl-hours", type=int, default=24)
+    m.set_defaults(func=cmd_map_jsonl)
 
     cs = sub.add_parser("cache-stats", help="Show persistent cache statistics")
     cs.set_defaults(func=cmd_cache_stats)

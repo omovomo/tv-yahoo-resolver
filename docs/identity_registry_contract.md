@@ -1,6 +1,6 @@
 # Identity Registry / garp-cli mapping contract — Phase A audit
 
-Status: **Phase A contract complete; Phase B schema v1 foundation and the first Phase C TV -> Yahoo read/write path are implemented through package `0.4.78`; admission policy unchanged**.
+Status: **Phase A contract complete; Phase B schema v1 foundation, Phase C TV -> Yahoo Registry read/write, and the first versioned application batch API are implemented through package `0.4.79`; admission policy unchanged**.
 
 Baseline inspected: package `0.4.76`, resolver policy `0.4.57-policy457`.
 
@@ -158,6 +158,38 @@ contract in the current project.
 The first IBKR phase should consume identifiers already available from the
 `garp-cli` import layer. It must **not** add an IBKR network dependency merely to
 claim integration.
+
+## 2.8 `garp-cli` integration audit update (2026-09-18)
+
+A targeted `garp-cli` source slice was inspected after the initial Phase A audit.
+The application currently has its own `StockYahooSymbolRegistry` which performs
+automatic identity admission by deterministic ticker transformation plus Yahoo
+metadata checks, persists metadata-supported/manual mappings, and feeds an
+immutable `StockYahooLivePlan`. This layer should no longer be an identity
+authority once the `tv-market-id` application contract is connected.
+
+The useful application responsibility is the immutable live plan / row-token
+safety boundary. Identity proof belongs in `tv-market-id`; the existing
+`StockYahooSymbolRegistry`, `YahooMetadataVerifier`, automatic candidate
+selection and manual authority should be retired or reduced to compatibility
+state during migration.
+
+Two concrete integration constraints were found:
+
+- current `TVStockAssessment` preserves the qualified TV ticker and raw TV
+  payload but the stock query does not currently request all identity fields
+  needed by `tv-market-id` (`currency`, `type`, `typespecs`, `isin`,
+  `active_symbol`); these fields must be carried through the TV sidecar before
+  strict mapping can replace the old registry;
+- `garp-cli` pins `yfinance==1.5.1` while `tv-market-identity` currently requires
+  `yfinance>=1.7,<1.8`. Direct in-process package integration would therefore
+  create a dependency conflict. The first integration transport should use the
+  versioned process/JSONL boundary (or another isolated runtime) rather than
+  weakening either dependency contract without separate evidence.
+
+Package `0.4.79` implements the first side of that boundary: `map-jsonl` and
+`tv_market_identity.api`. Warm Registry hits do not initialize provider clients;
+only the unresolved tail enters the normal resolver.
 
 ## 3. Required public contracts
 
