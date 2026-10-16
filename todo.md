@@ -61,7 +61,7 @@ identifiers из import layer и определить минимальный д�
 
 ## Active architecture / product plan
 
-Current implementation state after package `0.4.80`
+Current implementation state after package `0.4.81`
 (`0.4.57-policy457`, admission unchanged):
 
 - **Phase A / contract audit — COMPLETE**: product authority boundaries and the
@@ -78,7 +78,11 @@ Current implementation state after package `0.4.80`
   without constructing resolver/providers. Source API v1 stays compatible;
   telemetry distinguishes fast legacy hits. Registry remains unpopulated by
   legacy-only results; its security evidence is not fabricated.
-- **IBKR Registry ingest/reconciliation — not yet implemented**.
+- **Phase D1 / IBKR ISIN security reconciliation — IMPLEMENTED (`0.4.81`)**:
+  read-only broker JSONL batch API (`tv-market-id-broker-map`), exact broker
+  ISIN → current proven Registry security evidence, and informational TV/Yahoo
+  candidates only; **no verified broker listing route or persisted conid**.
+- **Phase D2 / IBKR conid lifecycle and listing evidence — PENDING**.
 
 Targeted `garp-cli` source inspection identified the historical
 `StockYahooSymbolRegistry` + `YahooMetadataVerifier` identity-admission path.
@@ -91,8 +95,9 @@ verification on its actual runtime, not another manual authority path.
 
 Confirmed integration constraints:
 
-- current `TVStockAssessment` does not yet carry all strict identity inputs
-  (`currency`, `type`, `typespecs`, `isin`, `active_symbol`);
+- Stock screen now carries strict TV identity inputs
+  (`currency`, `type`, `typespecs`, `isin`, `active_symbol`); bounded AAPL/IBM
+  real-provider smoke passed;
 - `garp-cli` pins `yfinance==1.5.1`, while this package currently requires
   `yfinance>=1.7,<1.8`; direct in-process dependency is therefore not the first
   migration path;
@@ -106,12 +111,12 @@ Confirmed integration constraints:
    were confirmed for AAPL/IBM; full application suite remains a separate gate;
 2. keep the historical `StockYahooSymbolRegistry` admission retired;
    do not restore manual or Yahoo-metadata authority;
-3. **REAL runtime performance gate**: compare before/after 2/100/700
-   warm batches on the same Windows installation and 100/700 mixed batches;
-   require `resolver_invocations=0` for fully compatible legacy/Registry warm
-   batches, verify unchanged admission decisions, and inspect cold-tail costs;
-4. **Phase D**: add IBKR identity ingest (`conid`/ISIN/symbol + import context),
-   then deterministic `IBKR -> Yahoo` and `IBKR -> TV`;
+3. **Warm-cache performance gate — PASS for 2/100/700 on Windows**:
+   0.4.80 p50 ~155/153/186 ms (previously ~1386/1349/1444 ms),
+   `resolver_invocations=0` with fully compatible legacy hits. Mixed/cold-tail
+   benchmarks with independent provider evidence remain pending;
+4. **Phase D2**: add durable IBKR conid observations and independent broker
+   listing/venue evidence, then VERIFIED `IBKR -> Yahoo` / `IBKR -> TV` routes;
 5. **Phase F**: lifecycle/performance hardening --- corporate actions, ticker/venue
    migration, invalidation/reverification, concurrency/locking and schema migrations.
 
@@ -338,12 +343,17 @@ PHASE C2 --- GARP-CLI AUTHORITY MIGRATION --- **NEXT**
 - preserve existing row-token, generation, duplicate-target and session safety;
 - add cross-project warm/miss/reject/invalidation tests.
 
-PHASE D --- IBKR IDENTITY INGEST / RECONCILIATION --- **PENDING**
+PHASE D --- IBKR IDENTITY INGEST / RECONCILIATION --- **D1 COMPLETE / D2 PENDING**
 
-- принимать broker identity record из existing import layer;
-- exact identifiers first (`conid`, ISIN);
-- symbol-based path только с достаточным context/evidence;
-- ambiguity/conflict остаются unresolved/REJECTED.
+- D1: broker identity JSONL record (`conid`, `symbol`, `isin`, `currency`, `asset_class`)
+  принят read-only; exact ISIN сопоставляется с independently VERIFIED
+  Registry security anchor, а не с legacy bindings;
+- D1: `SECURITY_MATCH` не означает доказанный broker listing или Yahoo
+  price route; TV/Yahoo candidates остаются informational only;
+- D2: durable broker conid lifecycle/provenance + independent broker
+  venue/contract proof (в существующем Flex trade importer MIC отсутствует);
+- D2: только после такого proof разрешить verified IBKR->Yahoo/TV mapping;
+- symbol-based fallback, ambiguity и конфликтующие ISIN остаются fail-closed.
 
 PHASE E --- GARP-CLI INTEGRATION --- **PENDING**
 

@@ -1,6 +1,6 @@
 # Identity Registry / garp-cli mapping contract — Phase A audit
 
-Status: **Phase A contract complete; Phase B schema v1 foundation, Phase C TV -> Yahoo Registry read/write, and the first versioned application batch API are implemented through package `0.4.80`; admission policy unchanged**.
+Status: **Phase A contract complete; Phase B schema v1 foundation, Phase C TV -> Yahoo Registry read/write, and the first versioned application batch API are implemented through package `0.4.81`; Phase D1 read-only broker ISIN security reconciliation added; admission policy unchanged**.
 
 Baseline inspected: package `0.4.76`, resolver policy `0.4.57-policy457`.
 
@@ -516,3 +516,18 @@ from fresh resolver work by `cache_hit`, `legacy_hits`, `resolver_rows`, and
 This is a speed optimization for *previously admitted* bindings, not a
 stronger ISIN/security Registry claim: full re-proof requires independently
 verified current provider/source evidence.
+
+## 8. Phase D1 — read-only IBKR security reconciliation (v0.4.81)
+
+The first broker-side API is an intentionally narrow, read-only security
+reconciliation service. It accepts existing Flex identifiers, looks up exact
+ISIN against **freshly proven normalized Registry** TV→Yahoo security evidence,
+and reports a `SECURITY_MATCH` with informational TV/Yahoo candidates, or
+`UNRESOLVED`/`CONFLICT`. It does not derive a broker contract/listing edge from
+a share-class match, and never emits a VERIFIED Yahoo price target. The absence
+of independently verified broker venue evidence in the reviewed Flex trade
+importer is a deliberate stop condition. See `docs/ibkr_security_reconciliation_d1.md`.
+
+Phase D2 (persisted conid lifecycle, independent IBKR listing proof, trusted
+Yahoo price routing) remains pending, as does a direct garp-cli Portfolio/TLH
+adapter. The old TV→Yahoo JSONL API v1 remains unchanged.

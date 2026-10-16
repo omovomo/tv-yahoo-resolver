@@ -1,4 +1,6 @@
-# tv-market-identity-prototype v0.4.80
+# tv-market-identity-prototype v0.4.81
+
+Broker Phase D1: read-only exact-ISIN security reconciliation with `tv-market-id-broker-map`; no IBKR listing/Yahoo price routing authority. See `docs/ibkr_security_reconciliation_d1.md`.
 
 Application-cache performance release; admission policy remains
 `0.4.57-policy457`. On a Registry miss, the `tv-market-id-map` application
