@@ -294,7 +294,27 @@ class TvYahooMappingService:
                 max_age_seconds=self.verified_ttl,
             )
 
-        misses = [row for row in unique_rows if row.tv_id not in registry_hits]
+        # Older compatible VERIFIED bindings still reside in the TV-keyed
+        # legacy cache. Read them in one indexed batch *before* constructing
+        # provider clients/BatchResolver; never elevate them into Registry.
+        legacy_hits: dict[str, Binding] = {}
+        if not refresh:
+            legacy_misses = [row for row in unique_rows if row.tv_id not in registry_hits]
+            legacy_hits = self.cache.get_application_legacy_bindings(
+                legacy_misses,
+                current_policy=RESOLVER_VERSION,
+                compatible_verified_policies=CACHE_COMPATIBLE_VERIFIED_RESOLVER_VERSIONS,
+            )
+            if refresh_rejected:
+                legacy_hits = {
+                    tv_id: binding for tv_id, binding in legacy_hits.items()
+                    if binding.status != "REJECTED"
+                }
+
+        misses = [
+            row for row in unique_rows
+            if row.tv_id not in registry_hits and row.tv_id not in legacy_hits
+        ]
         resolved: dict[str, Binding] = {}
         resolver_invocations = 0
         if misses:
@@ -310,7 +330,11 @@ class TvYahooMappingService:
             )
 
         bindings = dict(registry_hits)
+        bindings.update(legacy_hits)
         bindings.update(resolved)
+        # Keep source="RESOLVER" for legacy hits in API v1: garp-cli's
+        # strict v1 client admits only REGISTRY/RESOLVER provenance values.
+        # cache_hit=true and legacy_hits telemetry identify the fast path.
         results = tuple(
             self._binding_result(
                 request,
@@ -326,6 +350,13 @@ class TvYahooMappingService:
 
         telemetry = {
             "requested": len(request_list),
+            "legacy_hits": len(legacy_hits),
+            "legacy_verified_hits": sum(
+                1 for binding in legacy_hits.values() if binding.status == "VERIFIED"
+            ),
+            "legacy_rejected_hits": sum(
+                1 for binding in legacy_hits.values() if binding.status == "REJECTED"
+            ),
             "unique_tv_ids": len(unique_rows),
             "registry_hits": len(registry_hits),
             "resolver_rows": len(misses),

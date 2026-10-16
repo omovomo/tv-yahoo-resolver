@@ -90,6 +90,61 @@ class CacheDB:
                 out[b.tv_id] = b
         return out
 
+    def get_application_legacy_bindings(
+        self,
+        rows: Iterable[TvRow],
+        *,
+        current_policy: str,
+        compatible_verified_policies: Iterable[str],
+    ) -> dict[str, Binding]:
+        """Batch-read legacy identity bindings without constructing a resolver.
+
+        Preserve the existing BatchResolver cache contract: current-policy
+        bindings (including REJECTED) may be reused; older compatible-policy
+        bindings must be VERIFIED. Expiry and exact TV currency/type matching
+        are mandatory. A legacy hit is *not* Registry promotion or a new
+        security/listing proof, and cached Yahoo quotes are never reused.
+        """
+        unique_rows = {row.tv_id: row for row in rows}
+        if not unique_rows:
+            return {}
+        compatible = set(compatible_verified_policies)
+        compatible.discard(current_policy)
+        now = int(time.time())
+        hits: dict[str, Binding] = {}
+        ids = list(unique_rows)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            matches = self.conn.execute(
+                f"SELECT * FROM bindings WHERE tv_id IN ({marks}) AND expires_at>?",
+                [*chunk, now],
+            ).fetchall()
+            for record in matches:
+                policy = record["resolver_version"]
+                if policy != current_policy and not (
+                    policy in compatible and record["status"] == "VERIFIED"
+                ):
+                    continue
+                row = unique_rows[record["tv_id"]]
+                if (record["tv_currency"] or None) != (row.currency or None):
+                    continue
+                if (record["tv_type"] or None) != (row.tv_type or None):
+                    continue
+                binding = Binding(**json.loads(record["payload_json"]))
+                # Treat inconsistent persisted metadata as a miss, not proof.
+                if (
+                    binding.tv_id != row.tv_id
+                    or binding.status != record["status"]
+                    or binding.resolver_version != policy
+                ):
+                    continue
+                binding.cache_hit = True
+                binding.quote_status = "STALE_CACHED"
+                binding.yahoo_price = None
+                hits[row.tv_id] = binding
+        return hits
+
     def get_registry_tv_yahoo(
         self,
         rows: Iterable[TvRow],

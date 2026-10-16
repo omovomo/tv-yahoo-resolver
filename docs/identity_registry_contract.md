@@ -1,6 +1,6 @@
 # Identity Registry / garp-cli mapping contract — Phase A audit
 
-Status: **Phase A contract complete; Phase B schema v1 foundation, Phase C TV -> Yahoo Registry read/write, and the first versioned application batch API are implemented through package `0.4.79`; admission policy unchanged**.
+Status: **Phase A contract complete; Phase B schema v1 foundation, Phase C TV -> Yahoo Registry read/write, and the first versioned application batch API are implemented through package `0.4.80`; admission policy unchanged**.
 
 Baseline inspected: package `0.4.76`, resolver policy `0.4.57-policy457`.
 
@@ -498,3 +498,21 @@ Remaining deliverables:
 The concrete `garp-cli` adapter and cross-project integration tests remain gated
 on inspection of the actual relevant `garp-cli` source tree. The standalone
 Registry/schema work does not need to wait for that adapter.
+
+## 7. Application legacy warm-cache optimization (v0.4.80)
+
+Application mapping now reads compatible, unexpired legacy VERIFIED bindings
+in a bulk indexed lookup before constructing `BatchResolver`; unexpired
+current-policy REJECTED bindings obey their existing `refresh_rejected` behavior.
+The lookup preserves TV currency/type equality, policy compatibility and cache
+expiry, and does not generate new identity evidence or populate the Registry.
+A missing, stale, incompatible or metadata-inconsistent entry remains a
+resolver miss. A corrupted JSON payload remains a hard error as before.
+
+The v1 JSONL response keeps `source=RESOLVER` for backward compatibility with
+`garp-cli`'s strict source enumeration. Callers can distinguish legacy fast hits
+from fresh resolver work by `cache_hit`, `legacy_hits`, `resolver_rows`, and
+`resolver_invocations` telemetry. As before, cached quote price is discarded.
+This is a speed optimization for *previously admitted* bindings, not a
+stronger ISIN/security Registry claim: full re-proof requires independently
+verified current provider/source evidence.

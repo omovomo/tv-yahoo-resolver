@@ -61,7 +61,7 @@ identifiers из import layer и определить минимальный д�
 
 ## Active architecture / product plan
 
-Current implementation state after package `0.4.79`
+Current implementation state after package `0.4.80`
 (`0.4.57-policy457`, admission unchanged):
 
 - **Phase A / contract audit — COMPLETE**: product authority boundaries and the
@@ -73,14 +73,21 @@ Current implementation state after package `0.4.79`
 - **Application mapping boundary — IMPLEMENTED**: `tv_market_identity.api`,
   lightweight `tv-market-id-map` process transport, plus `map-jsonl` compatibility
   subcommand. Warm Registry hits do not construct provider clients/resolver.
+- **Application legacy fast path — IMPLEMENTED (`0.4.80`)**: Registry miss
+  first checks eligible verified/current-policy legacy bindings in bulk,
+  without constructing resolver/providers. Source API v1 stays compatible;
+  telemetry distinguishes fast legacy hits. Registry remains unpopulated by
+  legacy-only results; its security evidence is not fabricated.
 - **IBKR Registry ingest/reconciliation — not yet implemented**.
 
-Targeted `garp-cli` source inspection confirmed that its current
-`StockYahooSymbolRegistry` + `YahooMetadataVerifier` performs its own identity
-admission from deterministic ticker transformation and Yahoo metadata, including
-manual mappings. This layer is now planned for retirement from **identity
-authority**. Useful immutable `StockYahooLivePlan`/row-token/session safety stays
-on the application side; identity proof moves to `tv-market-id`.
+Targeted `garp-cli` source inspection identified the historical
+`StockYahooSymbolRegistry` + `YahooMetadataVerifier` identity-admission path.
+The subsequent `garp-cli` authority migration removed its manual/metadata
+admission role while retaining immutable `StockYahooLivePlan`/row-token/session
+safety. The user's October 2026 bounded AAPL/IBM smoke confirmed real
+TV->Yahoo VERIFIED results and Yahoo WebSocket quote updates. The remaining
+integration gate is a full `garp-cli` regression suite and warm/mixed performance
+verification on its actual runtime, not another manual authority path.
 
 Confirmed integration constraints:
 
@@ -94,14 +101,15 @@ Confirmed integration constraints:
 
 Следующий приоритет работ:
 
-1. **Phase C2 / garp-cli authority migration**: carry TV identity-only fields in
-   the assessment sidecar, call `tv-market-id-map` in bulk, and build live plans
-   only from VERIFIED results;
-2. retire automatic/manual `StockYahooSymbolRegistry` admission after the new
-   path is covered by integration tests; compatibility state may exist only
-   temporarily during rollout;
-3. measure realistic Screen warm/mixed batches, Registry hit rate and provider
-   calls avoided;
+1. **Phase C2 / garp-cli authority migration — BOUNDED SMOKE PASS**:
+   strict TV identity fields, verified batch mapping and Yahoo live quotes
+   were confirmed for AAPL/IBM; full application suite remains a separate gate;
+2. keep the historical `StockYahooSymbolRegistry` admission retired;
+   do not restore manual or Yahoo-metadata authority;
+3. **REAL runtime performance gate**: compare before/after 2/100/700
+   warm batches on the same Windows installation and 100/700 mixed batches;
+   require `resolver_invocations=0` for fully compatible legacy/Registry warm
+   batches, verify unchanged admission decisions, and inspect cold-tail costs;
 4. **Phase D**: add IBKR identity ingest (`conid`/ISIN/symbol + import context),
    then deterministic `IBKR -> Yahoo` and `IBKR -> TV`;
 5. **Phase F**: lifecycle/performance hardening --- corporate actions, ticker/venue

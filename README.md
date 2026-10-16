@@ -1,3 +1,23 @@
+# tv-market-identity-prototype v0.4.80
+
+Application-cache performance release; admission policy remains
+`0.4.57-policy457`. On a Registry miss, the `tv-market-id-map` application
+boundary now checks existing legacy `bindings` with an indexed bulk read
+**before** constructing `BatchResolver` or provider clients. A matching
+current-policy binding (including an unexpired REJECTED) or compatible-policy
+VERIFIED binding is reused under the existing expiry and exact TV currency/type
+checks. Other rows still go through the unchanged fail-closed resolver. The
+`--refresh` and `--refresh-rejected` contracts are preserved. Legacy results
+are *not* promoted to normalized Registry security evidence. The API v1
+`source=RESOLVER` field remains unchanged for compatibility with `garp-cli`,
+while `cache_hit=true` and new `legacy_hits`/`legacy_verified_hits`/
+`legacy_rejected_hits` telemetry distinguish the direct cache path. Neither
+live quote data nor persisted quote prices are reused.
+
+The pre-change real-world `garp-cli` benchmarks (2/100/700 legacy hits)
+were around 1.3–1.5 s per process on Windows; use a same-environment
+before/after benchmark to establish any production performance improvement.
+
 # tv-market-identity-prototype v0.4.79
 
 Architecture/API release; admission policy remains `0.4.57-policy457`. Adds a
